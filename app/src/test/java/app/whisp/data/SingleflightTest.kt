@@ -57,9 +57,11 @@ class SingleflightTest {
     fun completedKeyCanBeFetchedAgain() = runIsolatedTest { scope ->
         val flights = Singleflight<String, Int>(scope, 4)
         val calls = AtomicInteger(0)
-        assertEquals(1, flights.run("k") { calls.incrementAndGet() })
-        assertEquals(2, flights.run("k") { calls.incrementAndGet() })
-        assertEquals(2, calls.get())
+        repeat(50) { round ->
+            assertEquals(round * 2 + 1, flights.run("k") { calls.incrementAndGet() })
+            assertEquals(round * 2 + 2, flights.run("k") { calls.incrementAndGet() })
+        }
+        assertEquals(100, calls.get())
     }
 
     @Test

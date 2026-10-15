@@ -599,6 +599,7 @@ internal fun PlayerPage(
                     "音频输出" to { openAudioOutput(context) },
                     "播放设置" to { preferences = true },
                     "从头播放" to { model.playWork(detail, restart = true) },
+                    "导出播放诊断" to { model.exportPlaybackDiagnostics() },
                 )
                 .forEach { (label, action) ->
                     TextButton(

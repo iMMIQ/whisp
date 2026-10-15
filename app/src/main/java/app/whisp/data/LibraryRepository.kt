@@ -81,6 +81,7 @@ class LibraryRepository(val context: Context) {
     internal val onlineWorkChanges = Mutex()
     val dlsite = DlsiteClient(onlineHttp)
     val dlsiteDiagnostics = DlsiteDiagnostics(context)
+    val playbackDiagnostics = PlaybackDiagnostics(context)
     private val dlsiteClients =
         java.util.concurrent.ConcurrentHashMap<String, DlsiteAccountClient>()
     private val dlsiteCookieWrites = Mutex()

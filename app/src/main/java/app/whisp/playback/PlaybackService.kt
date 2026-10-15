@@ -3,11 +3,15 @@ package app.whisp.playback
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.media3.common.*
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.*
 import androidx.media3.session.MediaLibraryService.LibraryParams
@@ -18,7 +22,9 @@ import app.whisp.data.ProgressEntity
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import java.util.UUID
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
@@ -40,6 +46,10 @@ class PlaybackService : MediaLibraryService() {
     private var pendingLoopSeek: Pair<String?, Long>? = null
     private var automaticLoopSeek = false
     private var videoController: MediaSession.ControllerInfo? = null
+    // Player callbacks arrive serially on the main thread, so enqueue order
+    // matches event order and the single consumer below preserves it.
+    private val diagnosticTasks = Channel<suspend () -> Unit>(Channel.UNLIMITED)
+    private val decoderCorrelator = DecoderCorrelator(::onCorrelatedDecoder)
 
     companion object {
         const val TIMER = "whisp.timer"
@@ -66,6 +76,89 @@ class PlaybackService : MediaLibraryService() {
                 .setSeekForwardIncrementMs(10000)
                 .build()
         setVideoEnabled(false)
+        updateAudioOffload()
+        scope.launch(Dispatchers.IO) {
+            // A single consumer keeps dispatch order. Isolate failures so one
+            // corrupt entry cannot stop all later diagnostics.
+            for (task in diagnosticTasks) {
+                try {
+                    task()
+                } catch (_: Exception) {
+                    android.util.Log.w("WhispPlayback", "Diagnostic write skipped")
+                }
+            }
+        }
+        player.addAnalyticsListener(
+            object : AnalyticsListener {
+                override fun onAudioInputFormatChanged(
+                    eventTime: AnalyticsListener.EventTime,
+                    format: Format,
+                    decoderReuseEvaluation: DecoderReuseEvaluation?,
+                ) {
+                    decoderCorrelator.onFormatChanged(
+                        "audio",
+                        FormatSnapshot(format.sampleMimeType, format.codecs),
+                        formatContinuity(decoderReuseEvaluation),
+                    )
+                }
+
+                override fun onVideoInputFormatChanged(
+                    eventTime: AnalyticsListener.EventTime,
+                    format: Format,
+                    decoderReuseEvaluation: DecoderReuseEvaluation?,
+                ) {
+                    decoderCorrelator.onFormatChanged(
+                        "video",
+                        FormatSnapshot(format.sampleMimeType, format.codecs),
+                        formatContinuity(decoderReuseEvaluation),
+                    )
+                }
+
+                override fun onAudioDecoderInitialized(
+                    eventTime: AnalyticsListener.EventTime,
+                    decoderName: String,
+                    initializedTimestampMs: Long,
+                    initializationDurationMs: Long,
+                ) {
+                    decoderCorrelator.onDecoderInitialized("audio", decoderName)
+                }
+
+                override fun onAudioDecoderReleased(
+                    eventTime: AnalyticsListener.EventTime,
+                    decoderName: String,
+                ) {
+                    decoderCorrelator.onDecoderReleased("audio")
+                }
+
+                override fun onVideoDecoderInitialized(
+                    eventTime: AnalyticsListener.EventTime,
+                    decoderName: String,
+                    initializedTimestampMs: Long,
+                    initializationDurationMs: Long,
+                ) {
+                    decoderCorrelator.onDecoderInitialized("video", decoderName)
+                }
+
+                override fun onVideoDecoderReleased(
+                    eventTime: AnalyticsListener.EventTime,
+                    decoderName: String,
+                ) {
+                    decoderCorrelator.onDecoderReleased("video")
+                }
+            },
+        )
+        player.addAudioOffloadListener(
+            object : ExoPlayer.AudioOffloadListener {
+                override fun onOffloadedPlayback(offloadedPlayback: Boolean) {
+                    diagnosticTasks.trySend {
+                        repository.playbackDiagnostics.record(
+                            DecoderAudit.offloaded(offloadedPlayback)
+                                .copy(id = UUID.randomUUID().toString()),
+                        )
+                    }
+                }
+            },
+        )
         player.addListener(
             object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -99,6 +192,7 @@ class PlaybackService : MediaLibraryService() {
                         loopEnd = -1
                         player.setPauseAtEndOfMediaItems(false)
                         publishExtras()
+                        updateAudioOffload()
                         saveProgress()
                     }
                 }
@@ -157,6 +251,7 @@ class PlaybackService : MediaLibraryService() {
                         loopEnd = -1
                         player.setPauseAtEndOfMediaItems(false)
                         publishExtras()
+                        updateAudioOffload()
                     }
                     if (!loopSeek) saveProgress()
                 }
@@ -335,6 +430,7 @@ class PlaybackService : MediaLibraryService() {
                                             args.getInt("minutes", 0),
                                         )
                                     scheduleTimer()
+                                    updateAudioOffload()
                                 }
                                 LOOP -> {
                                     val segment =
@@ -352,6 +448,7 @@ class PlaybackService : MediaLibraryService() {
                                     pendingLoopSeek = null
                                     automaticLoopSeek = false
                                     reconcilePlaybackJobs()
+                                    updateAudioOffload()
                                 }
                                 else ->
                                     return Futures.immediateFuture(
@@ -502,6 +599,7 @@ class PlaybackService : MediaLibraryService() {
             timerEnd = 0
             player.pause()
             publishExtras()
+            updateAudioOffload()
             saveProgress()
         }
     }
@@ -527,6 +625,53 @@ class PlaybackService : MediaLibraryService() {
                 putLong("loopEnd", loopEnd)
             },
         )
+    }
+
+    private fun updateAudioOffload() {
+        if (!AudioOffload.supported(Build.VERSION.SDK_INT)) return
+        // Loop polling and the sleep timer rely on Handler deadlines, which stall
+        // while offloaded playback lets the CPU sleep. Switching the preference
+        // reselections the audio track, so only do it on loop/timer transitions.
+        player.trackSelectionParameters =
+            player.trackSelectionParameters
+                .buildUpon()
+                .setAudioOffloadPreferences(
+                    AudioOffload.preferences(
+                        enabled = !AudioOffload.needsPreciseDeadline(loopStart, loopEnd, timerEnd),
+                    ),
+                )
+                .build()
+    }
+
+    private fun onCorrelatedDecoder(
+        kind: String,
+        snapshot: FormatSnapshot?,
+        decoder: String?,
+        id: String,
+        replaceProvisional: Boolean,
+    ) {
+        // A single consumer keeps dispatch order: launch() alone does not
+        // guarantee that coroutines start in call order.
+        diagnosticTasks.trySend {
+            val candidates = runCatching {
+                val mime = snapshot?.mime ?: return@runCatching emptyList<CodecCandidate>()
+                MediaCodecUtil.getDecoderInfos(mime, false, false).map {
+                    CodecCandidate(it.name, it.hardwareAccelerated)
+                }
+            }
+                .getOrDefault(emptyList())
+            val event =
+                DecoderAudit.resolve(
+                        kind,
+                        snapshot?.mime,
+                        snapshot?.codecs,
+                        decoder,
+                        candidates,
+                    )
+                    .copy(id = id)
+            if (replaceProvisional) repository.playbackDiagnostics.replaceById(id, event)
+            else repository.playbackDiagnostics.record(event)
+        }
     }
 
     private fun saveProgress() {

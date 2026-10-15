@@ -22,6 +22,9 @@ internal class Singleflight<K, V>(private val scope: CoroutineScope, permits: In
     suspend fun run(key: K, block: suspend () -> V): V {
         val task =
             synchronized(ongoing) {
+                // Await can resume before the completion handler below removes
+                // the entry, so a finished task must never be shared again.
+                ongoing[key]?.let { if (it.isCompleted) ongoing.remove(key, it) }
                 ongoing[key]
                     ?: scope
                         .async(start = CoroutineStart.LAZY) { lanes.withPermit { block() } }
