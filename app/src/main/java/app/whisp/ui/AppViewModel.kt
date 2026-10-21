@@ -2,6 +2,7 @@
 package app.whisp.ui
 
 import android.content.ComponentName
+import android.content.Intent
 import android.os.Bundle
 import android.util.LruCache
 import androidx.core.content.ContextCompat
@@ -605,6 +606,14 @@ class AppViewModel(
     fun favorite(id: String) = action { repository.toggleFavorite(id) }
 
     fun deleteBookmark(id: String) = action { repository.deleteBookmark(id) }
+
+    fun exportPlaybackDiagnostics() {
+        val context = repository.context
+        context.startActivity(
+            Intent.createChooser(repository.playbackDiagnostics.shareIntent(), "播放诊断")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+    }
 
     fun download(id: String) = action { repository.offlineStore.downloadWork(id) }
 
