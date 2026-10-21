@@ -158,7 +158,6 @@ class DecoderCorrelatorTest {
             FormatContinuity.BYPASS,
         )
         correlator.onDecoderReleased("audio")
-        // The released init never produced output; the bypass format replaces it in place.
         correlator.onDecoderInitialized("audio", "mp3-decoder")
         correlator.onFormatChanged(
             "audio",
@@ -178,7 +177,7 @@ class DecoderCorrelatorTest {
         val log = mutableListOf<Emission>()
         val correlator = correlator(log)
         // init AAC -> format AAC -> format FLAC (rebuild scheduled, drain pending)
-        // -> release AAC -> init FLAC -> format FLAC.
+        // -> release AAC -> init FLAC. Delayed initialization emits no second format event.
         correlator.onDecoderInitialized("audio", "aac-decoder")
         correlator.onFormatChanged(
             "audio",
@@ -192,16 +191,27 @@ class DecoderCorrelatorTest {
         )
         correlator.onDecoderReleased("audio")
         correlator.onDecoderInitialized("audio", "flac-decoder")
-        correlator.onFormatChanged(
-            "audio",
-            FormatSnapshot("audio/flac", "fLaC"),
-            FormatContinuity.REUSE,
-        )
         val flacEntries = log.filter { it.snapshot?.mime == "audio/flac" }
-        // Provisional, in-place decoder update, then the paired format: one id throughout.
-        assertEquals(3, flacEntries.size)
+        assertEquals(2, flacEntries.size)
         assertTrue(flacEntries.all { it.id == flacEntries[0].id })
         assertEquals("flac-decoder", flacEntries.last().decoder)
         assertTrue(flacEntries.none { it.decoder == "aac-decoder" })
+    }
+
+    @Test
+    fun releasedInitializationDoesNotCaptureTheNextFormat() {
+        val log = mutableListOf<Emission>()
+        val correlator = correlator(log)
+        correlator.onDecoderInitialized("audio", "aac-decoder")
+        correlator.onDecoderReleased("audio")
+        correlator.onFormatChanged(
+            "audio",
+            FormatSnapshot("audio/mpeg", "mp3"),
+            FormatContinuity.BYPASS,
+        )
+        assertEquals(2, log.size)
+        assertNotEquals(log[0].id, log[1].id)
+        assertNull(log[1].decoder)
+        assertFalse(log[1].replace)
     }
 }

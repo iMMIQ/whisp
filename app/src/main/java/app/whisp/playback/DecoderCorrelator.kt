@@ -18,7 +18,7 @@ internal enum class FormatContinuity {
     BYPASS,
 }
 
-/** A null evaluation means bypass: a fresh init always dispatches before its format event. */
+/** Classifies format events; a preceding initialization takes priority over this hint. */
 @androidx.annotation.OptIn(UnstableApi::class)
 internal fun formatContinuity(evaluation: DecoderReuseEvaluation?): FormatContinuity =
     when {
@@ -28,17 +28,11 @@ internal fun formatContinuity(evaluation: DecoderReuseEvaluation?): FormatContin
     }
 
 /**
- * Pairs each decoder initialization with the input format event from the same renderer call.
- * Renderers initialize the codec before dispatching the format event, so recording at init time
- * would read a stale or missing format.
+ * Pairs renderer input formats and decoder initializations in either event order.
  *
- * A pending pairing always wins over the evaluation: init and its format stay adjacent in the
- * per-kind event stream. An init without a following format is always an in-place recovery, where
- * the cached format is still current.
- *
- * A release always precedes the next init of the same renderer; only the decoder name is cleared,
- * never a pending pairing. After a release, a format without a new init is bypass and keeps a null
- * decoder.
+ * Init-first observations await a format and are abandoned when that decoder is released.
+ * Format-first rebuilds await initialization across the old decoder's release. Initialization
+ * completes that pairing without waiting for another format callback.
  *
  * Every emission carries a stable id so the sink can replace the provisional entry in place, no
  * matter what was recorded after it.
@@ -55,30 +49,31 @@ internal class DecoderCorrelator(
 ) {
     private val cached = mutableMapOf<String, FormatSnapshot?>()
     private val lastDecoder = mutableMapOf<String, String?>()
-    private val pending = mutableMapOf<String, String>()
+    private val awaitingFormat = mutableMapOf<String, String>()
+    private val awaitingDecoder = mutableMapOf<String, String>()
 
     fun onDecoderInitialized(kind: String, decoder: String) {
         lastDecoder[kind] = decoder
-        val existing = pending[kind]
+        val existing = awaitingDecoder.remove(kind)
         if (existing != null) {
-            // A format event is already waiting for this init (e.g. delayed
-            // rebuild): fold the decoder name into the same entry.
             sink(kind, cached[kind], decoder, existing, true)
         } else {
             val id = UUID.randomUUID().toString()
-            pending[kind] = id
+            awaitingFormat[kind] = id
             sink(kind, cached[kind], decoder, id, false)
         }
     }
 
     fun onFormatChanged(kind: String, snapshot: FormatSnapshot?, continuity: FormatContinuity) {
         cached[kind] = snapshot
-        val pendingId = pending.remove(kind)
+        val pendingId = awaitingFormat.remove(kind)
+        // A new format supersedes any earlier format still waiting for initialization.
+        awaitingDecoder.remove(kind)
         if (pendingId != null) {
             sink(kind, snapshot, lastDecoder[kind], pendingId, true)
         } else if (continuity == FormatContinuity.REBUILD) {
             val id = UUID.randomUUID().toString()
-            pending[kind] = id
+            awaitingDecoder[kind] = id
             sink(kind, snapshot, null, id, false)
         } else {
             val decoder = if (continuity == FormatContinuity.REUSE) lastDecoder[kind] else null
@@ -88,5 +83,6 @@ internal class DecoderCorrelator(
 
     fun onDecoderReleased(kind: String) {
         lastDecoder.remove(kind)
+        awaitingFormat.remove(kind)
     }
 }
