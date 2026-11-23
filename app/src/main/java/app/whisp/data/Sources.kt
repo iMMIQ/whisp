@@ -11,6 +11,9 @@ import java.time.format.DateTimeFormatter
 import javax.xml.parsers.DocumentBuilderFactory
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.Credentials
@@ -195,44 +198,73 @@ class WebDavClient(private val http: OkHttpClient) {
     suspend fun walk(source: SourceEntity, password: String): List<FileEntry> =
         withContext(Dispatchers.IO) {
             val root = (source.root.trimEnd('/') + "/").toHttpUrl()
-            val pending = ArrayDeque<HttpUrl>().apply { add(root) }
+            var pending = listOf(root)
             val seen = mutableSetOf<String>()
             val files = mutableListOf<FileEntry>()
+            val rootDepth = root.pathSegments.dropLastWhile { it.isEmpty() }.size
             while (pending.isNotEmpty()) {
-                coroutineContext.ensureActive()
-                check(seen.size < 10_000 && files.size < 100_000) { "目录过大" }
-                val directory = pending.removeFirst()
-                if (!seen.add(directory.toString().trimEnd('/'))) continue
-                val bytes =
-                    http.onlineBytes(listRequest(directory, source, password), 8 * 1024 * 1024)
-                parse(bytes, directory).forEach { entry ->
-                    if (!insideRoot(entry.url, root)) return@forEach
-                    if (entry.url.encodedPath.trimEnd('/') == directory.encodedPath.trimEnd('/'))
-                        return@forEach
-                    val relativeSegments =
-                        entry.url.pathSegments.drop(
-                            root.pathSegments.dropLastWhile { it.isEmpty() }.size,
-                        )
-                    val path = relativeSegments.filter { it.isNotEmpty() }.joinToString("/")
-                    if (path.isBlank() || path.split('/').any { it == ".." }) return@forEach
-                    files +=
-                        FileEntry(
-                            path,
-                            entry.url.toString(),
-                            entry.directory,
-                            entry.size,
-                            entry.modified,
-                        )
-                    if (entry.directory)
-                        pending.add(
-                            entry.url
-                                .newBuilder()
-                                .apply {
-                                    if (!entry.url.encodedPath.endsWith('/')) addPathSegment("")
+                val nextLevel = mutableListOf<HttpUrl>()
+                val uniqueBatch =
+                    pending
+                        .filter { seen.add(it.toString().trimEnd('/')) }
+                        .also {
+                            check(seen.size < 10_000 && files.size < 100_000) { "目录过大" }
+                        }
+                // Match SMB/NFS concurrency: up to 4 parallel PROPFIND calls preserve order and cap
+                // load.
+                for (batch in uniqueBatch.chunked(4)) {
+                    coroutineContext.ensureActive()
+                    val responses = coroutineScope {
+                        batch
+                            .map { directory ->
+                                async(Dispatchers.IO) {
+                                    directory to
+                                        parse(
+                                            http.onlineBytes(
+                                                listRequest(directory, source, password),
+                                                8 * 1024 * 1024,
+                                            ),
+                                            directory,
+                                        )
                                 }
-                                .build(),
-                        )
+                            }
+                            .awaitAll()
+                    }
+                    for ((directory, entries) in responses) {
+                        coroutineContext.ensureActive()
+                        entries.forEach { entry ->
+                            if (!insideRoot(entry.url, root)) return@forEach
+                            if (
+                                entry.url.encodedPath.trimEnd('/') ==
+                                    directory.encodedPath.trimEnd('/')
+                            )
+                                return@forEach
+                            val relativeSegments = entry.url.pathSegments.drop(rootDepth)
+                            val path = relativeSegments.filter { it.isNotEmpty() }.joinToString("/")
+                            if (path.isBlank() || path.split('/').any { it == ".." }) return@forEach
+                            files +=
+                                FileEntry(
+                                    path,
+                                    entry.url.toString(),
+                                    entry.directory,
+                                    entry.size,
+                                    entry.modified,
+                                )
+                            check(files.size < 100_000) { "目录过大" }
+                            if (entry.directory)
+                                nextLevel.add(
+                                    entry.url
+                                        .newBuilder()
+                                        .apply {
+                                            if (!entry.url.encodedPath.endsWith('/'))
+                                                addPathSegment("")
+                                        }
+                                        .build(),
+                                )
+                        }
+                    }
                 }
+                pending = nextLevel
             }
             files.distinctBy { it.uri }
         }

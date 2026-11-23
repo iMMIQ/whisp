@@ -348,6 +348,8 @@ class DlsiteClient(
         return withContext(Dispatchers.Default) { parseDescription(id, page) }
     }
 
+    private val horizontalSpace = Regex("[ \t]+")
+
     internal fun parseDescription(number: String, page: String): List<DlsiteBlock> {
         val document = Jsoup.parse(page, root.toString())
         require(document.selectFirst("#work_name") != null) { "DLsite 作品页不可用" }
@@ -363,7 +365,7 @@ class DlsiteClient(
         var characters = 0
         fun flush() {
             val content =
-                buffer.toString().trim().replace(Regex("[ \t]+"), " ").take(100000 - characters)
+                buffer.toString().trim().replace(horizontalSpace, " ").take(100000 - characters)
             buffer.clear()
             if (content.isNotBlank()) {
                 blocks += DlsiteBlock("text", content)

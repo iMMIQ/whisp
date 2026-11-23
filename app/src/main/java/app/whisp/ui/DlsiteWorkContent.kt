@@ -242,7 +242,7 @@ internal fun LazyListScope.dlsiteContent(
                     contentPadding = PaddingValues(horizontal = 24.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    items(details.genres) { genre ->
+                    items(details.genres, key = { "${it.id}|${it.name}" }) { genre ->
                         SuggestionChip(
                             onClick = {
                                 if (

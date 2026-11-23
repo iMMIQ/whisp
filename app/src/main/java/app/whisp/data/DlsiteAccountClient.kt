@@ -4,6 +4,9 @@ package app.whisp.data
 import java.io.IOException
 import java.time.Instant
 import java.time.OffsetDateTime
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
@@ -12,6 +15,8 @@ import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+
+class DlsiteNoPlayableAudioException(message: String = "作品暂无可播放音轨") : IOException(message)
 
 @Serializable
 data class DlsiteOwnedWork(
@@ -22,6 +27,7 @@ data class DlsiteOwnedWork(
     val coverUrl: String? = null,
     val purchasedAt: Long = 0,
     val metadataReady: Boolean = false,
+    val metadataAttemptedAt: Long = 0,
 ) {
     fun entity(sourceId: String) =
         WorkEntity(
@@ -56,6 +62,8 @@ class DlsiteAccountClient(
     private val testTransport: Boolean = false,
     private val diagnostic: (DlsiteRequestEvent) -> Unit = {},
 ) {
+    private val latestServerDateMs = AtomicLong(0L)
+
     val http: OkHttpClient =
         baseHttp
             .newBuilder()
@@ -87,7 +95,22 @@ class DlsiteAccountClient(
                 val started = System.nanoTime()
                 var status = 0
                 try {
-                    chain.proceed(chain.request()).also { status = it.code }
+                    chain.proceed(chain.request()).also { response ->
+                        status = response.code
+                        response.header("Date")?.let { rawDate ->
+                            runCatching {
+                                ZonedDateTime.parse(
+                                        rawDate,
+                                        DateTimeFormatter.RFC_1123_DATE_TIME,
+                                    )
+                                    .toInstant()
+                                    .toEpochMilli()
+                            }
+                                .getOrNull()
+                                ?.takeIf { it > 0 }
+                                ?.let { latestServerDateMs.set(it) }
+                        }
+                    }
                 } finally {
                     diagnostic(
                         DlsiteRequestEvent(
@@ -101,6 +124,12 @@ class DlsiteAccountClient(
             .build()
     private val signatureLock = Mutex()
     private val expires = mutableMapOf<String, Long>()
+
+    fun close() {
+        session.clear()
+        http.dispatcher.cancelAll()
+        http.dispatcher.executorService.shutdown()
+    }
 
     private suspend fun json(path: String, body: JsonElement? = null): JsonElement {
         val url = root.resolve(path) ?: error("DLsite 地址无效")
@@ -140,6 +169,7 @@ class DlsiteAccountClient(
     }
 
     suspend fun purchases(lastScan: Long = 0): DlsitePurchaseSync {
+        latestServerDateMs.set(0L)
         authorize()
         val started = System.currentTimeMillis()
         val last = (lastScan / 1000).coerceAtLeast(0)
@@ -177,7 +207,11 @@ class DlsiteAccountClient(
                     as? JsonArray ?: throw IOException("DLsite 购买库格式错误")
             works.forEach { parseOwned(it.jsonObject, dates)?.let(result::add) }
         }
-        return DlsitePurchaseSync(result.distinctBy { it.workno }, started)
+        // Guard against a fast device clock skipping newly bought works on the next incremental
+        // sync.
+        val serverTime = latestServerDateMs.get()
+        val completedAt = if (serverTime > 0) minOf(started, serverTime) else started
+        return DlsitePurchaseSync(result.distinctBy { it.workno }, completedAt)
     }
 
     suspend fun work(workno: String): DlsiteOwnedWork {
@@ -186,7 +220,7 @@ class DlsiteAccountClient(
         require(item.string("workno") == workno) { "DLsite 作品编号不匹配" }
         if (item["sales_date"] == JsonNull && item.string("entitlement_type") == "none")
             throw IOException("账号尚未购买该作品")
-        return parseOwned(item, emptyMap()) ?: throw IOException("作品暂无可播放音声")
+        return parseOwned(item, emptyMap()) ?: throw DlsiteNoPlayableAudioException("作品暂无可播放音声")
     }
 
     suspend fun index(work: DlsiteOwnedWork, sourceId: String, generation: Long): IndexedLibrary {
@@ -257,7 +291,7 @@ class DlsiteAccountClient(
         require(
             validWorkno(workno) &&
                 (path == "ziptree.json" ||
-                    Regex("optimized/[A-Za-z0-9_.-]{1,200}").matches(path) && !path.contains("..")),
+                    optimizedPathPattern.matches(path) && !path.contains("..")),
         ) {
             "DLsite 文件标识无效"
         }
@@ -284,6 +318,8 @@ class DlsiteAccountClient(
     }
 
     companion object {
+        private val optimizedPathPattern = Regex("optimized/[A-Za-z0-9_.-]{1,200}")
+
         fun validWorkno(value: String) = validDlsiteWorkno(value)
 
         internal fun date(element: JsonElement?): Long {

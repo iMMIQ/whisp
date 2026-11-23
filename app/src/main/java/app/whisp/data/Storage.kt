@@ -18,23 +18,27 @@ import java.util.TreeSet
 
 const val MIB = 1024L * 1024
 
-/** Same LRU policy as Media3, with changes applied under SimpleCache's monitor. */
+/**
+ * Same LRU policy as Media3, using only Cache's public API and an internal span index lock so
+ * callers never depend on SimpleCache's private monitor object.
+ */
 @androidx.annotation.OptIn(UnstableApi::class)
 internal class AdjustableCacheEvictor(
-    private var limit: Long,
+    limit: Long,
     private val changed: () -> Unit = {},
 ) : CacheEvictor {
+    private val lock = Any()
+    @Volatile private var limit: Long = limit.coerceAtLeast(0)
     private val spans =
         TreeSet<CacheSpan>(
             compareBy<CacheSpan> { it.lastTouchTimestamp }.thenBy { it.key }.thenBy { it.position },
         )
     private var bytes = 0L
 
-    fun resize(cache: Cache, newLimit: Long) =
-        synchronized(cache) {
-            limit = newLimit.coerceAtLeast(0)
-            evict(cache, 0)
-        }
+    fun resize(cache: Cache, newLimit: Long) {
+        limit = newLimit.coerceAtLeast(0)
+        evict(cache, 0)
+    }
 
     override fun requiresCacheSpanTouches() = true
 
@@ -46,25 +50,39 @@ internal class AdjustableCacheEvictor(
     }
 
     override fun onSpanAdded(cache: Cache, span: CacheSpan) {
-        if (spans.add(span)) bytes += span.length
+        synchronized(lock) {
+            if (spans.add(span)) bytes += span.length
+        }
         evict(cache, 0)
         changed()
     }
 
     override fun onSpanRemoved(cache: Cache, span: CacheSpan) {
-        if (spans.remove(span)) {
-            bytes -= span.length
-            changed()
-        }
+        val removed =
+            synchronized(lock) {
+                spans.remove(span).also { if (it) bytes -= span.length }
+            }
+        if (removed) changed()
     }
 
     override fun onSpanTouched(cache: Cache, oldSpan: CacheSpan, newSpan: CacheSpan) {
-        spans.remove(oldSpan)
-        spans.add(newSpan)
+        synchronized(lock) {
+            spans.remove(oldSpan)
+            spans.add(newSpan)
+        }
     }
 
     private fun evict(cache: Cache, incoming: Long) {
-        while (bytes + incoming > limit && spans.isNotEmpty()) cache.removeSpan(spans.first())
+        val skipped = mutableSetOf<CacheSpan>()
+        while (true) {
+            val candidate =
+                synchronized(lock) {
+                    if (bytes + incoming <= limit) null else spans.firstOrNull { it !in skipped }
+                } ?: break
+            cache.removeSpan(candidate)
+            val stillPresent = synchronized(lock) { candidate in spans }
+            if (stillPresent) skipped += candidate
+        }
     }
 }
 
@@ -80,61 +98,149 @@ internal fun atomicFile(file: File, bytes: ByteArray) {
     }
 }
 
-/** Cache owns only its dedicated directory, never settings, custom art or downloads. */
+/**
+ * Cache owns only its dedicated directory, never settings, custom art or downloads. Maintains an
+ * in-memory LRU index so put/size/peek avoid full-directory scans and UI reads never write mtimes
+ * synchronously on the main thread.
+ */
 internal class ImageFileCache(
     val directory: File,
     private val limit: Long,
     private val changed: () -> Unit = {},
+    eagerInit: Boolean = true,
 ) {
+    private val entries = LinkedHashMap<String, Long>(64, 0.75f, true)
+    private var totalBytes = 0L
+    @Volatile private var initialized = false
+
     init {
-        directory.mkdirs()
-        directory.listFiles()?.filter { it.name.endsWith(".tmp") }?.forEach { it.delete() }
-        trim()
+        if (eagerInit) initialize()
     }
 
     @Synchronized
-    fun get(id: String): File? =
-        File(directory, id)
-            .takeIf { it.isFile }
-            ?.also {
-                val now = System.currentTimeMillis()
-                if (now - it.lastModified() > 60_000) it.setLastModified(now)
+    fun initialize() {
+        if (initialized) return
+        directory.mkdirs()
+        entries.clear()
+        totalBytes = 0L
+        val existing = directory.listFiles().orEmpty()
+        val regular = mutableListOf<File>()
+        for (file in existing) {
+            if (file.name.endsWith(".tmp")) file.delete() else if (file.isFile) regular += file
+        }
+        regular.sortBy { it.lastModified() }
+        for (file in regular) {
+            val length = file.length()
+            entries[file.name] = length
+            totalBytes += length
+        }
+        initialized = true
+        trim()
+    }
+
+    /** Fast lookup without synchronous disk mtime writes (safe for main-thread reads if needed). */
+    fun peek(id: String): File? {
+        val file = File(directory, id)
+        if (!file.isFile) {
+            if (initialized) {
+                synchronized(this) {
+                    entries.remove(id)?.let { totalBytes = (totalBytes - it).coerceAtLeast(0L) }
+                }
             }
+            return null
+        }
+        if (initialized) {
+            synchronized(this) {
+                if (entries.containsKey(id)) {
+                    // Accessing under accessOrder=true promotes the entry in memory.
+                    entries[id]
+                } else {
+                    val length = file.length()
+                    entries[id] = length
+                    totalBytes += length
+                }
+            }
+        }
+        return file
+    }
+
+    @Synchronized
+    fun get(id: String): File? {
+        if (!initialized) initialize()
+        val file = File(directory, id)
+        if (!file.isFile) {
+            entries.remove(id)?.let { totalBytes = (totalBytes - it).coerceAtLeast(0L) }
+            return null
+        }
+        val previous = entries[id]
+        if (previous == null) {
+            val length = file.length()
+            entries[id] = length
+            totalBytes += length
+        }
+        val now = System.currentTimeMillis()
+        if (now - file.lastModified() > 60_000) file.setLastModified(now)
+        return file
+    }
+
+    fun touch(id: String) {
+        val file = File(directory, id)
+        if (!file.isFile) return
+        val now = System.currentTimeMillis()
+        if (now - file.lastModified() > 60_000) file.setLastModified(now)
+    }
 
     @Synchronized
     fun put(id: String, bytes: ByteArray): File {
+        if (!initialized) initialize()
         require(bytes.size <= limit) { "图片过大" }
         val file = File(directory, id)
         atomicFile(file, bytes)
         file.setLastModified(System.currentTimeMillis())
-        trim(file)
+        val previous = entries.remove(id)
+        if (previous != null) totalBytes = (totalBytes - previous).coerceAtLeast(0L)
+        val length = bytes.size.toLong()
+        entries[id] = length
+        totalBytes += length
+        trim(id)
         changed()
         return file
     }
 
     @Synchronized
     fun clear() {
+        if (!initialized) directory.mkdirs()
         directory.listFiles()?.filter { it.isFile }?.forEach { it.delete() }
+        entries.clear()
+        totalBytes = 0L
+        initialized = true
         changed()
     }
 
     @Synchronized
     fun remove(id: String) {
-        if (File(directory, id).delete()) changed()
+        val removed = File(directory, id).delete()
+        entries.remove(id)?.let { totalBytes = (totalBytes - it).coerceAtLeast(0L) }
+        if (removed) changed()
     }
 
     @Synchronized
-    fun size() = directory.listFiles()?.filter { it.isFile }?.sumOf { it.length() } ?: 0L
+    fun size(): Long {
+        if (!initialized) initialize()
+        return totalBytes
+    }
 
     @Synchronized
-    private fun trim(keep: File? = null) {
-        val files =
-            directory.listFiles()?.filter { it.isFile && !it.name.endsWith(".tmp") }.orEmpty()
-        var total = files.sumOf { it.length() }
-        for (file in files.sortedBy { it.lastModified() }) {
-            if (total <= limit) break
-            val bytes = file.length()
-            if (file != keep && file.delete()) total -= bytes
+    private fun trim(keepId: String? = null) {
+        val iterator = entries.entries.iterator()
+        while (totalBytes > limit && iterator.hasNext()) {
+            val (id, length) = iterator.next()
+            if (id == keepId) continue
+            val file = File(directory, id)
+            if (!file.exists() || file.delete()) {
+                iterator.remove()
+                totalBytes = (totalBytes - length).coerceAtLeast(0L)
+            }
         }
     }
 }

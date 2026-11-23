@@ -331,6 +331,40 @@ class DlsiteAccountClientTest {
                     .encodedPath
                     .startsWith("/content/work/professional/"),
             )
+            client.close()
+            assertTrue(client.http.dispatcher.executorService.isShutdown)
+        }
+    }
+
+    @Test
+    fun serverDateHeaderCapsCompletedAtAgainstFastDeviceClock() = runBlocking {
+        withMockServer { server ->
+            val pastHeader = "Wed, 01 Jan 2020 00:00:00 GMT"
+            server.enqueue(
+                MockResponse.Builder()
+                    .body("""{"customer_id":7}""")
+                    .addHeader("Date", pastHeader)
+                    .build(),
+            )
+            server.enqueue(
+                MockResponse.Builder()
+                    .body("""{"user":0,"production":0,"page_limit":100}""")
+                    .addHeader("Date", pastHeader)
+                    .build(),
+            )
+            val client =
+                DlsiteAccountClient(
+                    DlsiteSession(),
+                    root = server.url("/"),
+                    contentRoot = server.url("/"),
+                    testTransport = true,
+                )
+            try {
+                val sync = client.purchases(0)
+                assertEquals(1577836800000L, sync.completedAt)
+            } finally {
+                client.close()
+            }
         }
     }
 }

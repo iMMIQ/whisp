@@ -110,9 +110,10 @@ class NfsClient(
         return object : RemoteAssetSession {
             override fun bytes(uri: String, limit: Int) = open(uri).use { boundedBytes(it, limit) }
 
-            override fun duration(uri: String) =
-                open(uri).use { reader ->
-                    Mp3Metadata.duration(reader.length) { offset, length ->
+            override fun duration(uri: String): Long {
+                val relative = NfsAddress.assetPath(uri, source.id)
+                return session.open(relative).use { reader ->
+                    AudioDurationParser.duration(relative, reader.length) { offset, length ->
                         val bytes = ByteArray(length)
                         var used = 0
                         while (used < length) {
@@ -123,6 +124,7 @@ class NfsClient(
                         bytes.copyOf(used)
                     }
                 }
+            }
 
             override fun close() = session.close()
         }

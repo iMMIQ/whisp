@@ -79,4 +79,19 @@ class ImageFileCacheTest {
         assertArrayEquals(byteArrayOf(2, 3), cache.get("cover")!!.readBytes())
         assertEquals(listOf("cover"), root.list()!!.toList())
     }
+
+    @Test
+    fun deferredInitializationAvoidsConstructorIoUntilInitialized() {
+        val root = temporary.newFolder()
+        val stale = File(root, "interrupted.tmp").apply { writeBytes(ByteArray(12)) }
+        val cache = ImageFileCache(root, 10, eagerInit = false)
+        assertTrue("Deferred cache must not touch disk in constructor", stale.exists())
+        cache.initialize()
+        assertFalse(stale.exists())
+        cache.put("a", ByteArray(4))
+        assertNotNull(cache.peek("a"))
+        assertTrue(File(root, "a").delete())
+        assertNull(cache.peek("a"))
+        assertEquals(0L, cache.size())
+    }
 }

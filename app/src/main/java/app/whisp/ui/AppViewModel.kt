@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
 import android.os.Bundle
-import android.util.LruCache
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
@@ -139,12 +139,20 @@ class AppViewModel(
         client: DlsiteClient = repository.dlsite,
     ) = dlsiteLoader.load(workId, rj, part, seed, force, client)
 
+    private val subtitleLoader = SubtitleLoader(viewModelScope, repository)
+
     // Event snapshots never advance merely because playback time passes.
     val player = MutableStateFlow(PlaybackState())
     val position = MutableStateFlow(0L)
-    val cues = MutableStateFlow<List<Cue>>(emptyList())
-    val subtitleLoading = MutableStateFlow(false)
-    val subtitleError = MutableStateFlow<String?>(null)
+    val cues: MutableStateFlow<List<Cue>>
+        get() = subtitleLoader.cues
+
+    val subtitleLoading: MutableStateFlow<Boolean>
+        get() = subtitleLoader.loading
+
+    val subtitleError: MutableStateFlow<String?>
+        get() = subtitleLoader.error
+
     val queueTracks = MutableStateFlow<List<TrackEntity>>(emptyList())
     val openingTrackId = MutableStateFlow<String?>(null)
     val loopDraftStart = MutableStateFlow(-1L)
@@ -154,10 +162,7 @@ class AppViewModel(
     private var videoVisible = false
     private var videoOwner: Any? = null
     private var loopDraftTrack: String? = null
-    private var subtitleTrackId: String? = null
-    private val subtitleCache = LruCache<String, List<Cue>>(16)
     val error = MutableStateFlow<String?>(null)
-    private var subtitleJob: Job? = null
     private var queueJob: Job? = null
     private var queueItems = emptyList<MediaItem>()
     private var openingJob: Job? = null
@@ -165,6 +170,7 @@ class AppViewModel(
     private var openingGeneration = 0
     private var openingPlayWhenReady = true
     private var controller: MediaController? = null
+    private val controllerReady = CompletableDeferred<MediaController>()
     private var closed = false
     private val future =
         MediaController.Builder(
@@ -187,28 +193,36 @@ class AppViewModel(
         viewModelScope.launch {
             asmrQuery.collect { savedState["asmr-query"] = it?.let(::encodeAsmrQuery) }
         }
+        viewModelScope.launch {
+            repository.settings
+                .map { it.textEncoding }
+                .distinctUntilChanged()
+                .collect { subtitleLoader.onEncodingChanged(it) }
+        }
+        // Single main-thread initialization path guarantees listeners are attached before use.
         future.addListener(
             {
-                if (!closed)
+                if (!closed) {
                     runCatching {
-                        controller =
-                            future.get().also { c ->
-                                c.addListener(
-                                    object : Player.Listener {
-                                        override fun onEvents(
-                                            player: Player,
-                                            events: Player.Events,
-                                        ) {
-                                            updatePlayer()
-                                        }
-                                    },
-                                )
-                            }
-                        videoPlayer.value = controller
+                        val connected = future.get()
+                        connected.addListener(
+                            object : Player.Listener {
+                                override fun onEvents(player: Player, events: Player.Events) {
+                                    updatePlayer()
+                                }
+                            },
+                        )
+                        controller = connected
+                        videoPlayer.value = connected
+                        controllerReady.complete(connected)
                         publishVideoVisibility()
                         updatePlayer()
                     }
-                        .onFailure { error.value = "播放服务连接失败" }
+                        .onFailure { failure ->
+                            controllerReady.completeExceptionally(failure)
+                            error.value = "播放服务连接失败"
+                        }
+                }
             },
             ContextCompat.getMainExecutor(repository.context),
         )
@@ -290,26 +304,31 @@ class AppViewModel(
         position.value = c.currentPosition.coerceAtLeast(0)
         player.value =
             PlaybackState(
-                id,
-                c.isPlaying,
-                c.currentPosition.coerceAtLeast(0),
-                c.duration.takeIf { it != C.TIME_UNSET && it > 0 } ?: 0,
-                c.playbackState == Player.STATE_BUFFERING,
-                extras.getLong("timerEnd", 0),
-                extras.getLong("loopStart", -1),
-                extras.getLong("loopEnd", -1),
-                c.playWhenReady && c.playbackState != Player.STATE_ENDED && c.playerError == null,
-                c.hasPreviousMediaItem(),
-                c.hasNextMediaItem(),
-                c.playbackState == Player.STATE_ENDED,
-                c.playerError != null,
-                updateQueue(c),
-                hasVideo,
-                aspect,
-                !c.currentTracks.isEmpty,
+                trackId = id,
+                playing = c.isPlaying,
+                positionMs = c.currentPosition.coerceAtLeast(0),
+                durationMs = c.duration.takeIf { it != C.TIME_UNSET && it > 0 } ?: 0,
+                buffering = c.playbackState == Player.STATE_BUFFERING,
+                timerEnd = extras.getLong("timerEnd", 0),
+                loopStart = extras.getLong("loopStart", -1),
+                loopEnd = extras.getLong("loopEnd", -1),
+                playWhenReady =
+                    c.playWhenReady &&
+                        c.playbackState != Player.STATE_ENDED &&
+                        c.playerError == null,
+                hasPrevious = c.hasPreviousMediaItem(),
+                hasNext = c.hasNextMediaItem(),
+                ended = c.playbackState == Player.STATE_ENDED,
+                failed = c.playerError != null,
+                queueIds = updateQueue(c),
+                hasVideo = hasVideo,
+                videoAspectRatio = aspect,
+                tracksKnown = !c.currentTracks.isEmpty,
+                speed = c.playbackParameters.speed,
+                repeatMode = c.repeatMode,
             )
         if (loopDraftTrack != id) loopDraftStart.value = -1
-        if (id != null && id != subtitleTrackId) loadSubtitles(id)
+        if (id != null && id != subtitleLoader.currentTrackId) loadSubtitles(id)
     }
 
     private fun updateQueue(c: MediaController): List<String> {
@@ -443,11 +462,9 @@ class AppViewModel(
                         playWhenReady = openingPlayWhenReady,
                     )
                 position.value = player.value.positionMs
-                if (subtitleTrackId != provisional.id) loadSubtitles(provisional.id)
+                if (subtitleLoader.currentTrackId != provisional.id) loadSubtitles(provisional.id)
                 else retrySubtitles(provisional.id)
-                val c =
-                    controller
-                        ?: withContext(Dispatchers.IO) { future.get() }.also { controller = it }
+                val c = controller ?: controllerReady.await()
                 // Continue the active work from the live player, never its older database
                 // checkpoint.
                 val currentIndex = tracks.indexOfFirst { it.id == c.currentMediaItem?.mediaId }
@@ -539,10 +556,7 @@ class AppViewModel(
             if (c.playWhenReady && c.playbackState != Player.STATE_ENDED && c.playerError == null)
                 c.pause()
             else if (c.mediaItemCount > 0) resume(c)
-            else
-                action {
-                    repository.latestDetails()?.let { playWork(it) }
-                }
+            else action { repository.latestDetails()?.let { playWork(it) } }
             updatePlayer()
         }
     }
@@ -573,6 +587,31 @@ class AppViewModel(
         updatePlayer()
     }
 
+    fun setPlaybackSpeed(speed: Float) {
+        val clamped = speed.coerceIn(0.5f, 2.0f)
+        controller?.setPlaybackSpeed(clamped)
+        action { repository.setSettings(playbackSpeed = clamped) }
+        updatePlayer()
+    }
+
+    fun setRepeatMode(mode: Int) {
+        controller?.let { c ->
+            c.repeatMode = mode
+            updatePlayer()
+        }
+    }
+
+    fun cycleRepeatMode() {
+        val current = controller?.repeatMode ?: player.value.repeatMode
+        val next =
+            when (current) {
+                Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                else -> Player.REPEAT_MODE_OFF
+            }
+        setRepeatMode(next)
+    }
+
     fun selectQueuedTrack(id: String) {
         val c = controller ?: return
         val index = (0 until c.mediaItemCount).firstOrNull { c.getMediaItemAt(it).mediaId == id }
@@ -593,13 +632,25 @@ class AppViewModel(
     }
 
     fun loop(start: Long = -1, end: Long = -1) {
-        player.value = player.value.copy(loopStart = start, loopEnd = end)
-        controller?.sendCustomCommand(
-            SessionCommand(PlaybackService.LOOP, Bundle.EMPTY),
-            Bundle().apply {
-                putLong("start", start)
-                putLong("end", end)
-            },
+        val c = controller
+        if (c == null) {
+            if (start < 0 || end <= start) {
+                player.value = player.value.copy(loopStart = -1, loopEnd = -1)
+            }
+            return
+        }
+        val commandFuture =
+            c.sendCustomCommand(
+                SessionCommand(PlaybackService.LOOP, Bundle.EMPTY),
+                Bundle().apply {
+                    putLong("start", start)
+                    putLong("end", end)
+                },
+            )
+        // Reconcile against the service's validated extras once the command settles.
+        commandFuture.addListener(
+            { updatePlayer() },
+            ContextCompat.getMainExecutor(repository.context),
         )
     }
 
@@ -607,12 +658,24 @@ class AppViewModel(
 
     fun deleteBookmark(id: String) = action { repository.deleteBookmark(id) }
 
-    fun exportPlaybackDiagnostics() {
-        val context = repository.context
-        context.startActivity(
-            Intent.createChooser(repository.playbackDiagnostics.shareIntent(), "播放诊断")
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-        )
+    fun exportPlaybackDiagnostics() = action {
+        val intent = withContext(Dispatchers.IO) { repository.playbackDiagnostics.shareIntent() }
+        launchChooser(intent, "播放诊断")
+    }
+
+    fun exportDlsiteDiagnostics() = action {
+        val intent = withContext(Dispatchers.IO) { repository.dlsiteDiagnostics.shareIntent() }
+        launchChooser(intent, "DLsite 诊断")
+    }
+
+    private fun launchChooser(intent: Intent, title: String) {
+        try {
+            repository.context.startActivity(
+                Intent.createChooser(intent, title).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        } catch (_: ActivityNotFoundException) {
+            error.value = "未找到可分享的应用"
+        }
     }
 
     fun download(id: String) = action { repository.offlineStore.downloadWork(id) }
@@ -627,6 +690,7 @@ class AppViewModel(
     }
 
     private fun detachTracks(ids: Set<String>) {
+        if (ids.isEmpty()) return
         controller?.let { c ->
             if (c.currentMediaItem?.mediaId in ids) {
                 c.pause()
@@ -636,12 +700,13 @@ class AppViewModel(
             for (index in c.mediaItemCount - 1 downTo 0) if (c.getMediaItemAt(index).mediaId in ids)
                 c.removeMediaItem(index)
         }
-        ids.forEach { subtitleCache.remove(it) }
+        subtitleLoader.removeCached(ids)
     }
 
     fun removeSource(sourceId: String) = action {
-        if (repository.source(sourceId)?.kindType == SourceKind.DLSITE) {
-            cancelOpening(repository.sourceWorkIds(sourceId).toSet())
+        val workIds = repository.sourceWorkIds(sourceId).toSet()
+        if (workIds.isNotEmpty()) {
+            cancelOpening(workIds)
             val trackIds = repository.sourceWorkTrackIds(sourceId)
             detachTracks(trackIds)
         }
@@ -698,61 +763,13 @@ class AppViewModel(
         )
     }
 
-    fun loadSubtitles(id: String?) {
-        if (id != null && id == subtitleTrackId && subtitleJob?.isActive == true) return
-        subtitleJob?.cancel()
-        subtitleTrackId = id
-        cues.value = id?.let { subtitleCache[it] }.orEmpty()
-        subtitleLoading.value = false
-        subtitleError.value = null
-        if (id == null || subtitleCache[id] != null) return
-        val job =
-            viewModelScope.launch(start = CoroutineStart.LAZY) {
-                try {
-                    val track = repository.track(id) ?: return@launch
-                    val attachmentId = track.subtitleId ?: return@launch
-                    subtitleLoading.value = true
-                    val detail = repository.workDetails(track.workId) ?: return@launch
-                    val attachment =
-                        detail.attachments.firstOrNull { it.id == attachmentId } ?: return@launch
-                    val bytes = repository.readAsset(attachment.id)
-                    val parsed =
-                        withContext(Dispatchers.Default) {
-                            SubtitleTimeline.parse(
-                                bytes.toString(Charsets.UTF_8),
-                                attachment.fileName.substringAfterLast('.'),
-                            )
-                        }
-                    ensureActive()
-                    subtitleCache.put(id, parsed)
-                    if (subtitleTrackId == id) cues.value = parsed
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    if (subtitleTrackId == id && subtitleJob === currentCoroutineContext()[Job]) {
-                        subtitleError.value = "字幕暂时不可用"
-                    }
-                } finally {
-                    if (subtitleTrackId == id && subtitleJob === currentCoroutineContext()[Job])
-                        subtitleLoading.value = false
-                }
-            }
-        subtitleJob = job
-        job.start()
-    }
+    fun loadSubtitles(id: String?) = subtitleLoader.load(id)
 
-    fun retrySubtitles(id: String? = subtitleTrackId) {
-        if (
-            id != null &&
-                id == subtitleTrackId &&
-                subtitleError.value != null &&
-                subtitleJob?.isActive != true
-        )
-            loadSubtitles(id)
-    }
+    fun retrySubtitles(id: String? = subtitleLoader.currentTrackId) = subtitleLoader.retry(id)
 
     override fun onCleared() {
         closed = true
+        controllerReady.cancel()
         setVideoVisible(false)
         videoPlayer.value = null
         MediaController.releaseFuture(future)

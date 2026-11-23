@@ -81,4 +81,13 @@ class ProgressWriterTest {
         writer.flush()
         assertEquals(listOf("a", "b", "a"), saved.map { it.workId })
     }
+
+    @Test
+    fun immediateSavePersistsWithoutDebounceDelay() = runIsolatedTest { scope ->
+        val written = CompletableDeferred<ProgressEntity>()
+        val writer = ProgressWriter(scope, { written.complete(it) })
+        writer.saveImmediate(ProgressEntity("a", "a1", 777, 1))
+        val entity = withTimeout(1000) { written.await() }
+        assertEquals(777L, entity.positionMs)
+    }
 }

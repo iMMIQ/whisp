@@ -72,6 +72,7 @@ class PlaybackDiagnostics(private val context: Context) {
         preferences.edit { clear() }
     }
 
+    @Synchronized
     fun shareIntent(): Intent {
         val events = readEvents()
         val report = buildJsonObject {

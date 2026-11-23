@@ -274,6 +274,23 @@ interface LibraryDao {
 
     @Query("SELECT * FROM tracks WHERE id = :id") suspend fun track(id: String): TrackEntity?
 
+    @Query("SELECT * FROM tracks WHERE id IN (:ids)")
+    suspend fun tracksByIds(ids: List<String>): List<TrackEntity>
+
+    @Query("SELECT * FROM works WHERE id IN (:ids)")
+    suspend fun worksByIds(ids: List<String>): List<WorkEntity>
+
+    @Query("SELECT id FROM tracks WHERE workId = :workId")
+    suspend fun trackIdsForWork(workId: String): List<String>
+
+    @Query("SELECT id FROM attachments WHERE workId = :workId")
+    suspend fun attachmentIdsForWork(workId: String): List<String>
+
+    @Query(
+        "SELECT id FROM works WHERE id IN (:workIds) AND offlineAttachments = 0 AND NOT EXISTS(SELECT 1 FROM tracks JOIN locations ON locations.assetId = tracks.id JOIN sources ON sources.id = locations.sourceId WHERE tracks.workId = works.id)",
+    )
+    suspend fun unlocatedWorkIds(workIds: List<String>): List<String>
+
     @Query("UPDATE tracks SET durationMs = :duration WHERE id = :id AND durationMs != :duration")
     suspend fun updateDuration(id: String, duration: Long)
 

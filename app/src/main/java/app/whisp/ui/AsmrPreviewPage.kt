@@ -80,6 +80,8 @@ internal fun AsmrPreviewPage(
         }
     }
     LaunchedEffect(sourceId, id) { if (current == null) model.restoreAsmrPreview(sourceId, id) }
+    val sections =
+        remember(preview) { preview?.details?.let { TrackSections.groups(it.tracks) }.orEmpty() }
     LazyColumn(Modifier.fillMaxSize().testTag("asmr-preview")) {
         item {
             Box(Modifier.fillMaxWidth().aspectRatio(.92f).background(Surface)) {
@@ -184,27 +186,25 @@ internal fun AsmrPreviewPage(
                 filter,
             )
         if (tab == "曲目")
-            preview?.details?.let { detail ->
-                TrackSections.groups(detail.tracks).forEach { section ->
-                    if (TrackSections.groups(detail.tracks).size > 1)
-                        item {
-                            Text(
-                                section.title,
-                                Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
-                                color = Rose,
-                                fontSize = 18.sp,
-                            )
-                        }
-                    items(section.tracks, key = { it.id }) { track ->
-                        Row(
-                            Modifier.fillMaxWidth()
-                                .clickable(enabled = !saving) { save(track.id, true) }
-                                .padding(horizontal = 24.dp, vertical = 16.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(track.title, Modifier.weight(1f), fontSize = 16.sp)
-                            Icon(Icons.Filled.PlayArrow, "播放${track.title}", tint = Rose)
-                        }
+            sections.forEach { section ->
+                if (sections.size > 1)
+                    item(key = "section:${section.key}") {
+                        Text(
+                            section.title,
+                            Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+                            color = Rose,
+                            fontSize = 18.sp,
+                        )
+                    }
+                items(section.tracks, key = { it.id }) { track ->
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickable(enabled = !saving) { save(track.id, true) }
+                            .padding(horizontal = 24.dp, vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(track.title, Modifier.weight(1f), fontSize = 16.sp)
+                        Icon(Icons.Filled.PlayArrow, "播放${track.title}", tint = Rose)
                     }
                 }
             }

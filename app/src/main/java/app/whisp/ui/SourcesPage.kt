@@ -70,6 +70,10 @@ internal fun SourcesPage(
                     )
                 }
         }
+    val offlineWorks =
+        remember(library, downloads) {
+            library.filter { detail -> detail.tracks.any { downloads.containsKey(it.id) } }
+        }
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(24.dp),
@@ -78,7 +82,7 @@ internal fun SourcesPage(
         item {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "来源",
+                    androidx.compose.ui.res.stringResource(app.whisp.R.string.title_sources),
                     fontFamily = FontFamily.Serif,
                     fontSize = 30.sp,
                     modifier = Modifier.weight(1f),
@@ -148,9 +152,6 @@ internal fun SourcesPage(
                     Text("添加作品")
                 }
             }
-        val offlineWorks = library.filter { detail ->
-            detail.tracks.any { downloads.containsKey(it.id) }
-        }
         if (offlineWorks.isNotEmpty())
             item {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -375,6 +376,7 @@ private fun RemoteDialog(model: AppViewModel, kind: String, dismiss: () -> Unit)
     var address by rememberSaveable(kind) { mutableStateOf("") }
     var username by rememberSaveable(kind) { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var allowUnencryptedSmb by rememberSaveable(kind) { mutableStateOf(false) }
     var version by rememberSaveable(kind) { mutableIntStateOf(4) }
     var uid by rememberSaveable(kind) { mutableStateOf("65534") }
     var gid by rememberSaveable(kind) { mutableStateOf("65534") }
@@ -453,6 +455,26 @@ private fun RemoteDialog(model: AppViewModel, kind: String, dismiss: () -> Unit)
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                     )
+                    if (kind == "SMB") {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                androidx.compose.ui.res.stringResource(
+                                    app.whisp.R.string.label_smb_compat,
+                                ),
+                                Modifier.weight(1f),
+                                fontSize = 14.sp,
+                                color = Muted,
+                            )
+                            Switch(
+                                checked = allowUnencryptedSmb,
+                                onCheckedChange = { allowUnencryptedSmb = it },
+                                enabled = !connecting,
+                            )
+                        }
+                    }
                 }
                 error?.let { Text(it, color = Rose) }
             }
@@ -466,7 +488,14 @@ private fun RemoteDialog(model: AppViewModel, kind: String, dismiss: () -> Unit)
                     scope.launch {
                         try {
                             when (kind) {
-                                "SMB" -> model.repository.addSmb(name, address, username, password)
+                                "SMB" ->
+                                    model.repository.addSmb(
+                                        name,
+                                        address,
+                                        username,
+                                        password,
+                                        encrypt = if (allowUnencryptedSmb) false else null,
+                                    )
                                 "NFS" ->
                                     model.repository.addNfs(
                                         name,

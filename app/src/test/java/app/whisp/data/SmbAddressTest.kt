@@ -25,6 +25,11 @@ class SmbAddressTest {
         assertEquals(1445, SmbAddress.parse("smb://localhost:1445/ASMR").port)
         assertEquals(SmbAccount("listener", "WORKGROUP"), SmbAccount.parse("WORKGROUP\\listener"))
         assertEquals(SmbAccount("listener", ""), SmbAccount.parse("listener"))
+        val unencrypted = SmbAddress.parse("smb://nas.example/media/Audio/", encrypt = false)
+        assertFalse(unencrypted.encrypt)
+        assertTrue(unencrypted.normalized.endsWith("?encrypt=false"))
+        assertEquals(unencrypted, SmbAddress.parse(unencrypted.normalized))
+        assertTrue(SmbAddress.parse("smb://nas.example/media/Audio/").encrypt)
     }
 
     @Test

@@ -55,6 +55,7 @@ class AsmrOneClient(
     companion object {
         const val API_ROOT = "https://api.asmr.one/"
         val MEDIA_HEADERS = mapOf("Origin" to "https://asmr.one", "Referer" to "https://asmr.one/")
+        private val illegalPathChars = Regex("[\\\\/\\u0000]")
     }
 
     suspend fun catalog(
@@ -115,7 +116,7 @@ class AsmrOneClient(
             for (element in nodes) {
                 require(++visited <= 20000) { "作品文件数量过多" }
                 val node = element.jsonObject
-                val name = node.text("title").replace(Regex("[\\\\/\\u0000]"), "_").trim()
+                val name = node.text("title").replace(illegalPathChars, "_").trim()
                 if (name.isEmpty() || name in setOf(".", "..")) continue
                 val path = "$parent/$name"
                 val children = node["children"] as? JsonArray

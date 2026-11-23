@@ -20,7 +20,7 @@ import app.whisp.data.PrecisionScrubber
 
 @Composable
 internal fun PrecisionSeekBar(
-    position: Long,
+    positionProvider: () -> Long,
     duration: Long,
     enabled: Boolean,
     loopStart: Long,
@@ -53,7 +53,7 @@ internal fun PrecisionSeekBar(
                     contentDescription = "播放进度"
                     progressBarRangeInfo =
                         ProgressBarRangeInfo(
-                            position.toFloat(),
+                            positionProvider().toFloat(),
                             0f..duration.coerceAtLeast(1).toFloat(),
                         )
                     if (!enabled) disabled()
@@ -134,7 +134,7 @@ internal fun PrecisionSeekBar(
                         )
                     }
             }
-            val value = preview ?: position
+            val value = preview ?: positionProvider()
             drawLine(tint, Offset(0f, y), Offset(x(value), y), 4.dp.toPx(), StrokeCap.Round)
             drawCircle(tint, if (preview != null) 8.dp.toPx() else 5.dp.toPx(), Offset(x(value), y))
         }

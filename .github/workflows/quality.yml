@@ -45,7 +45,7 @@ jobs:
         run: |
           python3 -m pip install black==26.10.1
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-format-19 ccache
+          sudo apt-get install -y --no-install-recommends clang-format-19 ccache cmake g++
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;36.0.0" "ndk;30.0.16248370" "cmake;3.31.6"
       - name: Check and build
         run: |

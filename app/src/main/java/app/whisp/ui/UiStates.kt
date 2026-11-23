@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import androidx.media3.common.Player
 import app.whisp.data.AsmrPreview
 import app.whisp.data.AsmrWork
 import app.whisp.data.DlsiteDetails
@@ -37,6 +38,8 @@ data class PlaybackState(
     val hasVideo: Boolean = false,
     val videoAspectRatio: Float = 16f / 9f,
     val tracksKnown: Boolean = false,
+    val speed: Float = 1f,
+    val repeatMode: Int = Player.REPEAT_MODE_OFF,
 )
 
 internal fun playControlLabel(state: PlaybackState): String =

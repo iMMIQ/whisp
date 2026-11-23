@@ -9,11 +9,18 @@ import androidx.media3.common.util.UnstableApi
 internal object AudioOffload {
     fun supported(sdkInt: Int): Boolean = sdkInt >= 29
 
-    /** Loop polling and the sleep timer need Handler deadlines that stall in offload sleep. */
+    /**
+     * Loop polling and Handler-backed sleep timers rely on CPU deadlines that stall during offload
+     * sleep. When the sleep timer is delegated to AlarmManager, pass 0 for [timerEnd] so offload
+     * remains enabled overnight.
+     */
     fun needsPreciseDeadline(loopStart: Long, loopEnd: Long, timerEnd: Long): Boolean =
         (loopStart >= 0 && loopEnd > loopStart) || timerEnd > 0
 
-    fun preferences(enabled: Boolean = true): TrackSelectionParameters.AudioOffloadPreferences =
+    fun preferences(
+        enabled: Boolean = true,
+        speedChangeRequired: Boolean = false,
+    ): TrackSelectionParameters.AudioOffloadPreferences =
         TrackSelectionParameters.AudioOffloadPreferences.Builder()
             .setAudioOffloadMode(
                 if (enabled) {
@@ -23,6 +30,6 @@ internal object AudioOffload {
                 },
             )
             .setIsGaplessSupportRequired(true)
-            .setIsSpeedChangeSupportRequired(false)
+            .setIsSpeedChangeSupportRequired(speedChangeRequired)
             .build()
 }

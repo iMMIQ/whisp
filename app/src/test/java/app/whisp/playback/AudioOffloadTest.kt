@@ -39,5 +39,9 @@ class AudioOffloadTest {
         assertTrue(AudioOffload.needsPreciseDeadline(-1, -1, 1_000_000))
         assertFalse(AudioOffload.needsPreciseDeadline(-1, -1, 0))
         assertFalse(AudioOffload.needsPreciseDeadline(5_000, 5_000, 0))
+        assertTrue(
+            AudioOffload.preferences(enabled = true, speedChangeRequired = true)
+                .isSpeedChangeSupportRequired,
+        )
     }
 }

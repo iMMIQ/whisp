@@ -5,7 +5,13 @@ import java.net.URI
 import java.net.URLDecoder
 
 /** Credentials live in the source record, never in media URLs. */
-data class SmbAddress(val host: String, val port: Int, val share: String, val root: List<String>) {
+data class SmbAddress(
+    val host: String,
+    val port: Int,
+    val share: String,
+    val root: List<String>,
+    val encrypt: Boolean = true,
+) {
     val normalized: String
         get() =
             URI(
@@ -14,7 +20,7 @@ data class SmbAddress(val host: String, val port: Int, val share: String, val ro
                     host,
                     if (port == 445) -1 else port,
                     "/" + (listOf(share) + root).joinToString("/") + "/",
-                    null,
+                    if (encrypt) null else "encrypt=false",
                     null,
                 )
                 .toASCIIString()
@@ -22,7 +28,9 @@ data class SmbAddress(val host: String, val port: Int, val share: String, val ro
     fun filePath(relative: String) = (root + safeSegments(relative)).joinToString("\\")
 
     companion object {
-        fun parse(value: String): SmbAddress {
+        private val sourceIdPattern = Regex("[A-Za-z0-9_-]+")
+
+        fun parse(value: String, encrypt: Boolean? = null): SmbAddress {
             val uri =
                 try {
                     URI(value.trim())
@@ -32,8 +40,19 @@ data class SmbAddress(val host: String, val port: Int, val share: String, val ro
             require(uri.scheme.equals("smb", true) && !uri.host.isNullOrBlank()) {
                 "请输入 smb://服务器/共享名/目录"
             }
-            require(uri.userInfo == null && uri.query == null && uri.fragment == null) {
-                "账号请填写在账号栏"
+            require(uri.userInfo == null && uri.fragment == null) { "账号请填写在账号栏" }
+            var resolvedEncrypt = encrypt ?: true
+            uri.rawQuery?.let { raw ->
+                val pairs = raw.split('&')
+                require(pairs.size == 1) { "账号请填写在账号栏" }
+                val pair = pairs.single().split('=', limit = 2)
+                require(pair.size == 2 && pair[0] == "encrypt") { "账号请填写在账号栏" }
+                resolvedEncrypt =
+                    when (pair[1]) {
+                        "true" -> true
+                        "false" -> false
+                        else -> throw IllegalArgumentException("SMB 加密参数无效")
+                    }
             }
             require(uri.port == -1 || uri.port in 1..65535) { "端口无效" }
             val parts = decodeSegments(uri.rawPath.orEmpty())
@@ -43,11 +62,12 @@ data class SmbAddress(val host: String, val port: Int, val share: String, val ro
                 if (uri.port == -1) 445 else uri.port,
                 parts.first(),
                 parts.drop(1),
+                encrypt ?: resolvedEncrypt,
             )
         }
 
         fun assetUri(sourceId: String, relative: String): String {
-            require(sourceId.matches(Regex("[A-Za-z0-9_-]+")))
+            require(sourceIdPattern.matches(sourceId))
             return URI("whisp-smb", sourceId, "/" + safeSegments(relative).joinToString("/"), null)
                 .toASCIIString()
         }

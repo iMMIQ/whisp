@@ -91,4 +91,30 @@ class WebDavClientTest {
             "https://nas.example/".toHttpUrl(),
         )
     }
+
+    @Test
+    fun walksNestedDirectoriesConcurrentlyAndKeepsAllFiles() = runBlocking {
+        withMockServer { server ->
+            server.dispatcher =
+                object : mockwebserver3.Dispatcher() {
+                    override fun dispatch(request: mockwebserver3.RecordedRequest): MockResponse {
+                        val body =
+                            when (request.url.encodedPath) {
+                                "/ASMR/" ->
+                                    """<d:multistatus xmlns:d="DAV:">${response("/ASMR/", true)}${response("/ASMR/a/", true)}${response("/ASMR/b/", true)}</d:multistatus>"""
+                                "/ASMR/a/" ->
+                                    """<d:multistatus xmlns:d="DAV:">${response("/ASMR/a/", true)}${response("/ASMR/a/01.flac")}</d:multistatus>"""
+                                "/ASMR/b/" ->
+                                    """<d:multistatus xmlns:d="DAV:">${response("/ASMR/b/", true)}${response("/ASMR/b/02.wav")}</d:multistatus>"""
+                                else -> """<d:multistatus xmlns:d="DAV:"/>"""
+                            }
+                        return MockResponse.Builder().code(207).body(body).build()
+                    }
+                }
+            val source = SourceEntity("src", "NAS", "webdav", server.url("/ASMR/").toString())
+            val entries = WebDavClient(OkHttpClient()).walk(source, "")
+            val paths = entries.filterNot { it.directory }.map { it.path }.sorted()
+            assertEquals(listOf("a/01.flac", "b/02.wav"), paths)
+        }
+    }
 }

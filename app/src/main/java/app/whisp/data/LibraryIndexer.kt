@@ -23,6 +23,12 @@ fun stableId(value: String): String = value.encodeUtf8().sha256().substring(0, 1
 object LibraryIndexer {
     private val rjPattern = Regex("RJ\\d{6,}", RegexOption.IGNORE_CASE)
     private val images = setOf("jpg", "jpeg", "png", "webp")
+    private val codePrefix = Regex("^[A-Za-z]\\d+[_-]")
+    private val leadingNumber = Regex("^(\\d+)")
+    private val leadingNumberSep = Regex("^\\d+[_ .-]*")
+    private val bonusPattern = Regex("附赠|特典|おまけ|omake|bonus", RegexOption.IGNORE_CASE)
+    private val bracketPattern = Regex("【[^】]*】|\\[[^]]*]")
+    private val seriesFrame = Regex("^[「『]|[」』]系列$")
 
     private fun String.extension() = substringAfterLast('.', "").lowercase()
 
@@ -39,20 +45,12 @@ object LibraryIndexer {
     private fun stem(name: String) = name.replace(subtitleSuffix, "").replace(resourceSuffix, "")
 
     fun number(name: String): Int =
-        Regex("^(\\d+)")
-            .find(
-                name.replace(Regex("^[A-Za-z]\\d+[_-]"), ""),
-            )
-            ?.groupValues
-            ?.get(1)
-            ?.toIntOrNull() ?: 9999
+        leadingNumber.find(name.replace(codePrefix, ""))?.groupValues?.get(1)?.toIntOrNull() ?: 9999
 
     fun trackTitle(name: String): String =
-        stem(name)
-            .replace(Regex("^[A-Za-z]\\d+[_-]"), "")
-            .replace(Regex("^\\d+[_ .-]*"), "")
-            .trim()
-            .ifBlank { stem(name) }
+        stem(name).replace(codePrefix, "").replace(leadingNumberSep, "").trim().ifBlank {
+            stem(name)
+        }
 
     private fun rootOf(path: String): String {
         val dirs = path.split('/').dropLast(1)
@@ -109,10 +107,7 @@ object LibraryIndexer {
                     when (file.path.extension()) {
                         in MediaFormats.subtitles -> "subtitle"
                         "txt" ->
-                            if (
-                                Regex("附赠|特典|おまけ|omake|bonus", RegexOption.IGNORE_CASE)
-                                    .containsMatchIn(relative.substringBeforeLast('/'))
-                            )
+                            if (bonusPattern.containsMatchIn(relative.substringBeforeLast('/')))
                                 "extra-text"
                             else "script"
                         in images -> "image"
@@ -145,16 +140,14 @@ object LibraryIndexer {
                     ?.value
                     ?.id
             val title =
-                name.replace(rjPattern, "").replace(Regex("【[^】]*】|\\[[^]]*]"), "").trim().ifBlank {
-                    name
-                }
+                name.replace(rjPattern, "").replace(bracketPattern, "").trim().ifBlank { name }
             val series =
                 root
                     .split('/')
                     .dropLast(1)
                     .lastOrNull()
                     ?.takeUnless { rjPattern.containsMatchIn(it) }
-                    ?.replace(Regex("^[「『]|[」』]系列$"), "")
+                    ?.replace(seriesFrame, "")
             works +=
                 workOverride?.copy(coverId = workOverride.coverId ?: cover)
                     ?: WorkEntity(workId, rj, title, name, series = series, coverId = cover)
@@ -174,15 +167,15 @@ object LibraryIndexer {
                 attachments += attachment
                 addLocation(file, attachment.id)
             }
+            // Index companion resources by normalized stem once (O(T + R) instead of O(T * R)).
+            val resourcesByStem =
+                resources.entries.groupBy { stem(it.key.path.basename()).lowercase() }
             group
                 .sortedWith(compareBy<FileEntry> { number(it.path.basename()) }.thenBy { it.path })
                 .forEach { file ->
                     val fileName = file.path.basename()
                     val relative = file.path.removePrefix("$root/")
-                    val sameName =
-                        resources.entries.filter {
-                            stem(it.key.path.basename()).equals(stem(fileName), ignoreCase = true)
-                        }
+                    val sameName = resourcesByStem[stem(fileName).lowercase()].orEmpty()
                     // Exact stem wins; script folders sometimes prefix the work's code.
                     fun match(kind: String) =
                         sameName
@@ -224,9 +217,7 @@ object LibraryIndexer {
                             number(fileName),
                             subtitleId = subtitle,
                             scriptId = match("script"),
-                            bonus =
-                                Regex("附赠|特典|おまけ|omake|bonus", RegexOption.IGNORE_CASE)
-                                    .containsMatchIn(relative),
+                            bonus = bonusPattern.containsMatchIn(relative),
                         )
                     tracks += track
                     addLocation(file, track.id)

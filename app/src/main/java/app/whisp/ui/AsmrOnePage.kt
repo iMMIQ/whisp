@@ -289,7 +289,7 @@ internal fun AsmrOnePage(
                 }
             else
                 LazyVerticalGrid(
-                    GridCells.Fixed(2),
+                    GridCells.Adaptive(minSize = 160.dp),
                     Modifier.fillMaxSize().testTag("asmr-grid"),
                     state = grid,
                     contentPadding = PaddingValues(20.dp),
@@ -299,7 +299,7 @@ internal fun AsmrOnePage(
                     items(
                         works.itemCount,
                         key = works.itemKey { it.workId },
-                        span = { GridItemSpan(if (it == 0) 2 else 1) },
+                        span = { GridItemSpan(if (it == 0) maxLineSpan else 1) },
                     ) { index ->
                         works[index]?.let {
                             WorkCard(it.entity(), model, index == 0, it.coverUrl, sourceId) {
@@ -307,7 +307,7 @@ internal fun AsmrOnePage(
                             }
                         }
                     }
-                    item(span = { GridItemSpan(2) }) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
                         CatalogAppend(works.loadState.append) { works.retry() }
                     }
                 }
@@ -414,6 +414,7 @@ private fun AsmrFilters(
                                 it !in selected
                         }
                         .take(20),
+                    key = { "${it.kind}|${it.name}" },
                 ) { facet ->
                     TextButton(
                         onClick = {
@@ -427,7 +428,7 @@ private fun AsmrFilters(
                 }
             }
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(selected) { facet ->
+                items(selected, key = { "${it.kind}|${it.name}" }) { facet ->
                     InputChip(
                         selected = true,
                         onClick = { selected = selected - facet },

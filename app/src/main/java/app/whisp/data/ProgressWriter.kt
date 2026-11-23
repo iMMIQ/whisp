@@ -13,15 +13,23 @@ internal class ProgressWriter(
     private val failed: (Exception) -> Unit = {},
 ) {
     private val pending = LinkedHashMap<String, ProgressEntity>()
-    private val signal = Channel<Unit>(Channel.CONFLATED)
+    private val signal = Channel<Boolean>(Channel.CONFLATED)
     private val writes = Mutex()
     private var latest: ProgressEntity? = null
+    private var immediateRequested = false
 
     init {
         scope.launch {
-            for (ignored in signal) {
-                // Merge the callbacks produced by a single pause/seek/transition.
-                delay(150)
+            for (immediate in signal) {
+                val skipDelay =
+                    synchronized(pending) {
+                        val value = immediate || immediateRequested
+                        immediateRequested = false
+                        value
+                    }
+                // Merge the callbacks produced by a single pause/seek/transition unless shutting
+                // down.
+                if (!skipDelay) delay(150)
                 try {
                     flush()
                 } catch (e: CancellationException) {
@@ -29,13 +37,17 @@ internal class ProgressWriter(
                 } catch (e: Exception) {
                     failed(e)
                     delay(5000)
-                    signal.trySend(Unit)
+                    signal.trySend(false)
                 }
             }
         }
     }
 
-    fun save(progress: ProgressEntity) =
+    fun save(progress: ProgressEntity) = enqueue(progress, immediate = false)
+
+    fun saveImmediate(progress: ProgressEntity) = enqueue(progress, immediate = true)
+
+    private fun enqueue(progress: ProgressEntity, immediate: Boolean) =
         synchronized(pending) {
             if (
                 latest?.let {
@@ -43,12 +55,18 @@ internal class ProgressWriter(
                         it.trackId == progress.trackId &&
                         it.positionMs == progress.positionMs
                 } == true
-            )
+            ) {
+                if (immediate && pending.isNotEmpty()) {
+                    immediateRequested = true
+                    signal.trySend(true)
+                }
                 return@synchronized
+            }
             latest = progress
             pending.remove(progress.workId)
             pending[progress.workId] = progress
-            signal.trySend(Unit)
+            if (immediate) immediateRequested = true
+            signal.trySend(immediate)
             Unit
         }
 

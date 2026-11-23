@@ -22,6 +22,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.whisp.DlsiteLoginActivity
+import app.whisp.data.DlsiteNoPlayableAudioException
 import app.whisp.data.DlsiteOwnedWork
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -99,13 +100,7 @@ internal fun DlsiteLibraryPage(
                         text = { Text("导出诊断") },
                         onClick = {
                             menu = false
-                            model.repository.context.startActivity(
-                                Intent.createChooser(
-                                        model.repository.dlsiteDiagnostics.shareIntent(),
-                                        "DLsite 诊断",
-                                    )
-                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                            )
+                            model.exportDlsiteDiagnostics()
                         },
                     )
                     DropdownMenuItem(
@@ -150,7 +145,7 @@ internal fun DlsiteLibraryPage(
         }
         Box(Modifier.weight(1f)) {
             LazyVerticalGrid(
-                GridCells.Fixed(2),
+                GridCells.Adaptive(minSize = 160.dp),
                 contentPadding = PaddingValues(20.dp),
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp),
@@ -158,7 +153,7 @@ internal fun DlsiteLibraryPage(
                 itemsIndexed(
                     visible,
                     key = { _, work -> work.workno },
-                    span = { index, _ -> GridItemSpan(if (index == 0) 2 else 1) },
+                    span = { index, _ -> GridItemSpan(if (index == 0) maxLineSpan else 1) },
                 ) { index, work ->
                     WorkCard(work.entity(sourceId), model, index == 0, work.coverUrl, sourceId) {
                         if (opening == null) {
@@ -173,9 +168,10 @@ internal fun DlsiteLibraryPage(
                                     )
                                 } catch (e: CancellationException) {
                                     throw e
+                                } catch (_: DlsiteNoPlayableAudioException) {
+                                    officialPlayer = work
                                 } catch (e: Exception) {
-                                    if (e.message == "作品暂无可播放音轨") officialPlayer = work
-                                    else model.error.value = e.message ?: "作品读取失败"
+                                    model.error.value = e.message ?: "作品读取失败"
                                 } finally {
                                     opening = null
                                 }

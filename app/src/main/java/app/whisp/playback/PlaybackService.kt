@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.playback
 
+import android.app.AlarmManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import androidx.core.content.ContextCompat
 import androidx.media3.common.*
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DecoderReuseEvaluation
@@ -23,6 +28,7 @@ import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import java.util.UUID
+import kotlin.math.abs
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -37,6 +43,7 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var player: ExoPlayer
     private var session: MediaLibrarySession? = null
     private var timerEnd = 0L
+    private var timerHandledByAlarm = false
     private var loopStart = -1L
     private var loopEnd = -1L
     private var currentTrackId: String? = null
@@ -46,20 +53,40 @@ class PlaybackService : MediaLibraryService() {
     private var pendingLoopSeek: Pair<String?, Long>? = null
     private var automaticLoopSeek = false
     private var videoController: MediaSession.ControllerInfo? = null
+    private var sleepAlarmRegistered = false
     // Player callbacks arrive serially on the main thread, so enqueue order
     // matches event order and the single consumer below preserves it.
     private val diagnosticTasks = Channel<suspend () -> Unit>(Channel.UNLIMITED)
     private val decoderCorrelator = DecoderCorrelator(::onCorrelatedDecoder)
+
+    private val sleepTimerAction
+        get() = "$packageName.ACTION_SLEEP_TIMER"
+
+    private val sleepTimerReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action != sleepTimerAction) return
+                if (timerEnd > 0L) onSleepTimerExpired()
+            }
+        }
 
     companion object {
         const val TIMER = "whisp.timer"
         const val LOOP = "whisp.loop"
         const val VIDEO = "whisp.video"
         const val RECENT_ROOT = "whisp.recent"
+        private const val SLEEP_ALARM_REQUEST_CODE = 1702
     }
 
     override fun onCreate() {
         super.onCreate()
+        ContextCompat.registerReceiver(
+            this,
+            sleepTimerReceiver,
+            IntentFilter(sleepTimerAction),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        sleepAlarmRegistered = true
         player =
             ExoPlayer.Builder(this)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(repository.playbackFactory))
@@ -216,6 +243,7 @@ class PlaybackService : MediaLibraryService() {
                     loopJob?.cancel()
                     loopJob = null
                     reconcilePlaybackJobs()
+                    updateAudioOffload()
                 }
 
                 override fun onEvents(player: Player, events: Player.Events) {
@@ -480,8 +508,7 @@ class PlaybackService : MediaLibraryService() {
                                     )
                                 } else {
                                     // Boot-time requests must not resolve audio or connect to a
-                                    // remote
-                                    // source.
+                                    // remote source.
                                     MediaSession.MediaItemsWithStartPosition(
                                         listOf(catalog.recentItem(snapshot)),
                                         0,
@@ -506,29 +533,54 @@ class PlaybackService : MediaLibraryService() {
                 .build()
         scope.launch {
             repository.settingsUpdates
+                .map { it.playbackSpeed }
+                .distinctUntilChanged()
+                .collect { speed ->
+                    if (abs(player.playbackParameters.speed - speed) > 0.005f) {
+                        player.setPlaybackSpeed(speed)
+                    }
+                }
+        }
+        scope.launch {
+            repository.settingsUpdates
                 .map { it.hideArtwork }
                 .distinctUntilChanged()
                 .collect { hide ->
                     // Service ownership makes privacy work with no Activity or ViewModel alive.
                     val items = (0 until player.mediaItemCount).map { player.getMediaItemAt(it) }
-                    for ((index, old) in items.withIndex()) {
-                        val metadata =
+                    if (items.isNotEmpty()) {
+                        val metadataByTrack =
                             withContext(Dispatchers.IO) {
-                                val track =
-                                    repository.dao.track(old.mediaId) ?: return@withContext null
-                                val work =
-                                    repository.dao.work(track.workId) ?: return@withContext null
-                                repository.mediaMetadata(track, work, hide)
-                            } ?: continue
-                        if (
-                            index < player.mediaItemCount &&
-                                player.getMediaItemAt(index).mediaId == old.mediaId
-                        ) {
-                            val current = player.getMediaItemAt(index)
-                            player.replaceMediaItem(
-                                index,
-                                current.buildUpon().setMediaMetadata(metadata).build(),
-                            )
+                                val ids = items.map { it.mediaId }.distinct()
+                                val tracks =
+                                    ids.chunked(500).flatMap { repository.dao.tracksByIds(it) }
+                                val works =
+                                    tracks
+                                        .map { it.workId }
+                                        .distinct()
+                                        .chunked(500)
+                                        .flatMap { repository.dao.worksByIds(it) }
+                                        .associateBy { it.id }
+                                tracks
+                                    .mapNotNull { track ->
+                                        works[track.workId]?.let { work ->
+                                            track.id to repository.mediaMetadata(track, work, hide)
+                                        }
+                                    }
+                                    .toMap()
+                            }
+                        for ((index, old) in items.withIndex()) {
+                            val metadata = metadataByTrack[old.mediaId] ?: continue
+                            if (
+                                index < player.mediaItemCount &&
+                                    player.getMediaItemAt(index).mediaId == old.mediaId
+                            ) {
+                                val current = player.getMediaItemAt(index)
+                                player.replaceMediaItem(
+                                    index,
+                                    current.buildUpon().setMediaMetadata(metadata).build(),
+                                )
+                            }
                         }
                     }
                     val hasRecent =
@@ -587,20 +639,56 @@ class PlaybackService : MediaLibraryService() {
         player.seekTo(loopStart)
     }
 
+    private fun sleepTimerPendingIntent(): PendingIntent =
+        PendingIntent.getBroadcast(
+            this,
+            SLEEP_ALARM_REQUEST_CODE,
+            Intent(sleepTimerAction).setPackage(packageName),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+
+    private fun cancelSleepAlarm() {
+        getSystemService(AlarmManager::class.java)?.cancel(sleepTimerPendingIntent())
+        timerHandledByAlarm = false
+    }
+
+    private fun onSleepTimerExpired() {
+        timerJob?.cancel()
+        timerJob = null
+        cancelSleepAlarm()
+        timerEnd = 0
+        player.pause()
+        publishExtras()
+        updateAudioOffload()
+        saveProgress(immediate = true)
+    }
+
     private fun scheduleTimer() {
         timerJob?.cancel()
         timerJob = null
+        cancelSleepAlarm()
         if (timerEnd <= 0) return
-        timerJob = scope.launch {
-            // elapsedRealtime keeps the deadline independent of wall-clock changes.
-            while (isActive && timerEnd > SystemClock.elapsedRealtime()) delay(
-                timerEnd - SystemClock.elapsedRealtime(),
-            )
-            timerEnd = 0
-            player.pause()
-            publishExtras()
-            updateAudioOffload()
-            saveProgress()
+        val alarmManager = getSystemService(AlarmManager::class.java)
+        val scheduledWithAlarm =
+            alarmManager != null &&
+                runCatching {
+                    val pending = sleepTimerPendingIntent()
+                    alarmManager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        timerEnd,
+                        pending,
+                    )
+                }
+                    .isSuccess
+        timerHandledByAlarm = scheduledWithAlarm
+        if (!scheduledWithAlarm) {
+            timerJob = scope.launch {
+                // elapsedRealtime keeps the deadline independent of wall-clock changes.
+                while (isActive && timerEnd > SystemClock.elapsedRealtime()) delay(
+                    timerEnd - SystemClock.elapsedRealtime(),
+                )
+                onSleepTimerExpired()
+            }
         }
     }
 
@@ -629,15 +717,18 @@ class PlaybackService : MediaLibraryService() {
 
     private fun updateAudioOffload() {
         if (!AudioOffload.supported(Build.VERSION.SDK_INT)) return
-        // Loop polling and the sleep timer rely on Handler deadlines, which stall
-        // while offloaded playback lets the CPU sleep. Switching the preference
-        // reselections the audio track, so only do it on loop/timer transitions.
+        // AlarmManager-backed sleep timers wake the AP independently, allowing DSP audio offload
+        // to stay enabled overnight. Only A–B loops or fallback Handler timers disable offload.
+        val handlerTimer = if (timerHandledByAlarm) 0L else timerEnd
+        val speedChanged = abs(player.playbackParameters.speed - 1f) > 0.01f
         player.trackSelectionParameters =
             player.trackSelectionParameters
                 .buildUpon()
                 .setAudioOffloadPreferences(
                     AudioOffload.preferences(
-                        enabled = !AudioOffload.needsPreciseDeadline(loopStart, loopEnd, timerEnd),
+                        enabled =
+                            !AudioOffload.needsPreciseDeadline(loopStart, loopEnd, handlerTimer),
+                        speedChangeRequired = speedChanged,
                     ),
                 )
                 .build()
@@ -674,30 +765,43 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
-    private fun saveProgress() {
+    private fun saveProgress(immediate: Boolean = false) {
         // Automatic A–B seeks can also generate buffering/ready callbacks. The
         // checkpoint records these loops; pause/error/end still flush immediately.
         if (
-            automaticLoopSeek &&
+            !immediate &&
+                automaticLoopSeek &&
                 player.playWhenReady &&
                 player.playbackState != Player.STATE_ENDED &&
                 player.playerError == null
         )
             return
-        savePosition(player.currentMediaItem, player.currentPosition)
+        savePosition(player.currentMediaItem, player.currentPosition, immediate)
     }
 
-    private fun savePosition(item: MediaItem?, position: Long) {
+    private fun savePosition(item: MediaItem?, position: Long, immediate: Boolean = false) {
         val id = item?.mediaId ?: return
         val workId = item.mediaMetadata.extras?.getString("workId") ?: return
-        repository.savePlaybackProgress(ProgressEntity(workId, id, position.coerceAtLeast(0)))
+        val entity = ProgressEntity(workId, id, position.coerceAtLeast(0))
+        if (immediate) repository.savePlaybackProgressImmediate(entity)
+        else repository.savePlaybackProgress(entity)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? =
         session
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        saveProgress(immediate = true)
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
-        saveProgress()
+        saveProgress(immediate = true)
+        cancelSleepAlarm()
+        if (sleepAlarmRegistered) {
+            runCatching { unregisterReceiver(sleepTimerReceiver) }
+            sleepAlarmRegistered = false
+        }
         scope.cancel()
         session?.release()
         player.release()

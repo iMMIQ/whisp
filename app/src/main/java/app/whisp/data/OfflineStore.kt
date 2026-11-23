@@ -19,16 +19,16 @@ import java.io.File
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 /** Offline downloads and attachments, behind the repository facade. */
 @androidx.annotation.OptIn(UnstableApi::class)
 internal class OfflineStore(private val repository: LibraryRepository) {
     private suspend fun withWorkLock(id: String, block: suspend (WorkDetails) -> Unit) {
-        repository.onlineWorkChanges.withLock {
-            val detail = repository.dao.details(id) ?: return@withLock
+        repository.withWorkLock(id) {
+            val detail = repository.dao.details(id) ?: return@withWorkLock
             block(detail)
         }
     }
@@ -72,12 +72,14 @@ internal class OfflineStore(private val repository: LibraryRepository) {
     suspend fun downloadAttachments(id: String) =
         withWorkLock(id) { detail ->
             detail.attachments.forEach { attachment ->
+                currentCoroutineContext().ensureActive()
                 if (repository.offlineFile(attachment.id) == null)
                     atomicFile(
                         File(repository.offlineDir, attachment.id),
                         repository.readAsset(attachment.id, 64 * 1024 * 1024),
                     )
             }
+            currentCoroutineContext().ensureActive()
             detail.work.coverId?.let { cover ->
                 val target = File(repository.offlineDir, cover)
                 if (!target.isFile) {
@@ -98,7 +100,7 @@ internal class OfflineStore(private val repository: LibraryRepository) {
 
     suspend fun setCover(work: WorkEntity, uri: Uri) =
         withContext(Dispatchers.IO) {
-            repository.onlineWorkChanges.withLock {
+            repository.withWorkLock(work.id) {
                 val latest = repository.dao.work(work.id) ?: throw IOException("作品已删除")
                 val id = stableId("${work.id}|custom-cover")
                 val bytes =
@@ -108,7 +110,8 @@ internal class OfflineStore(private val repository: LibraryRepository) {
                 atomicFile(File(repository.customArtworkDir, id), bytes)
                 if (latest.offlineAttachments) atomicFile(File(repository.offlineDir, id), bytes)
                 repository.dao.updateWorkCover(work.id, id)
-                repository.artworkRevision.update { it + 1 }
+                repository.artworkStore.notifyAssetChanged(id)
+                latest.coverId?.let { repository.artworkStore.notifyAssetChanged(it) }
                 repository.storageChanged()
             }
         }
@@ -116,9 +119,7 @@ internal class OfflineStore(private val repository: LibraryRepository) {
     suspend fun removeOffline(id: String) {
         WorkManager.getInstance(repository.context).cancelUniqueWork("attachments-$id")
         withWorkLock(id) { detail ->
-            detail.tracks.forEach { track ->
-                removeTrackDownload(track.id)
-            }
+            detail.tracks.forEach { track -> removeTrackDownload(track.id) }
             detail.attachments.forEach { File(repository.offlineDir, it.id).delete() }
             detail.work.coverId?.let {
                 if (!repository.dao.otherOfflineCover(it, id))
@@ -149,7 +150,9 @@ class AttachmentsWorker(context: Context, params: WorkerParameters) :
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            if (runAttemptCount < 3) Result.retry() else Result.failure()
+            if (runAttemptCountCountExceeded()) Result.failure() else Result.retry()
         }
     }
+
+    private fun runAttemptCountCountExceeded(): Boolean = runAttemptCount >= 3
 }

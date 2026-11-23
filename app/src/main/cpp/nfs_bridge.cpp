@@ -16,9 +16,12 @@ namespace {
 struct Connection {
     nfs_context *nfs;
     std::unordered_set<nfsfh *> files;
+    std::vector<char> read_buffer;
 };
 
 void fail(JNIEnv *env, int code) {
+    if (env->ExceptionCheck())
+        return;
     const char *message = "NFS：读取失败，请检查连接或重新扫描";
     if (code == -EACCES || code == -EPERM)
         message = "NFS：访问被拒绝，请检查 NAS 授权、UID/GID 与非特权端口设置";
@@ -33,25 +36,35 @@ void fail(JNIEnv *env, int code) {
         message = "NFS：目录文件过多，请选择 ASMR 子目录";
     else if (code == -EISDIR)
         message = "NFS：所选资源不是普通文件";
-    env->ThrowNew(env->FindClass("java/io/IOException"), message);
+    if (auto cls = env->FindClass("java/io/IOException"))
+        env->ThrowNew(cls, message);
 }
 
 void oom(JNIEnv *env) {
-    env->ThrowNew(env->FindClass("java/lang/OutOfMemoryError"), "NFS buffer allocation failed");
+    if (env->ExceptionCheck())
+        return;
+    if (auto cls = env->FindClass("java/lang/OutOfMemoryError"))
+        env->ThrowNew(cls, "NFS buffer allocation failed");
 }
 
 std::string bytes(JNIEnv *env, jbyteArray value) {
+    if (env->ExceptionCheck())
+        return {};
     if (!value) {
         fail(env, -EINVAL);
         return {};
     }
     const auto size = env->GetArrayLength(value);
-    if (size > 16384) {
+    if (size < 0 || size > 16384) {
         fail(env, -EINVAL);
         return {};
     }
     std::string result(static_cast<size_t>(size), '\0');
-    env->GetByteArrayRegion(value, 0, size, reinterpret_cast<jbyte *>(result.data()));
+    if (size > 0) {
+        env->GetByteArrayRegion(value, 0, size, reinterpret_cast<jbyte *>(result.data()));
+        if (env->ExceptionCheck())
+            return {};
+    }
     if (result.find('\0') != std::string::npos)
         fail(env, -EINVAL);
     return result;
@@ -80,6 +93,8 @@ extern "C" JNIEXPORT jlong JNICALL Java_app_whisp_data_NfsNative_connect(
     jint port, jint mount_port) {
     try {
         auto server = bytes(env, host);
+        if (env->ExceptionCheck())
+            return 0;
         auto root = bytes(env, path);
         if (env->ExceptionCheck())
             return 0;
@@ -113,7 +128,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_app_whisp_data_NfsNative_connect(
             fail(env, status);
             return 0;
         }
-        auto *result = new (std::nothrow) Connection{nfs, {}};
+        auto *result = new (std::nothrow) Connection{nfs, {}, {}};
         if (!result) {
             nfs_destroy_context(nfs);
             oom(env);
@@ -132,8 +147,10 @@ extern "C" JNIEXPORT jobjectArray JNICALL Java_app_whisp_data_NfsNative_entries(
                                                                                 jbyteArray path) {
     try {
         auto *ctx = connection(env, pointer);
-        auto relative = bytes(env, path);
         if (!ctx || env->ExceptionCheck())
+            return nullptr;
+        auto relative = bytes(env, path);
+        if (env->ExceptionCheck())
             return nullptr;
         Directory dir{ctx->nfs, nullptr};
         const int status = nfs_opendir(ctx->nfs, relative.c_str(), &dir.dir);
@@ -145,11 +162,11 @@ extern "C" JNIEXPORT jobjectArray JNICALL Java_app_whisp_data_NfsNative_entries(
             std::string name;
             uint32_t type;
             uint64_t size;
-            long modified;
+            int64_t modified;
         };
         std::vector<Entry> entries;
         while (auto *item = nfs_readdir(ctx->nfs, dir.dir)) {
-            if (!std::strcmp(item->name, ".") || !std::strcmp(item->name, ".."))
+            if (!item->name || !std::strcmp(item->name, ".") || !std::strcmp(item->name, ".."))
                 continue;
             if (entries.size() >= 100000) {
                 fail(env, -EFBIG);
@@ -159,7 +176,8 @@ extern "C" JNIEXPORT jobjectArray JNICALL Java_app_whisp_data_NfsNative_entries(
                 fail(env, -EFBIG);
                 return nullptr;
             }
-            entries.push_back({item->name, item->type, item->size, item->mtime.tv_sec});
+            entries.push_back(
+                {item->name, item->type, item->size, static_cast<int64_t>(item->mtime.tv_sec)});
         }
         auto cls = env->FindClass("app/whisp/data/NfsNativeEntry");
         if (!cls)
@@ -175,8 +193,14 @@ extern "C" JNIEXPORT jobjectArray JNICALL Java_app_whisp_data_NfsNative_entries(
             auto name = env->NewByteArray(static_cast<jsize>(item.name.size()));
             if (!name)
                 return nullptr;
-            env->SetByteArrayRegion(name, 0, static_cast<jsize>(item.name.size()),
-                                    reinterpret_cast<const jbyte *>(item.name.data()));
+            if (!item.name.empty()) {
+                env->SetByteArrayRegion(name, 0, static_cast<jsize>(item.name.size()),
+                                        reinterpret_cast<const jbyte *>(item.name.data()));
+                if (env->ExceptionCheck()) {
+                    env->DeleteLocalRef(name);
+                    return nullptr;
+                }
+            }
             auto entry =
                 env->NewObject(cls, ctor, name, static_cast<jint>(item.type),
                                static_cast<jlong>(item.size), static_cast<jlong>(item.modified));
@@ -200,8 +224,10 @@ extern "C" JNIEXPORT jlongArray JNICALL Java_app_whisp_data_NfsNative_open(JNIEn
                                                                            jbyteArray path) {
     try {
         auto *ctx = connection(env, pointer);
-        auto relative = bytes(env, path);
         if (!ctx || env->ExceptionCheck())
+            return nullptr;
+        auto relative = bytes(env, path);
+        if (env->ExceptionCheck())
             return nullptr;
         nfsfh *file = nullptr;
         int status = nfs_open(ctx->nfs, relative.c_str(), O_RDONLY, &file);
@@ -214,7 +240,12 @@ extern "C" JNIEXPORT jlongArray JNICALL Java_app_whisp_data_NfsNative_open(JNIEn
         if (status < 0 || !S_ISREG(st.nfs_mode) ||
             st.nfs_size > static_cast<uint64_t>(std::numeric_limits<jlong>::max())) {
             nfs_close(ctx->nfs, file);
-            fail(env, status < 0 ? status : -EISDIR);
+            if (status < 0)
+                fail(env, status);
+            else if (!S_ISREG(st.nfs_mode))
+                fail(env, -EISDIR);
+            else
+                fail(env, -EFBIG);
             return nullptr;
         }
         auto result = env->NewLongArray(2);
@@ -245,9 +276,9 @@ extern "C" JNIEXPORT jint JNICALL Java_app_whisp_data_NfsNative_read(JNIEnv *env
                                                                      jint length) {
     try {
         auto *ctx = connection(env, pointer);
-        auto *file = reinterpret_cast<nfsfh *>(static_cast<intptr_t>(handle));
-        if (!ctx)
+        if (!ctx || env->ExceptionCheck())
             return -1;
+        auto *file = reinterpret_cast<nfsfh *>(static_cast<intptr_t>(handle));
         if (!ctx->files.count(file)) {
             fail(env, -EBADF);
             return -1;
@@ -259,9 +290,11 @@ extern "C" JNIEXPORT jint JNICALL Java_app_whisp_data_NfsNative_read(JNIEnv *env
         }
         if (!length)
             return 0;
-        std::vector<char> data(static_cast<size_t>(length));
-        const int status =
-            nfs_pread(ctx->nfs, file, data.data(), data.size(), static_cast<uint64_t>(position));
+        const auto required = static_cast<size_t>(length);
+        if (ctx->read_buffer.size() < required)
+            ctx->read_buffer.resize(required);
+        const int status = nfs_pread(ctx->nfs, file, ctx->read_buffer.data(), required,
+                                     static_cast<uint64_t>(position));
         if (status < 0) {
             fail(env, status);
             return -1;
@@ -270,7 +303,12 @@ extern "C" JNIEXPORT jint JNICALL Java_app_whisp_data_NfsNative_read(JNIEnv *env
             fail(env, -EIO);
             return -1;
         }
-        env->SetByteArrayRegion(buffer, offset, status, reinterpret_cast<jbyte *>(data.data()));
+        if (status > 0) {
+            env->SetByteArrayRegion(buffer, offset, status,
+                                    reinterpret_cast<jbyte *>(ctx->read_buffer.data()));
+            if (env->ExceptionCheck())
+                return -1;
+        }
         return status;
     } catch (const std::bad_alloc &) {
         oom(env);
@@ -282,8 +320,10 @@ extern "C" JNIEXPORT void JNICALL Java_app_whisp_data_NfsNative_closeFile(JNIEnv
                                                                           jlong pointer,
                                                                           jlong handle) {
     auto *ctx = connection(env, pointer);
+    if (!ctx || env->ExceptionCheck())
+        return;
     auto *file = reinterpret_cast<nfsfh *>(static_cast<intptr_t>(handle));
-    if (ctx && ctx->files.erase(file))
+    if (ctx->files.erase(file))
         nfs_close(ctx->nfs, file);
 }
 

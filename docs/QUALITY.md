@@ -15,7 +15,7 @@ export WHISP_BLACK="$PWD/.venv/bin/black"
 ./gradlew -PsplitApks :app:assembleRelease :app:assembleDebugAndroidTest
 ```
 
-`fmt` 统一排版，`qualityCheck` 执行格式检查、公开内容检查、单元测试及 Debug / Release Lint。GitHub Actions 对推送和 Pull Request 执行同一套检查，并编译 Release 和设备测试 APK。
+`fmt` 统一排版，`qualityCheck` 执行格式检查、公开内容检查、主机端 JNI ASan/UBSan 桥接测试、单元测试及 Debug / Release Lint。依赖版本统一维护在 `gradle/libs.versions.toml`。GitHub Actions 对推送和 Pull Request 执行同一套检查，并编译 Release 和设备测试 APK。
 
 ## 构建速度
 
@@ -85,7 +85,7 @@ Room 与 WorkManager 的扩展 API 随主模块提供。测试服务器使用 Mo
 | 视频画面、生命周期与等比例显示 | Media3 PlayerSurface 与 Compose ContentScale |
 | 索引、设置与任务 | Room / DataStore / WorkManager |
 
-应用负责作品目录识别、录音分组、字幕阅读锚点、精细定位手势和按作品合并的进度写入。LRC 解析服务于多时间标签与偏移量；MP3 扫描通过少量分段请求读取时长索引，音频解码由 Media3 负责。
+应用负责作品目录识别、录音分组、字幕阅读锚点、多编码字幕台本识别、精细定位手势和按作品合并的进度写入。LRC 解析服务于多时间标签与偏移量；远程音频扫描通过少量分段请求读取 MP3、FLAC、WAV、Ogg/Opus 和 M4A 文件头时长，音频解码由 Media3 负责。
 
 在线播放缓存的淘汰器与图片文件缓存负责运行时容量调整、永久资料分区及文件变化通知。图片优化使用 Android Bitmap API，编码参数与容量限制由应用定义。
 

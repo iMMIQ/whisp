@@ -128,12 +128,28 @@ class DlsiteLoginActivity : ComponentActivity() {
                                         settings.domStorageEnabled = true
                                         settings.allowFileAccess = false
                                         settings.allowContentAccess = false
+                                        if (Build.VERSION.SDK_INT < 30) {
+                                            @Suppress("DEPRECATION")
+                                            settings.allowFileAccessFromFileURLs = false
+                                            @Suppress("DEPRECATION")
+                                            settings.allowUniversalAccessFromFileURLs = false
+                                        }
                                         settings.mixedContentMode =
                                             WebSettings.MIXED_CONTENT_NEVER_ALLOW
                                         CookieManager.getInstance()
                                             .setAcceptThirdPartyCookies(this, false)
                                         webViewClient =
                                             object : WebViewClient() {
+                                                override fun onReceivedSslError(
+                                                    view: WebView,
+                                                    handler: SslErrorHandler,
+                                                    error: android.net.http.SslError,
+                                                ) {
+                                                    handler.cancel()
+                                                    this@DlsiteLoginActivity.error =
+                                                        "安全连接验证失败，请检查网络环境"
+                                                }
+
                                                 override fun shouldOverrideUrlLoading(
                                                     view: WebView,
                                                     request: WebResourceRequest,

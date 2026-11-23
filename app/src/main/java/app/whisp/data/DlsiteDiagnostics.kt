@@ -46,6 +46,7 @@ class DlsiteDiagnostics(private val context: Context) {
         preferences.edit { clear() }
     }
 
+    @Synchronized
     fun shareIntent(): Intent {
         val events = runCatching {
             Json.parseToJsonElement(preferences.getString("events", "[]")!!)

@@ -26,19 +26,22 @@ import kotlinx.coroutines.ensureActive
  * Each operation owns its session; playback, scans and downloads cannot close each other's handles.
  */
 class SmbClient(private val report: (String) -> Unit = {}) {
-    private val config =
+    private val encryptedConfig = buildConfig(encrypt = true)
+    private val compatibleConfig = buildConfig(encrypt = false)
+
+    private fun buildConfig(encrypt: Boolean): SmbConfig =
         SmbConfig.builder()
             .withAuthenticators(NtlmAuthenticator.Factory())
             .withTimeout(20, TimeUnit.SECONDS)
             .withSoTimeout(25000)
             .withBufferSize(256 * 1024)
             .withDfsEnabled(false)
-            .withEncryptData(true)
+            .withEncryptData(encrypt)
             .build()
 
     private inner class Disk(source: SourceEntity, password: String) : Closeable {
         val address = SmbAddress.parse(source.root)
-        val client = SMBClient(config)
+        val client = SMBClient(if (address.encrypt) encryptedConfig else compatibleConfig)
         var connection: Connection? = null
         var session: Session? = null
         var share: DiskShare? = null
@@ -165,10 +168,14 @@ class SmbClient(private val report: (String) -> Unit = {}) {
                 read(file, 0, file.length.toInt(), requireFull = true)
             }
 
-        override fun duration(uri: String): Long =
-            openFile(disk, SmbAddress.assetPath(uri, source.id)).use { file ->
-                Mp3Metadata.duration(file.length) { offset, count -> read(file, offset, count) }
+        override fun duration(uri: String): Long {
+            val relative = SmbAddress.assetPath(uri, source.id)
+            return openFile(disk, relative).use { file ->
+                AudioDurationParser.duration(relative, file.length) { offset, count ->
+                    read(file, offset, count)
+                }
             }
+        }
 
         private fun read(
             file: com.hierynomus.smbj.share.File,
@@ -201,6 +208,10 @@ class SmbClient(private val report: (String) -> Unit = {}) {
         private val relative = SmbAddress.assetPath(uri, source.id)
         private var disk: Disk? = null
         private var file: com.hierynomus.smbj.share.File? = null
+        // 256 KiB sliding read-ahead window eliminates small-chunk SMB2 READ RTT amplification.
+        private val window = ByteArray(256 * 1024)
+        private var windowStart = -1L
+        private var windowAvailable = 0
         override var length: Long = 0
             private set
 
@@ -213,23 +224,17 @@ class SmbClient(private val report: (String) -> Unit = {}) {
                 disk = Disk(source, password)
                 file = openFile(disk!!, relative)
                 length = file!!.length
+                windowStart = -1L
+                windowAvailable = 0
             } catch (e: Exception) {
                 close()
                 throw failure(e)
             }
         }
 
-        override fun read(buffer: ByteArray, offset: Long, bufferOffset: Int, count: Int): Int {
-            require(offset >= 0)
-            if (count == 0) return 0
-            if (offset >= length) return -1
+        private fun readRemote(dest: ByteArray, offset: Long, destOffset: Int, count: Int): Int {
             try {
-                return file!!.read(
-                    buffer,
-                    offset,
-                    bufferOffset,
-                    minOf(count.toLong(), length - offset).toInt(),
-                )
+                return file!!.read(dest, offset, destOffset, count)
             } catch (e: Exception) {
                 if (Thread.currentThread().isInterrupted) throw failure(e)
                 // A bounded reconnect resumes at the exact 64-bit offset, including downloads.
@@ -238,19 +243,50 @@ class SmbClient(private val report: (String) -> Unit = {}) {
                 connect()
                 if (length != previousLength) throw IOException("SMB：文件已改变，请重新扫描")
                 return try {
-                    file!!.read(
-                        buffer,
-                        offset,
-                        bufferOffset,
-                        minOf(count.toLong(), length - offset).toInt(),
-                    )
+                    file!!.read(dest, offset, destOffset, count)
                 } catch (retry: Exception) {
                     throw failure(retry)
                 }
             }
         }
 
+        override fun read(buffer: ByteArray, offset: Long, bufferOffset: Int, count: Int): Int {
+            require(
+                offset >= 0 &&
+                    bufferOffset >= 0 &&
+                    count >= 0 &&
+                    bufferOffset <= buffer.size - count,
+            )
+            if (count == 0) return 0
+            if (offset >= length) return -1
+            val maxReadable = minOf(count.toLong(), length - offset).toInt()
+            if (
+                windowAvailable > 0 &&
+                    offset >= windowStart &&
+                    offset - windowStart < windowAvailable
+            ) {
+                val cachedOffset = (offset - windowStart).toInt()
+                val copied = minOf(maxReadable, windowAvailable - cachedOffset)
+                window.copyInto(buffer, bufferOffset, cachedOffset, cachedOffset + copied)
+                return copied
+            }
+            // Large caller buffers can bypass the sliding window to avoid an extra copy.
+            if (maxReadable >= window.size) {
+                return readRemote(buffer, offset, bufferOffset, maxReadable)
+            }
+            val fetchSize = minOf(window.size.toLong(), length - offset).toInt()
+            val n = readRemote(window, offset, 0, fetchSize)
+            if (n <= 0) return n
+            windowStart = offset
+            windowAvailable = n
+            val copied = minOf(maxReadable, n)
+            window.copyInto(buffer, bufferOffset, 0, copied)
+            return copied
+        }
+
         override fun close() {
+            windowStart = -1L
+            windowAvailable = 0
             runCatching { file?.close() }
             file = null
             disk?.close()
@@ -308,7 +344,7 @@ class SmbClient(private val report: (String) -> Unit = {}) {
                 error.toString().contains("STATUS_OBJECT_PATH_NOT_FOUND") ||
                     error.toString().contains("STATUS_OBJECT_NAME_NOT_FOUND") -> "目录或文件不存在"
                 error is java.net.SocketTimeoutException -> "连接超时，请检查 NAS 和网络"
-                else -> "连接或读取失败，请检查地址、账号和网络"
+                else -> "连接或读取失败，请检查地址、账号、加密设置和网络"
             }
         return IOException("SMB：$detail", error)
     }

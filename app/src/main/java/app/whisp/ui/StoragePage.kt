@@ -59,9 +59,14 @@ internal fun StoragePage(model: AppViewModel, back: () -> Unit) {
     ) {
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                IconAction(Icons.AutoMirrored.Outlined.ArrowBack, "返回来源", Muted, back)
+                IconAction(
+                    Icons.AutoMirrored.Outlined.ArrowBack,
+                    androidx.compose.ui.res.stringResource(app.whisp.R.string.action_back_sources),
+                    Muted,
+                    back,
+                )
                 Text(
-                    "存储",
+                    androidx.compose.ui.res.stringResource(app.whisp.R.string.title_storage),
                     fontFamily = FontFamily.Serif,
                     fontSize = 30.sp,
                     modifier = Modifier.padding(start = 10.dp),
