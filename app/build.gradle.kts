@@ -146,7 +146,6 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.navigation3.runtime)
     implementation(libs.navigation3.ui)
-    implementation(libs.paging.compose)
     implementation(libs.room.runtime)
     ksp(libs.room.compiler)
     implementation(libs.datastore.preferences)

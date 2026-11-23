@@ -2,7 +2,32 @@
 package app.whisp.data
 
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
+
+/** Source kinds persisted as [SourceEntity.kind] and [WorkEntity.origin] strings. */
+enum class SourceKind(val raw: String) {
+    LOCAL("local"),
+    SMB("smb"),
+    NFS("nfs"),
+    WEBDAV("webdav"),
+    ASMRONE("asmrone"),
+    DLSITE("dlsite");
+
+    companion object {
+        fun of(raw: String): SourceKind? = entries.firstOrNull { it.raw == raw }
+    }
+}
+
+val SourceEntity.kindType: SourceKind?
+    get() = SourceKind.of(kind)
+
+val WorkEntity.originKind: SourceKind
+    get() = SourceKind.of(origin) ?: SourceKind.LOCAL
+
+val WorkEntity.isRemovableOnline: Boolean
+    get() = originKind == SourceKind.ASMRONE || originKind == SourceKind.DLSITE
 
 @Entity(tableName = "sources")
 data class SourceEntity(
@@ -16,7 +41,19 @@ data class SourceEntity(
     val error: String? = null,
 )
 
-@Entity(tableName = "works")
+@Entity(
+    tableName = "works",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = SourceEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["sourceId"],
+                onDelete = ForeignKey.SET_NULL,
+            ),
+        ],
+    indices = [Index("sourceId")],
+)
 data class WorkEntity(
     @PrimaryKey val id: String,
     val rj: String?,
@@ -30,7 +67,8 @@ data class WorkEntity(
     val offlineAttachments: Boolean = false,
     @ColumnInfo(defaultValue = "''") val originalArtist: String = "",
     @ColumnInfo(defaultValue = "NULL") val coverUrl: String? = null,
-    @ColumnInfo(defaultValue = "'local'") val origin: String = "local",
+    @ColumnInfo(defaultValue = "'local'") val origin: String = SourceKind.LOCAL.raw,
+    @ColumnInfo(defaultValue = "NULL") val sourceId: String? = null,
 )
 
 @Entity(
@@ -68,7 +106,19 @@ data class DlsitePurchaseEntity(
     val snapshot: String,
 )
 
-@Entity(tableName = "tracks", indices = [Index("workId")])
+@Entity(
+    tableName = "tracks",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = WorkEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["workId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+        ],
+    indices = [Index("workId")],
+)
 data class TrackEntity(
     @PrimaryKey val id: String,
     val workId: String,
@@ -80,9 +130,23 @@ data class TrackEntity(
     val subtitleId: String? = null,
     val scriptId: String? = null,
     val bonus: Boolean = false,
+    @ColumnInfo(defaultValue = "''") val uri: String = "",
+    @ColumnInfo(defaultValue = "0") val size: Long = 0,
 )
 
-@Entity(tableName = "attachments", indices = [Index("workId")])
+@Entity(
+    tableName = "attachments",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = WorkEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["workId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+        ],
+    indices = [Index("workId")],
+)
 data class AttachmentEntity(
     @PrimaryKey val id: String,
     val workId: String,
@@ -90,20 +154,22 @@ data class AttachmentEntity(
     val fileName: String,
     val relativePath: String,
     val kind: String,
+    @ColumnInfo(defaultValue = "''") val uri: String = "",
+    @ColumnInfo(defaultValue = "0") val size: Long = 0,
 )
 
-@Entity(tableName = "locations", indices = [Index("assetId"), Index("sourceId")])
-data class LocationEntity(
-    @PrimaryKey val id: String,
-    val assetId: String,
-    val sourceId: String,
-    val uri: String,
-    val size: Long,
-    val modified: Long = 0,
-    val generation: Long = 0,
+@Entity(
+    tableName = "progress",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = WorkEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["workId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+        ],
 )
-
-@Entity(tableName = "progress")
 data class ProgressEntity(
     @PrimaryKey val workId: String,
     val trackId: String,
@@ -111,7 +177,19 @@ data class ProgressEntity(
     val updatedAt: Long = System.currentTimeMillis(),
 )
 
-@Entity(tableName = "bookmarks", indices = [Index("workId")])
+@Entity(
+    tableName = "bookmarks",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = WorkEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["workId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+        ],
+    indices = [Index("workId")],
+)
 data class BookmarkEntity(
     @PrimaryKey val id: String,
     val workId: String,
@@ -126,6 +204,8 @@ data class WorkDetails(
     @Relation(parentColumn = "id", entityColumn = "workId") val tracks: List<TrackEntity>,
     @Relation(parentColumn = "id", entityColumn = "workId") val attachments: List<AttachmentEntity>,
 )
+
+data class TrackWorkPair(val id: String, val workId: String)
 
 @Dao
 interface LibraryDao {
@@ -163,19 +243,46 @@ interface LibraryDao {
 
     @Query("DELETE FROM sources WHERE id = :id") suspend fun deleteSource(id: String)
 
-    @Query("DELETE FROM locations WHERE sourceId = :id")
-    suspend fun deleteSourceLocations(id: String)
+    @Query("SELECT * FROM works ORDER BY addedAt DESC") fun observeWorks(): Flow<List<WorkEntity>>
+
+    @Query("SELECT id, workId FROM tracks") fun observeTrackWorkPairs(): Flow<List<TrackWorkPair>>
 
     @Transaction
-    @Query(
-        "SELECT * FROM works ORDER BY addedAt DESC",
-    )
-    fun observeLibrary(): Flow<List<WorkDetails>>
+    @Query("SELECT * FROM works WHERE id = :id")
+    fun observeDetails(id: String): Flow<WorkDetails?>
+
+    @Transaction
+    @Query("SELECT * FROM works WHERE id = :id")
+    suspend fun details(id: String): WorkDetails?
 
     @Query(
-        "SELECT DISTINCT tracks.workId FROM tracks JOIN locations ON locations.assetId = tracks.id JOIN sources ON sources.id = locations.sourceId",
+        """
+        SELECT DISTINCT works.id FROM works
+        LEFT JOIN tracks ON tracks.workId = works.id
+        LEFT JOIN attachments ON attachments.workId = works.id
+        WHERE works.title LIKE :pattern
+           OR works.rj LIKE :pattern
+           OR works.artist LIKE :pattern
+           OR works.originalTitle LIKE :pattern
+           OR tracks.title LIKE :pattern
+           OR tracks.fileName LIKE :pattern
+           OR attachments.fileName LIKE :pattern
+        """,
     )
-    fun observeLocatedWorks(): Flow<List<String>>
+    suspend fun searchWorkIds(pattern: String): List<String>
+
+    @Query("SELECT * FROM works WHERE id = :id") suspend fun work(id: String): WorkEntity?
+
+    @Query("SELECT * FROM works WHERE coverId = :id LIMIT 1")
+    suspend fun workByCover(id: String): WorkEntity?
+
+    @Query("SELECT * FROM works WHERE sourceId = :sourceId")
+    suspend fun sourceWorks(sourceId: String): List<WorkEntity>
+
+    @Query("SELECT id FROM works WHERE sourceId = :sourceId")
+    suspend fun sourceWorkIds(sourceId: String): List<String>
+
+    @Query("SELECT * FROM works") suspend fun allWorks(): List<WorkEntity>
 
     @Query(
         "SELECT EXISTS(SELECT 1 FROM works WHERE coverId = :assetId AND offlineAttachments = 1 AND id != :excludingWork)",
@@ -185,94 +292,25 @@ interface LibraryDao {
     @Query("SELECT EXISTS(SELECT 1 FROM works WHERE coverId = :assetId AND id != :excludingWork)")
     suspend fun otherCover(assetId: String, excludingWork: String): Boolean
 
-    @Query("SELECT * FROM locations WHERE sourceId = :sourceId")
-    suspend fun sourceLocations(sourceId: String): List<LocationEntity>
-
-    @Transaction
-    @Query("SELECT * FROM works WHERE id = :id")
-    suspend fun details(id: String): WorkDetails?
-
-    @Query("SELECT * FROM works WHERE id = :id") suspend fun work(id: String): WorkEntity?
-
-    @Query("SELECT * FROM works WHERE coverId = :id LIMIT 1")
-    suspend fun workByCover(id: String): WorkEntity?
-
-    @Query("SELECT * FROM works") suspend fun allWorks(): List<WorkEntity>
-
-    @Query("SELECT id FROM attachments WHERE kind = 'image'")
-    suspend fun imageAttachments(): List<String>
-
-    @Query("SELECT * FROM tracks") suspend fun allTracks(): List<TrackEntity>
-
-    @Query(
-        "SELECT DISTINCT locations.assetId FROM locations JOIN sources ON sources.id = locations.sourceId WHERE locations.assetId IN (:ids)",
-    )
-    suspend fun locatedAssets(ids: List<String>): List<String>
-
-    @Query(
-        "SELECT * FROM tracks WHERE workId IN (:workIds) AND NOT EXISTS(SELECT 1 FROM locations JOIN sources ON sources.id = locations.sourceId WHERE locations.assetId = tracks.id)",
-    )
-    suspend fun unlocatedTracks(workIds: List<String>): List<TrackEntity>
-
-    @Query("DELETE FROM tracks WHERE id IN (:ids)") suspend fun deleteTracks(ids: List<String>)
-
-    @Query(
-        "SELECT * FROM attachments WHERE workId IN (:workIds) AND NOT EXISTS(SELECT 1 FROM locations JOIN sources ON sources.id = locations.sourceId WHERE locations.assetId = attachments.id)",
-    )
-    suspend fun unlocatedAttachments(workIds: List<String>): List<AttachmentEntity>
-
-    @Query("DELETE FROM attachments WHERE id IN (:ids)")
-    suspend fun deleteAttachments(ids: List<String>)
-
     @Upsert suspend fun putWorks(works: List<WorkEntity>)
 
     @Upsert suspend fun putTracks(tracks: List<TrackEntity>)
 
     @Upsert suspend fun putAttachments(attachments: List<AttachmentEntity>)
 
-    @Upsert suspend fun putLocations(locations: List<LocationEntity>)
+    @Query("DELETE FROM works WHERE id = :workId") suspend fun deleteWork(workId: String)
 
-    @Query("DELETE FROM locations WHERE sourceId = :id AND generation != :generation")
-    suspend fun removeStaleLocations(id: String, generation: Long)
+    @Query("DELETE FROM tracks WHERE id IN (:ids)") suspend fun deleteTracks(ids: List<String>)
 
-    @Query("SELECT * FROM locations WHERE assetId = :id")
-    suspend fun locations(id: String): List<LocationEntity>
-
-    @Query(
-        "SELECT DISTINCT workId FROM tracks JOIN locations ON locations.assetId = tracks.id WHERE locations.sourceId = :sourceId",
-    )
-    suspend fun sourceWorkIds(sourceId: String): List<String>
-
-    @Query(
-        "DELETE FROM locations WHERE sourceId = :sourceId AND assetId IN (SELECT id FROM tracks WHERE workId = :workId UNION SELECT id FROM attachments WHERE workId = :workId UNION SELECT coverId FROM works WHERE id = :workId)",
-    )
-    suspend fun deleteWorkSourceLocations(workId: String, sourceId: String)
-
-    @Query("DELETE FROM tracks WHERE workId = :workId AND id NOT IN (:keepIds)")
-    suspend fun deleteStaleTracks(workId: String, keepIds: List<String>)
-
-    @Query("DELETE FROM attachments WHERE workId = :workId")
-    suspend fun deleteWorkAttachments(workId: String)
-
-    @Query("DELETE FROM attachments WHERE workId = :workId AND id NOT IN (:keepIds)")
-    suspend fun deleteStaleAttachments(workId: String, keepIds: List<String>)
-
-    @Query(
-        "DELETE FROM locations WHERE assetId IN (SELECT id FROM tracks WHERE workId = :workId UNION SELECT id FROM attachments WHERE workId = :workId UNION SELECT coverId FROM works WHERE id = :workId)",
-    )
-    suspend fun deleteWorkLocations(workId: String)
+    @Query("DELETE FROM attachments WHERE id IN (:ids)")
+    suspend fun deleteAttachments(ids: List<String>)
 
     @Query("DELETE FROM tracks WHERE workId = :workId") suspend fun deleteWorkTracks(workId: String)
 
-    @Query("DELETE FROM works WHERE id = :workId") suspend fun deleteWork(workId: String)
-
-    @Query("DELETE FROM progress WHERE workId = :workId")
-    suspend fun deleteWorkProgress(workId: String)
-
-    @Query("DELETE FROM bookmarks WHERE workId = :workId")
-    suspend fun deleteWorkBookmarks(workId: String)
-
     @Query("SELECT * FROM tracks WHERE id = :id") suspend fun track(id: String): TrackEntity?
+
+    @Query("SELECT * FROM attachments WHERE id = :id")
+    suspend fun attachment(id: String): AttachmentEntity?
 
     @Query("SELECT * FROM tracks WHERE id IN (:ids)")
     suspend fun tracksByIds(ids: List<String>): List<TrackEntity>
@@ -280,16 +318,11 @@ interface LibraryDao {
     @Query("SELECT * FROM works WHERE id IN (:ids)")
     suspend fun worksByIds(ids: List<String>): List<WorkEntity>
 
-    @Query("SELECT id FROM tracks WHERE workId = :workId")
-    suspend fun trackIdsForWork(workId: String): List<String>
+    @Query("SELECT * FROM tracks WHERE workId = :workId")
+    suspend fun tracksForWork(workId: String): List<TrackEntity>
 
     @Query("SELECT id FROM attachments WHERE workId = :workId")
     suspend fun attachmentIdsForWork(workId: String): List<String>
-
-    @Query(
-        "SELECT id FROM works WHERE id IN (:workIds) AND offlineAttachments = 0 AND NOT EXISTS(SELECT 1 FROM tracks JOIN locations ON locations.assetId = tracks.id JOIN sources ON sources.id = locations.sourceId WHERE tracks.workId = works.id)",
-    )
-    suspend fun unlocatedWorkIds(workIds: List<String>): List<String>
 
     @Query("UPDATE tracks SET durationMs = :duration WHERE id = :id AND durationMs != :duration")
     suspend fun updateDuration(id: String, duration: Long)
@@ -325,6 +358,185 @@ interface LibraryDao {
     @Query("DELETE FROM bookmarks WHERE id = :id") suspend fun deleteBookmark(id: String)
 }
 
+val MIGRATION_4_5 =
+    object : Migration(4, 5) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE dlsite_metadata_tmp (workId TEXT NOT NULL, snapshot TEXT NOT NULL)",
+            )
+            db.execSQL(
+                "INSERT INTO dlsite_metadata_tmp SELECT workId, snapshot FROM dlsite_metadata",
+            )
+            db.execSQL("DROP TABLE dlsite_metadata")
+
+            db.execSQL(
+                """
+                CREATE TABLE works_new (
+                    id TEXT NOT NULL,
+                    rj TEXT,
+                    title TEXT NOT NULL,
+                    originalTitle TEXT NOT NULL,
+                    artist TEXT NOT NULL,
+                    series TEXT,
+                    coverId TEXT,
+                    favorite INTEGER NOT NULL,
+                    addedAt INTEGER NOT NULL,
+                    offlineAttachments INTEGER NOT NULL,
+                    originalArtist TEXT NOT NULL DEFAULT '',
+                    coverUrl TEXT DEFAULT NULL,
+                    origin TEXT NOT NULL DEFAULT 'local',
+                    sourceId TEXT DEFAULT NULL,
+                    PRIMARY KEY(id),
+                    FOREIGN KEY(sourceId) REFERENCES sources(id) ON UPDATE NO ACTION ON DELETE SET NULL
+                )
+                """,
+            )
+            db.execSQL(
+                """
+                INSERT INTO works_new (
+                    id, rj, title, originalTitle, artist, series, coverId, favorite,
+                    addedAt, offlineAttachments, originalArtist, coverUrl, origin, sourceId
+                )
+                SELECT
+                    w.id, w.rj, w.title, w.originalTitle, w.artist, w.series, w.coverId, w.favorite,
+                    w.addedAt, w.offlineAttachments, w.originalArtist, w.coverUrl, w.origin,
+                    (SELECT l.sourceId FROM tracks t
+                     JOIN locations l ON l.assetId = t.id
+                     JOIN sources s ON s.id = l.sourceId
+                     WHERE t.workId = w.id LIMIT 1)
+                FROM works w
+                """,
+            )
+            db.execSQL("DROP TABLE works")
+            db.execSQL("ALTER TABLE works_new RENAME TO works")
+            db.execSQL("CREATE INDEX index_works_sourceId ON works(sourceId)")
+
+            db.execSQL(
+                """
+                CREATE TABLE dlsite_metadata (
+                    workId TEXT NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    PRIMARY KEY(workId),
+                    FOREIGN KEY(workId) REFERENCES works(id) ON UPDATE NO ACTION ON DELETE CASCADE
+                )
+                """,
+            )
+            db.execSQL(
+                "INSERT INTO dlsite_metadata SELECT workId, snapshot FROM dlsite_metadata_tmp WHERE workId IN (SELECT id FROM works)",
+            )
+            db.execSQL("DROP TABLE dlsite_metadata_tmp")
+
+            db.execSQL(
+                """
+                CREATE TABLE tracks_new (
+                    id TEXT NOT NULL,
+                    workId TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    fileName TEXT NOT NULL,
+                    relativePath TEXT NOT NULL,
+                    `order` INTEGER NOT NULL,
+                    durationMs INTEGER NOT NULL,
+                    subtitleId TEXT,
+                    scriptId TEXT,
+                    bonus INTEGER NOT NULL,
+                    uri TEXT NOT NULL DEFAULT '',
+                    size INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(id),
+                    FOREIGN KEY(workId) REFERENCES works(id) ON UPDATE NO ACTION ON DELETE CASCADE
+                )
+                """,
+            )
+            db.execSQL(
+                """
+                INSERT INTO tracks_new (
+                    id, workId, title, fileName, relativePath, `order`, durationMs,
+                    subtitleId, scriptId, bonus, uri, size
+                )
+                SELECT
+                    t.id, t.workId, t.title, t.fileName, t.relativePath, t.`order`, t.durationMs,
+                    t.subtitleId, t.scriptId, t.bonus,
+                    COALESCE((SELECT l.uri FROM locations l WHERE l.assetId = t.id LIMIT 1), ''),
+                    COALESCE((SELECT l.size FROM locations l WHERE l.assetId = t.id LIMIT 1), 0)
+                FROM tracks t WHERE t.workId IN (SELECT id FROM works)
+                """,
+            )
+            db.execSQL("DROP TABLE tracks")
+            db.execSQL("ALTER TABLE tracks_new RENAME TO tracks")
+            db.execSQL("CREATE INDEX index_tracks_workId ON tracks(workId)")
+
+            db.execSQL(
+                """
+                CREATE TABLE attachments_new (
+                    id TEXT NOT NULL,
+                    workId TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    fileName TEXT NOT NULL,
+                    relativePath TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    uri TEXT NOT NULL DEFAULT '',
+                    size INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(id),
+                    FOREIGN KEY(workId) REFERENCES works(id) ON UPDATE NO ACTION ON DELETE CASCADE
+                )
+                """,
+            )
+            db.execSQL(
+                """
+                INSERT INTO attachments_new (id, workId, title, fileName, relativePath, kind, uri, size)
+                SELECT
+                    a.id, a.workId, a.title, a.fileName, a.relativePath, a.kind,
+                    COALESCE((SELECT l.uri FROM locations l WHERE l.assetId = a.id LIMIT 1), ''),
+                    COALESCE((SELECT l.size FROM locations l WHERE l.assetId = a.id LIMIT 1), 0)
+                FROM attachments a WHERE a.workId IN (SELECT id FROM works)
+                """,
+            )
+            db.execSQL("DROP TABLE attachments")
+            db.execSQL("ALTER TABLE attachments_new RENAME TO attachments")
+            db.execSQL("CREATE INDEX index_attachments_workId ON attachments(workId)")
+
+            db.execSQL(
+                """
+                CREATE TABLE progress_new (
+                    workId TEXT NOT NULL,
+                    trackId TEXT NOT NULL,
+                    positionMs INTEGER NOT NULL,
+                    updatedAt INTEGER NOT NULL,
+                    PRIMARY KEY(workId),
+                    FOREIGN KEY(workId) REFERENCES works(id) ON UPDATE NO ACTION ON DELETE CASCADE
+                )
+                """,
+            )
+            db.execSQL(
+                "INSERT INTO progress_new SELECT workId, trackId, positionMs, updatedAt FROM progress WHERE workId IN (SELECT id FROM works)",
+            )
+            db.execSQL("DROP TABLE progress")
+            db.execSQL("ALTER TABLE progress_new RENAME TO progress")
+
+            db.execSQL(
+                """
+                CREATE TABLE bookmarks_new (
+                    id TEXT NOT NULL,
+                    workId TEXT NOT NULL,
+                    trackId TEXT NOT NULL,
+                    positionMs INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    endMs INTEGER,
+                    PRIMARY KEY(id),
+                    FOREIGN KEY(workId) REFERENCES works(id) ON UPDATE NO ACTION ON DELETE CASCADE
+                )
+                """,
+            )
+            db.execSQL(
+                "INSERT INTO bookmarks_new SELECT id, workId, trackId, positionMs, title, endMs FROM bookmarks WHERE workId IN (SELECT id FROM works)",
+            )
+            db.execSQL("DROP TABLE bookmarks")
+            db.execSQL("ALTER TABLE bookmarks_new RENAME TO bookmarks")
+            db.execSQL("CREATE INDEX index_bookmarks_workId ON bookmarks(workId)")
+
+            db.execSQL("DROP TABLE IF EXISTS locations")
+        }
+    }
+
 @Database(
     entities =
         [
@@ -332,13 +544,12 @@ interface LibraryDao {
             WorkEntity::class,
             TrackEntity::class,
             AttachmentEntity::class,
-            LocationEntity::class,
             ProgressEntity::class,
             BookmarkEntity::class,
             DlsiteMetadataEntity::class,
             DlsitePurchaseEntity::class,
         ],
-    version = 4,
+    version = 5,
     autoMigrations =
         [
             AutoMigration(from = 1, to = 2),

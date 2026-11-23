@@ -59,22 +59,21 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 
     override suspend fun doWork(): Result {
         val sourceId = inputData.getString("sourceId") ?: return Result.failure()
-        val repository = (applicationContext as WhispApp).repository
-        if (repository.dao.source(sourceId) == null) return Result.success()
+        val graph = (applicationContext as WhispApp).graph
+        if (graph.library.dao.source(sourceId) == null) return Result.success()
         var scanStarted = false
         return try {
             setForeground(getForegroundInfo())
             scanStarted = true
-            repository.scan(sourceId)
+            graph.sync.scan(sourceId)
             Result.success()
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
-            // Foreground startup errors happen before repository.scan can report them.
+        } catch (_: Exception) {
             if (!scanStarted)
-                repository.dao.source(sourceId)?.let { source ->
+                graph.library.dao.source(sourceId)?.let { source ->
                     if (source.error == null)
-                        repository.dao.updateSourceError(source.id, "扫描未完成，请重新刷新")
+                        graph.library.dao.updateSourceError(source.id, "扫描未完成，请重新刷新")
                 }
             Result.failure()
         }

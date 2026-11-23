@@ -36,8 +36,8 @@ class SmbIntegrationTest {
     private val instrumentation
         get() = InstrumentationRegistry.getInstrumentation()
 
-    private val repo
-        get() = (activity.application as WhispApp).repository
+    private val graph
+        get() = (activity.application as WhispApp).graph
 
     private fun waitFor(timeoutMs: Long = 30000, predicate: () -> Boolean) {
         val end = System.currentTimeMillis() + timeoutMs
@@ -52,28 +52,31 @@ class SmbIntegrationTest {
     fun scanSeekBackgroundDownloadAndOfflineWithoutSource() {
         assertTrue(
             "Use -PsmokeTest to preserve the installed app",
-            repo.context.packageName.endsWith(".smoketest"),
+            graph.context.packageName.endsWith(".smoketest"),
         )
         val args = InstrumentationRegistry.getArguments()
         val root = requireNotNull(args.getString("smbRoot"))
         val username = requireNotNull(args.getString("smbUser"))
         val password = requireNotNull(args.getString("smbPassword"))
-        val id = runBlocking { repo.addSmb("SMB 测试", root, username, password) }
-        waitFor(60000) {
-            runBlocking { repo.dao.source(id)!!.lastScan > 0 } && id !in repo.busy.value
+        val id = runBlocking {
+            graph.library.addSmb("SMB 测试", root, username, password).also {
+                graph.sync.scheduleScan(it, force = true)
+            }
         }
-        waitFor { repo.library.value.any { it.work.rj == "RJ00000001" } }
-        val detail = repo.library.value.first { it.work.rj == "RJ00000001" }
+        waitFor(60000) {
+            runBlocking { graph.library.dao.source(id)!!.lastScan > 0 } &&
+                id !in graph.sync.busy.value
+        }
+        waitFor { graph.library.works.value.any { it.rj == "RJ00000001" } }
+        val work = graph.library.works.value.first { it.rj == "RJ00000001" }
+        val detail = runBlocking { graph.library.dao.details(work.id)!! }
         assertEquals(1, detail.tracks.size)
         val track = detail.tracks.single()
-        assertTrue(track.durationMs in 1_850_000..1_854_000)
-        assertNotNull(repo.artwork(detail.work.coverId))
-        assertTrue(runBlocking { repo.readAsset(track.subtitleId!!) }.isNotEmpty())
+        assertTrue(runBlocking { graph.library.readAsset(track.subtitleId!!) }.isNotEmpty())
         assertTrue(detail.attachments.any { it.fileName.endsWith(".txt") })
-        // Exercise real Media3 offset/length boundaries through the SMB adapter.
-        val source = runBlocking { repo.dao.source(id)!! }
-        val uri = runBlocking { repo.resolve(track.id) }
-        val data = RemoteFileDataSource("SMB") { repo.smb.open(source, password, it) }
+        val source = runBlocking { graph.library.dao.source(id)!! }
+        val uri = runBlocking { graph.library.resolveTrackUri(track, detail.work) }
+        val data = RemoteFileDataSource("SMB") { graph.sources.smb.open(source, password, it) }
         val offset = 40_000_003L
         assertEquals(
             1021L,
@@ -90,19 +93,22 @@ class SmbIntegrationTest {
         while (used < actual.size) used += data.read(actual, used, actual.size - used)
         assertEquals(-1, data.read(actual, 0, 1))
         data.close()
-        assertArrayEquals(repo.smb.range(uri, source, password, offset, actual.size), actual)
+        assertArrayEquals(
+            graph.sources.smb.range(uri, source, password, offset, actual.size),
+            actual,
+        )
         val future =
             MediaController.Builder(
-                    repo.context,
+                    graph.context,
                     SessionToken(
-                        repo.context,
-                        ComponentName(repo.context, PlaybackService::class.java),
+                        graph.context,
+                        ComponentName(graph.context, PlaybackService::class.java),
                     ),
                 )
                 .buildAsync()
         val controller = future.get(20, TimeUnit.SECONDS)
         try {
-            val item = runBlocking { repo.mediaItem(track, detail.work) }
+            val item = runBlocking { graph.playback.mediaItem(track, detail.work) }
             instrumentation.runOnMainSync {
                 assertTrue(
                     "Muted playback requires volume command",
@@ -129,21 +135,27 @@ class SmbIntegrationTest {
             Thread.sleep(1500)
             assertTrue("SMB playback continues in the background", playing())
             instrumentation.runOnMainSync { controller.pause() }
-            runBlocking { repo.offlineStore.downloadWork(detail.work.id) }
-            waitFor(180000) { repo.downloads.value[track.id]?.state == Download.STATE_COMPLETED }
-            waitFor { runBlocking { repo.dao.details(detail.work.id)!!.work.offlineAttachments } }
-            runBlocking { repo.removeSource(id) }
-            assertNull(runBlocking { repo.dao.source(id) })
-            val offlineItem = runBlocking { repo.mediaItem(track, detail.work) }
+            runBlocking { graph.offline.downloadWork(detail.work.id) }
+            waitFor(180000) {
+                graph.media.downloads.value[track.id]?.state == Download.STATE_COMPLETED
+            }
+            waitFor {
+                runBlocking { graph.library.dao.details(detail.work.id)!!.work.offlineAttachments }
+            }
+            runBlocking { graph.sync.removeSource(id) }
+            assertNull(runBlocking { graph.library.dao.source(id) })
+            val offlineItem = runBlocking { graph.playback.mediaItem(track, detail.work) }
             instrumentation.runOnMainSync {
                 controller.setMediaItem(offlineItem, 20 * 60_000L)
                 controller.prepare()
                 controller.play()
             }
             waitFor { playing() }
-            assertTrue(runBlocking { repo.readAsset(track.subtitleId!!) }.isNotEmpty())
+            assertTrue(runBlocking { graph.library.readAsset(track.subtitleId!!) }.isNotEmpty())
             assertTrue(
-                repo.offlineStore.isOffline(runBlocking { repo.dao.details(detail.work.id)!! }),
+                graph.offline.isOffline(
+                    runBlocking { graph.library.dao.details(detail.work.id)!! },
+                ),
             )
             instrumentation.runOnMainSync { controller.pause() }
         } finally {

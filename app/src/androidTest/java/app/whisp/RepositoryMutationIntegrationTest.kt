@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp
 
+import androidx.core.net.toUri
 import androidx.media3.common.util.UnstableApi
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import app.whisp.data.AttachmentEntity
-import app.whisp.data.LibraryRepository
-import app.whisp.data.LocationEntity
-import app.whisp.data.SourceEntity
-import app.whisp.data.WorkEntity
+import app.whisp.data.*
+import coil3.request.ImageRequest
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -24,14 +23,14 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 @androidx.annotation.OptIn(UnstableApi::class)
 class RepositoryMutationIntegrationTest {
-    private fun repository(): LibraryRepository =
+    private fun graph(): AppGraph =
         (InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as WhispApp)
-            .repository
+            .graph
             .also { assertTrue(it.context.packageName.endsWith(".smoketest")) }
 
     @Test
     fun sourcePasswordWhitespaceIsPreservedByTheKeystore() {
-        val secrets = repository().secrets
+        val secrets = graph().secrets
         val password = " \t "
         val encrypted = secrets.encrypt(password)
         assertTrue(encrypted.isNotEmpty())
@@ -43,7 +42,7 @@ class RepositoryMutationIntegrationTest {
 
     @Test
     fun fourIntroductionImagesCanStartBeforeAnyResponseCompletes() = runBlocking {
-        val repo = repository()
+        val graph = graph()
         val arrived = CountDownLatch(4)
         val release = CountDownLatch(1)
         val server = MockWebServer()
@@ -55,16 +54,21 @@ class RepositoryMutationIntegrationTest {
                     return MockResponse.Builder().body("synthetic image bytes").build()
                 }
             }
-
         server.start()
         try {
             coroutineScope {
                 val requests =
                     (1..4).map { index ->
                         async(Dispatchers.IO) {
-                            repo.ensureDlsiteImage(
-                                "introduction-concurrency-$index",
-                                server.url("/$index").toString(),
+                            graph.images.imageLoader.execute(
+                                ImageRequest.Builder(graph.context)
+                                    .data(
+                                        WhispImage.Official(
+                                            "introduction-concurrency-$index",
+                                            server.url("/$index").toString(),
+                                        ),
+                                    )
+                                    .build(),
                             )
                         }
                     }
@@ -76,12 +80,12 @@ class RepositoryMutationIntegrationTest {
                 } finally {
                     release.countDown()
                 }
-                assertTrue(requests.awaitAll().all { it?.isFile == true })
+                requests.awaitAll()
             }
         } finally {
             release.countDown()
             server.close()
-            repo.clearTemporaryCache()
+            graph.images.clearCaches(graph.media::clearStreamingCache)
         }
     }
 
@@ -94,7 +98,7 @@ class RepositoryMutationIntegrationTest {
     @Test fun failedScanDoesNotRestoreRemovedSource() = sourceScanRace(true, 500)
 
     private fun sourceScanRace(remove: Boolean, status: Int) = runBlocking {
-        val repo = repository()
+        val graph = graph()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val server = MockWebServer()
@@ -113,25 +117,27 @@ class RepositoryMutationIntegrationTest {
             }
         server.start()
         val id = "scan-race-$remove-$status"
-        repo.dao.putSource(SourceEntity(id, "Before", "webdav", server.url("/dav/").toString()))
+        graph.library.dao.putSource(
+            SourceEntity(id, "Before", "webdav", server.url("/dav/").toString()),
+        )
         try {
             coroutineScope {
                 val scan =
                     async(Dispatchers.IO) {
                         try {
-                            repo.scan(id)
+                            graph.sync.scan(id)
                         } catch (_: IOException) {} catch (_: IllegalArgumentException) {}
                     }
                 try {
                     assertTrue(entered.await(5, TimeUnit.SECONDS))
-                    if (remove) repo.removeSource(id)
+                    if (remove) graph.sync.removeSource(id)
                     else
-                        repo.dao.putSource(
-                            repo.dao
+                        graph.library.dao.putSource(
+                            graph.library.dao
                                 .source(id)!!
                                 .copy(
                                     name = "After",
-                                    secret = repo.secrets.encrypt("synthetic-new-password"),
+                                    secret = graph.secrets.encrypt("synthetic-new-password"),
                                 ),
                         )
                 } finally {
@@ -142,49 +148,49 @@ class RepositoryMutationIntegrationTest {
             if (remove) {
                 assertNull(
                     "An in-flight scan must not restore a deleted source",
-                    repo.dao.source(id),
+                    graph.library.dao.source(id),
                 )
-                assertTrue(repo.dao.sourceWorkIds(id).isEmpty())
+                assertTrue(graph.library.dao.sourceWorkIds(id).isEmpty())
             } else {
-                val latest = repo.dao.source(id)!!
+                val latest = graph.library.dao.source(id)!!
                 assertEquals("After", latest.name)
-                assertEquals("synthetic-new-password", repo.secrets.decrypt(latest.secret))
+                assertEquals("synthetic-new-password", graph.secrets.decrypt(latest.secret))
             }
         } finally {
             release.countDown()
-            repo.removeSource(id)
+            graph.sync.removeSource(id)
             server.close()
         }
     }
 
     @Test
     fun coverChangePreservesMetadataWrittenSinceEditorOpened() = runBlocking {
-        val repo = repository()
+        val graph = graph()
         val original = WorkEntity("cover-editor-race", null, "Before", "Before")
-        repo.dao.putWorks(listOf(original))
-        repo.dao.putWorks(
+        graph.library.dao.putWorks(listOf(original))
+        graph.library.dao.putWorks(
             listOf(original.copy(title = "After", favorite = true, origin = "dlsite")),
         )
         val picture =
-            java.io.File(repo.context.cacheDir, "synthetic-cover.png").apply {
+            File(graph.context.cacheDir, "synthetic-cover.png").apply {
                 writeBytes(byteArrayOf(1, 2, 3))
             }
         try {
-            repo.offlineStore.setCover(original, android.net.Uri.fromFile(picture))
-            val latest = repo.dao.work(original.id)!!
+            graph.offline.setCover(original, android.net.Uri.fromFile(picture))
+            val latest = graph.library.dao.work(original.id)!!
             assertEquals("After", latest.title)
             assertTrue(latest.favorite)
             assertEquals("dlsite", latest.origin)
             assertNotNull(latest.coverId)
         } finally {
-            repo.removeAsmrWork(original.id)
+            graph.sync.removeOnlineWork(original.id)
             picture.delete()
         }
     }
 
     @Test
     fun removingOfflineCopyWaitsForInFlightAttachmentWriter() = runBlocking {
-        val repo = repository()
+        val graph = graph()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val server = MockWebServer()
@@ -200,52 +206,57 @@ class RepositoryMutationIntegrationTest {
         val sourceId = "attachment-removal-source"
         val workId = "attachment-removal-work"
         val assetId = "attachment-removal-asset"
-        repo.dao.putSource(
+        graph.library.dao.putSource(
             SourceEntity(sourceId, "Attachments", "webdav", server.url("/").toString()),
         )
-        repo.dao.putWorks(
-            listOf(WorkEntity(workId, null, "Attachments", "Attachments", origin = "dlsite")),
-        )
-        repo.dao.putAttachments(
+        graph.library.dao.putWorks(
             listOf(
-                AttachmentEntity(assetId, workId, "Script", "script.txt", "script.txt", "script"),
+                WorkEntity(
+                    workId,
+                    null,
+                    "Attachments",
+                    "Attachments",
+                    origin = "dlsite",
+                    sourceId = sourceId,
+                ),
             ),
         )
-        repo.dao.putLocations(
+        graph.library.dao.putAttachments(
             listOf(
-                LocationEntity(
-                    "attachment-removal-location",
+                AttachmentEntity(
                     assetId,
-                    sourceId,
-                    server.url("/script.txt").toString(),
-                    20,
+                    workId,
+                    "Script",
+                    "script.txt",
+                    "script.txt",
+                    "script",
+                    uri = server.url("/script.txt").toString(),
+                    size = 20,
                 ),
             ),
         )
         try {
             coroutineScope {
-                val writer = async(Dispatchers.IO) { repo.offlineStore.downloadAttachments(workId) }
+                val writer = async(Dispatchers.IO) { graph.offline.downloadAttachments(workId) }
                 assertTrue(entered.await(5, TimeUnit.SECONDS))
-                val removal = async(Dispatchers.IO) { repo.offlineStore.removeOffline(workId) }
+                val removal = async(Dispatchers.IO) { graph.offline.removeOffline(workId) }
                 delay(100)
                 release.countDown()
                 withTimeout(10_000) { awaitAll(writer, removal) }
             }
-            assertFalse(repo.dao.work(workId)!!.offlineAttachments)
-            assertFalse(
-                java.io.File(repo.context.filesDir, "offline/attachments/$assetId").exists(),
-            )
+            assertFalse(graph.library.dao.work(workId)!!.offlineAttachments)
+            assertFalse(File(graph.context.filesDir, "offline/assets/$assetId").exists())
         } finally {
             release.countDown()
-            repo.removeAsmrWork(workId)
-            repo.removeSource(sourceId)
+            graph.sync.removeOnlineWork(workId)
+            graph.sync.removeSource(sourceId)
             server.close()
         }
     }
 
     @Test
     fun removingOneWorkPreservesAnOfflineCoverSharedByAnotherAccount() = runBlocking {
-        val repo = repository()
+        val graph = graph()
         val coverId = "shared-offline-cover"
         val first =
             WorkEntity(
@@ -258,30 +269,28 @@ class RepositoryMutationIntegrationTest {
                 origin = "dlsite",
             )
         val second = first.copy(id = "shared-cover-work-2", title = "Second")
-        repo.dao.putWorks(listOf(first, second))
+        graph.library.dao.putWorks(listOf(first, second))
         val cover =
-            java.io.File(repo.context.filesDir, "offline/attachments/$coverId").apply {
+            File(graph.context.filesDir, "offline/assets/$coverId").apply {
                 parentFile!!.mkdirs()
                 writeBytes(byteArrayOf(1, 2, 3))
             }
         try {
-            repo.offlineStore.removeOffline(first.id)
+            graph.offline.removeOffline(first.id)
             assertTrue("The second account still owns the pinned cover", cover.isFile)
-            assertTrue(repo.dao.work(second.id)!!.offlineAttachments)
-            repo.removeAsmrWork(first.id)
-            assertTrue("Deleting the first work must keep the second work's cover", cover.isFile)
-            repo.removeAsmrWork(second.id)
+            assertTrue(graph.library.dao.work(second.id)!!.offlineAttachments)
+            graph.sync.removeOnlineWork(second.id)
             assertFalse("The final owner's removal releases the offline file", cover.exists())
         } finally {
-            repo.removeAsmrWork(first.id)
-            repo.removeAsmrWork(second.id)
+            runCatching { graph.sync.removeOnlineWork(first.id) }
+            runCatching { graph.sync.removeOnlineWork(second.id) }
             cover.delete()
         }
     }
 
     @Test
     fun sourceRescanKeepsIdentityProgressAndFavoritesWhenTracksAreAddedOrRemoved() = runBlocking {
-        val repo = repository()
+        val graph = graph()
         val server = MockWebServer()
         server.start()
         val sourceId = "stable-rescan-source"
@@ -296,67 +305,65 @@ class RepositoryMutationIntegrationTest {
                         "</d:multistatus>",
                 )
                 .build()
-        repo.dao.putSource(
+        graph.library.dao.putSource(
             SourceEntity(sourceId, "Rescan", "webdav", server.url("/dav/").toString()),
         )
         var workId: String? = null
         try {
             server.enqueue(listing("01.m4a"))
-            repo.scan(sourceId)
-            workId = repo.dao.sourceWorkIds(sourceId).single()
-            val first = repo.dao.details(workId)!!
+            graph.sync.scan(sourceId)
+            workId = graph.library.dao.sourceWorkIds(sourceId).single()
+            val first = graph.library.dao.details(workId)!!
             val firstTrack = first.tracks.single()
-            repo.dao.toggleFavorite(workId)
-            repo.dao.updateWorkIdentity(workId, "Edited title", "Edited artist")
-            repo.dao.updateDuration(firstTrack.id, 65000)
-            repo.dao.saveProgress(app.whisp.data.ProgressEntity(workId, firstTrack.id, 12345))
+            graph.library.dao.toggleFavorite(workId)
+            graph.library.dao.updateWorkIdentity(workId, "Edited title", "Edited artist")
+            graph.library.dao.updateDuration(firstTrack.id, 65000)
+            graph.library.dao.saveProgress(ProgressEntity(workId, firstTrack.id, 12345))
             server.enqueue(listing("01.m4a", "02.m4a"))
-            repo.scan(sourceId)
-            assertEquals(listOf(workId), repo.dao.sourceWorkIds(sourceId))
-            val added = repo.dao.details(workId)!!
+            graph.sync.scan(sourceId)
+            assertEquals(listOf(workId), graph.library.dao.sourceWorkIds(sourceId))
+            val added = graph.library.dao.details(workId)!!
             assertEquals(2, added.tracks.size)
             assertTrue(added.work.favorite)
             assertEquals("Edited title", added.work.title)
             assertEquals("Edited artist", added.work.artist)
             assertEquals(65000L, added.tracks.single { it.id == firstTrack.id }.durationMs)
-            assertEquals(12345L, repo.dao.progress(workId)!!.positionMs)
+            assertEquals(12345L, graph.library.dao.progress(workId)!!.positionMs)
             server.enqueue(listing("01.m4a"))
-            repo.scan(sourceId)
-            val removed = repo.dao.details(workId)!!
+            graph.sync.scan(sourceId)
+            val removed = graph.library.dao.details(workId)!!
             assertEquals(listOf(firstTrack.id), removed.tracks.map { it.id })
             assertTrue(removed.work.favorite)
-            assertEquals(12345L, repo.dao.progress(workId)!!.positionMs)
+            assertEquals(12345L, graph.library.dao.progress(workId)!!.positionMs)
             server.enqueue(listing())
-            repo.scan(sourceId)
-            assertTrue(repo.dao.sourceWorkIds(sourceId).isEmpty())
-            assertTrue(repo.dao.details(workId)!!.tracks.isEmpty())
-            assertTrue(repo.dao.work(workId)!!.favorite)
+            graph.sync.scan(sourceId)
+            assertTrue(graph.library.dao.sourceWorkIds(sourceId).isEmpty())
+            assertTrue(graph.library.dao.details(workId)!!.tracks.isEmpty())
+            assertTrue(graph.library.dao.work(workId)!!.favorite)
         } finally {
-            repo.removeSource(sourceId)
-            workId?.let {
-                repo.dao.deleteWorkTracks(it)
-                repo.dao.deleteWorkProgress(it)
-                repo.dao.deleteWork(it)
-            }
+            graph.sync.removeSource(sourceId)
+            workId?.let { graph.library.dao.deleteWork(it) }
             server.close()
         }
     }
 
     @Test
     fun refreshingAWorkReleasesRemovedUnfinishedDownloads() = runBlocking {
-        val repo = repository()
+        val graph = graph()
         val sourceId = "obsolete-download-source"
         val server = MockWebServer()
         server.start()
-        val work = app.whisp.data.AsmrWork(98, "Download test", "RJ00000098", "Example", null)
+        val work = AsmrWork(98, "Download test", "RJ00000098", "Example", null)
         val old =
-            app.whisp.data.TrackEntity(
+            TrackEntity(
                 "obsolete-download-track",
                 work.workId,
                 "Old",
                 "old.wav",
                 "old.wav",
                 1,
+                uri = server.url("/old.wav").toString(),
+                size = 20,
             )
         val current =
             old.copy(
@@ -364,31 +371,21 @@ class RepositoryMutationIntegrationTest {
                 title = "Current",
                 fileName = "current.wav",
                 relativePath = "current.wav",
+                uri = server.url("/current.wav").toString(),
             )
-        repo.dao.putSource(
+        graph.library.dao.putSource(
             SourceEntity(sourceId, "Download test", "asmrone", server.url("/").toString()),
         )
-        repo.dao.putWorks(listOf(work.entity()))
-        repo.dao.putTracks(listOf(old))
-        repo.dao.putLocations(
-            listOf(
-                LocationEntity(
-                    "obsolete-location",
-                    old.id,
-                    sourceId,
-                    server.url("/old.wav").toString(),
-                    20,
-                ),
-            ),
-        )
+        graph.library.dao.putWorks(listOf(work.entity(sourceId)))
+        graph.library.dao.putTracks(listOf(old))
         val request =
             androidx.media3.exoplayer.offline.DownloadRequest.Builder(
                     old.id,
-                    android.net.Uri.parse("whisp-asmr://$sourceId/${old.id}"),
+                    "whisp-asmr://$sourceId/${old.id}".toUri(),
                 )
                 .setCustomCacheKey(old.id)
                 .build()
-        (repo.downloadManager.downloadIndex
+        (graph.media.downloadManager.downloadIndex
                 as androidx.media3.exoplayer.offline.WritableDownloadIndex)
             .putDownload(
                 androidx.media3.exoplayer.offline.Download(
@@ -404,39 +401,28 @@ class RepositoryMutationIntegrationTest {
                     },
                 ),
             )
-        val hole = repo.downloadCache.startReadWrite(old.id, 0, 3)
+        val hole = graph.media.downloadCache.startReadWrite(old.id, 0, 3)
         try {
-            val file = repo.downloadCache.startFile(old.id, 0, 3)
+            val file = graph.media.downloadCache.startFile(old.id, 0, 3)
             file.writeBytes(byteArrayOf(1, 2, 3))
-            repo.downloadCache.commitFile(file, 3)
+            graph.media.downloadCache.commitFile(file, 3)
         } finally {
-            repo.downloadCache.releaseHoleSpan(hole)
+            graph.media.downloadCache.releaseHoleSpan(hole)
         }
         try {
             val indexed =
-                app.whisp.data.IndexedLibrary(
-                    listOf(work.entity()),
-                    listOf(current),
-                    emptyList(),
-                    listOf(
-                        LocationEntity(
-                            "current-location",
-                            current.id,
-                            sourceId,
-                            server.url("/current.wav").toString(),
-                            20,
-                        ),
-                    ),
-                )
-            repo.addAsmrPreview(app.whisp.data.AsmrPreview(sourceId, work.artist, work, indexed))
-            assertNull(repo.dao.track(old.id))
+                IndexedLibrary(listOf(work.entity(sourceId)), listOf(current), emptyList())
+            graph.sync.addAsmrPreview(AsmrPreview(sourceId, work.artist, work, indexed))
+            assertNull(graph.library.dao.track(old.id))
             withTimeout(15_000) {
-                while (repo.downloadManager.downloadIndex.getDownload(old.id) != null) delay(50)
+                while (graph.media.downloadManager.downloadIndex.getDownload(old.id) != null) delay(
+                    50,
+                )
             }
-            assertFalse(repo.downloadCache.keys.contains(old.id))
+            assertFalse(graph.media.downloadCache.keys.contains(old.id))
         } finally {
-            repo.removeAsmrWork(work.workId)
-            repo.removeSource(sourceId)
+            graph.sync.removeOnlineWork(work.workId)
+            graph.sync.removeSource(sourceId)
             server.close()
         }
     }

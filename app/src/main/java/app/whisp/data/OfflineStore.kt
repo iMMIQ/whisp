@@ -14,6 +14,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import app.whisp.WhispApp
 import app.whisp.playback.OfflineService
 import java.io.File
 import java.io.IOException
@@ -22,44 +23,48 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import okio.ByteString.Companion.toByteString
 
-/** Offline downloads and attachments, behind the repository facade. */
+/** Offline downloads, attachment persistence, and custom cover assignment. */
 @androidx.annotation.OptIn(UnstableApi::class)
-internal class OfflineStore(private val repository: LibraryRepository) {
-    private suspend fun withWorkLock(id: String, block: suspend (WorkDetails) -> Unit) {
-        repository.withWorkLock(id) {
-            val detail = repository.dao.details(id) ?: return@withWorkLock
+class OfflineStore(
+    private val context: Context,
+    private val library: LibraryStore,
+    private val media: MediaSourceRouting,
+    private val images: WhispImages,
+) {
+    private suspend fun withWork(id: String, block: suspend (WorkDetails) -> Unit) {
+        library.withWorkLock(id) {
+            val detail = library.dao.details(id) ?: return@withWorkLock
             block(detail)
         }
     }
 
     fun removeTrackDownload(id: String) {
-        DownloadService.sendRemoveDownload(
-            repository.context,
-            OfflineService::class.java,
-            id,
-            false,
-        )
+        DownloadService.sendRemoveDownload(context, OfflineService::class.java, id, false)
+    }
+
+    fun resumeDownloads() {
+        DownloadService.sendResumeDownloads(context, OfflineService::class.java, false)
+    }
+
+    fun pauseDownloads() {
+        DownloadService.sendPauseDownloads(context, OfflineService::class.java, false)
     }
 
     suspend fun downloadWork(id: String) =
-        withWorkLock(id) { detail ->
+        withWork(id) { detail ->
             require(detail.tracks.isNotEmpty()) { "作品没有音轨" }
             for (track in detail.tracks) {
-                val uri = repository.resolve(track.id)
+                val uri = library.resolveTrackUri(track, detail.work)
                 val request =
                     DownloadRequest.Builder(track.id, uri.toUri())
                         .setMimeType(MediaFormats.videoMimeType(track.fileName))
                         .setCustomCacheKey(track.id)
                         .build()
-                DownloadService.sendAddDownload(
-                    repository.context,
-                    OfflineService::class.java,
-                    request,
-                    false,
-                )
+                DownloadService.sendAddDownload(context, OfflineService::class.java, request, false)
             }
-            WorkManager.getInstance(repository.context)
+            WorkManager.getInstance(context)
                 .enqueueUniqueWork(
                     "attachments-$id",
                     ExistingWorkPolicy.KEEP,
@@ -70,71 +75,86 @@ internal class OfflineStore(private val repository: LibraryRepository) {
         }
 
     suspend fun downloadAttachments(id: String) =
-        withWorkLock(id) { detail ->
+        withWork(id) { detail ->
             detail.attachments.forEach { attachment ->
                 currentCoroutineContext().ensureActive()
-                if (repository.offlineFile(attachment.id) == null)
+                if (library.offlineFile(attachment.id) == null)
                     atomicFile(
-                        File(repository.offlineDir, attachment.id),
-                        repository.readAsset(attachment.id, 64 * 1024 * 1024),
+                        File(library.offlineDir, attachment.id),
+                        library.readAsset(attachment.id, 64 * 1024 * 1024),
                     )
             }
             currentCoroutineContext().ensureActive()
             detail.work.coverId?.let { cover ->
-                val target = File(repository.offlineDir, cover)
+                val target = File(library.offlineDir, cover)
                 if (!target.isFile) {
-                    val custom =
-                        File(repository.customArtworkDir, cover).takeIf { it.isFile }
-                            ?: File(repository.artworkDir, cover).takeIf {
-                                cover == stableId("${detail.work.id}|custom-cover") && it.isFile
-                            }
+                    val custom = File(library.customArtworkDir, cover).takeIf { it.isFile }
                     atomicFile(
                         target,
-                        custom?.readBytes() ?: repository.readAsset(cover, 16 * 1024 * 1024),
+                        custom?.readBytes() ?: library.readAsset(cover, 16 * 1024 * 1024),
                     )
                 }
             }
-            repository.dao.attachmentsReady(id, true)
-            repository.storageChanged()
+            library.dao.attachmentsReady(id, true)
+            library.storageChanged()
         }
 
     suspend fun setCover(work: WorkEntity, uri: Uri) =
         withContext(Dispatchers.IO) {
-            repository.withWorkLock(work.id) {
-                val latest = repository.dao.work(work.id) ?: throw IOException("作品已删除")
-                val id = stableId("${work.id}|custom-cover")
+            library.withWorkLock(work.id) {
+                val latest = library.dao.work(work.id) ?: throw IOException("作品已删除")
                 val bytes =
-                    repository.context.contentResolver.openInputStream(uri)?.use {
+                    context.contentResolver.openInputStream(uri)?.use {
                         boundedRead(it, 16 * 1024 * 1024)
                     } ?: error("无法读取图片")
-                atomicFile(File(repository.customArtworkDir, id), bytes)
-                if (latest.offlineAttachments) atomicFile(File(repository.offlineDir, id), bytes)
-                repository.dao.updateWorkCover(work.id, id)
-                repository.artworkStore.notifyAssetChanged(id)
-                latest.coverId?.let { repository.artworkStore.notifyAssetChanged(it) }
-                repository.storageChanged()
+                // Content-addressed ID invalidates Room & Coil automatically without revision
+                // flows.
+                val digest = bytes.toByteString().sha256().substring(0, 8).hex()
+                val newId = stableId("${work.id}|custom-cover|$digest")
+                atomicFile(File(library.customArtworkDir, newId), bytes)
+                if (latest.offlineAttachments) atomicFile(File(library.offlineDir, newId), bytes)
+                library.dao.updateWorkCover(work.id, newId)
+                latest.coverId
+                    ?.takeIf { it != newId }
+                    ?.let { previous ->
+                        if (!library.dao.otherCover(previous, work.id)) {
+                            File(library.customArtworkDir, previous).delete()
+                            images.removeFromMemoryAndDisk(previous)
+                        }
+                        if (!library.dao.otherOfflineCover(previous, work.id)) {
+                            File(library.offlineDir, previous).delete()
+                        }
+                    }
+                library.storageChanged()
             }
         }
 
     suspend fun removeOffline(id: String) {
-        WorkManager.getInstance(repository.context).cancelUniqueWork("attachments-$id")
-        withWorkLock(id) { detail ->
-            detail.tracks.forEach { track -> removeTrackDownload(track.id) }
-            detail.attachments.forEach { File(repository.offlineDir, it.id).delete() }
+        WorkManager.getInstance(context).cancelUniqueWork("attachments-$id")
+        withWork(id) { detail ->
+            detail.tracks.forEach { removeTrackDownload(it.id) }
+            detail.attachments.forEach { File(library.offlineDir, it.id).delete() }
             detail.work.coverId?.let {
-                if (!repository.dao.otherOfflineCover(it, id))
-                    File(repository.offlineDir, it).delete()
+                if (!library.dao.otherOfflineCover(it, id)) File(library.offlineDir, it).delete()
             }
-            repository.dao.attachmentsReady(id, false)
-            repository.storageChanged()
+            library.dao.attachmentsReady(id, false)
+            if (detail.work.sourceId == null) {
+                library.dao.deleteWork(id)
+                images.purgeWorkAssets(
+                    id,
+                    (detail.tracks.map { it.id } +
+                            detail.attachments.map { it.id } +
+                            listOfNotNull(detail.work.coverId))
+                        .toSet(),
+                )
+            }
+            library.storageChanged()
         }
     }
 
     fun isOffline(detail: WorkDetails): Boolean =
         detail.work.offlineAttachments &&
-            detail.tracks.all {
-                repository.downloads.value[it.id]?.state == Download.STATE_COMPLETED
-            }
+            detail.tracks.all { media.downloads.value[it.id]?.state == Download.STATE_COMPLETED }
 }
 
 class AttachmentsWorker(context: Context, params: WorkerParameters) :
@@ -142,17 +162,12 @@ class AttachmentsWorker(context: Context, params: WorkerParameters) :
     override suspend fun doWork(): Result {
         val id = inputData.getString("workId") ?: return Result.failure()
         return try {
-            (applicationContext as app.whisp.WhispApp)
-                .repository
-                .offlineStore
-                .downloadAttachments(id)
+            (applicationContext as WhispApp).graph.offline.downloadAttachments(id)
             Result.success()
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            if (runAttemptCountCountExceeded()) Result.failure() else Result.retry()
+            if (runAttemptCount >= 3) Result.failure() else Result.retry()
         }
     }
-
-    private fun runAttemptCountCountExceeded(): Boolean = runAttemptCount >= 3
 }

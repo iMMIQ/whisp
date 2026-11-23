@@ -5,10 +5,8 @@ import androidx.media3.common.util.UnstableApi
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.whisp.data.*
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.*
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -19,21 +17,16 @@ import org.junit.runner.RunWith
 @androidx.annotation.OptIn(UnstableApi::class)
 @RunWith(AndroidJUnit4::class)
 class DlsiteScanLifecycleIntegrationTest {
-    private fun repository(): LibraryRepository {
+    private fun graph(): AppGraph {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         assertTrue(context.packageName.endsWith(".smoketest"))
-        return (context.applicationContext as WhispApp).repository
+        return (context.applicationContext as WhispApp).graph
     }
 
-    @Suppress("UNCHECKED_CAST")
-    private fun <T> field(repo: LibraryRepository, name: String): T =
-        LibraryRepository::class.java.getDeclaredField(name).apply { isAccessible = true }.get(repo)
-            as T
-
-    private fun client(repo: LibraryRepository, server: MockWebServer) =
+    private fun client(graph: AppGraph, server: MockWebServer) =
         DlsiteAccountClient(
             DlsiteSession(),
-            repo.http,
+            graph.http,
             root = server.url("/"),
             contentRoot = server.url("/"),
             testTransport = true,
@@ -43,10 +36,10 @@ class DlsiteScanLifecycleIntegrationTest {
 
     @Test
     fun cancelledOldScanCannotOverwriteNewSessionOrClearItsBusyOwner() = runBlocking {
-        val repo = repository()
-        val clients = field<ConcurrentHashMap<String, DlsiteAccountClient>>(repo, "dlsiteClients")
-        val owners = field<ConcurrentHashMap<String, Any>>(repo, "scanOwners")
-        val cookieLock = field<Mutex>(repo, "dlsiteCookieWrites")
+        val graph = graph()
+        val clients = graph.sources.dlsiteClients
+        val owners = graph.sync.scanOwners
+        val cookieLock = graph.sources.dlsiteCookieWrites
         val source = "dlsite-scan-cancellation-test"
         MockWebServer().use { oldServer ->
             MockWebServer().use { newServer ->
@@ -65,11 +58,11 @@ class DlsiteScanLifecycleIntegrationTest {
                         .build(),
                 )
                 newServer.enqueue(response("""{"user":0,"production":0,"page_limit":100}"""))
-                val oldClient = client(repo, oldServer)
-                val newClient = client(repo, newServer)
+                val oldClient = client(graph, oldServer)
+                val newClient = client(graph, newServer)
                 cookieLock.withLock {
                     clients[source] = oldClient
-                    repo.dao.putSource(
+                    graph.library.dao.putSource(
                         SourceEntity(
                             source,
                             "示例账号",
@@ -80,7 +73,7 @@ class DlsiteScanLifecycleIntegrationTest {
                     )
                 }
                 var replacement: Deferred<Result<Unit>>? = null
-                val oldScan = async(Dispatchers.IO) { runCatching { repo.scan(source) } }
+                val oldScan = async(Dispatchers.IO) { runCatching { graph.sync.scan(source) } }
                 try {
                     assertNotNull(oldServer.takeRequest(5, TimeUnit.SECONDS))
                     val oldOwner = owners[source]
@@ -88,24 +81,25 @@ class DlsiteScanLifecycleIntegrationTest {
                     cookieLock.withLock {
                         oldClient.session.clear()
                         clients[source] = newClient
-                        repo.dao.putSource(
-                            repo.dao.source(source)!!.copy(secret = "new-session", error = null),
+                        graph.library.dao.putSource(
+                            graph.library.dao
+                                .source(source)!!
+                                .copy(secret = "new-session", error = null),
                         )
                         oldClient.http.dispatcher.cancelAll()
-                        replacement = async(Dispatchers.IO) { runCatching { repo.scan(source) } }
-                        withTimeout(5000) {
-                            while (owners[source] === oldOwner) delay(10)
-                        }
+                        replacement =
+                            async(Dispatchers.IO) { runCatching { graph.sync.scan(source) } }
+                        withTimeout(5000) { while (owners[source] === oldOwner) delay(10) }
                     }
                     assertNotNull(newServer.takeRequest(5, TimeUnit.SECONDS))
                     val cancelled = withTimeout(5000) { oldScan.await() }
                     assertTrue(cancelled.exceptionOrNull() is CancellationException)
-                    assertTrue(source in repo.busy.value)
-                    assertNull(repo.dao.source(source)!!.error)
-                    assertEquals("new-session", repo.dao.source(source)!!.secret)
+                    assertTrue(source in graph.sync.busy.value)
+                    assertNull(graph.library.dao.source(source)!!.error)
+                    assertEquals("new-session", graph.library.dao.source(source)!!.secret)
                     assertTrue(withTimeout(15_000) { replacement!!.await() }.isSuccess)
-                    assertFalse(source in repo.busy.value)
-                    assertNull(repo.dao.source(source)!!.error)
+                    assertFalse(source in graph.sync.busy.value)
+                    assertNull(graph.library.dao.source(source)!!.error)
                 } finally {
                     withContext(NonCancellable) {
                         oldScan.cancelAndJoin()
@@ -114,7 +108,7 @@ class DlsiteScanLifecycleIntegrationTest {
                             clients.remove(source)?.session?.clear()
                             oldClient.http.dispatcher.cancelAll()
                             newClient.http.dispatcher.cancelAll()
-                            repo.dao.deleteSource(source)
+                            graph.library.dao.deleteSource(source)
                         }
                     }
                 }
@@ -124,9 +118,9 @@ class DlsiteScanLifecycleIntegrationTest {
 
     @Test
     fun completedOldPurchaseResponseCannotAdvanceTheReplacementSession() = runBlocking {
-        val repo = repository()
-        val clients = field<ConcurrentHashMap<String, DlsiteAccountClient>>(repo, "dlsiteClients")
-        val cookieLock = field<Mutex>(repo, "dlsiteCookieWrites")
+        val graph = graph()
+        val clients = graph.sources.dlsiteClients
+        val cookieLock = graph.sources.dlsiteCookieWrites
         val source = "dlsite-scan-commit-test"
         MockWebServer().use { server ->
             server.start()
@@ -137,11 +131,11 @@ class DlsiteScanLifecycleIntegrationTest {
                     .bodyDelay(1, TimeUnit.SECONDS)
                     .build(),
             )
-            val oldClient = client(repo, server)
-            val newClient = client(repo, server)
+            val oldClient = client(graph, server)
+            val newClient = client(graph, server)
             cookieLock.withLock {
                 clients[source] = oldClient
-                repo.dao.putSource(
+                graph.library.dao.putSource(
                     SourceEntity(
                         source,
                         "示例账号",
@@ -151,22 +145,23 @@ class DlsiteScanLifecycleIntegrationTest {
                     ),
                 )
             }
-            val sync = async(Dispatchers.IO) { runCatching { repo.syncDlsitePurchases(source) } }
+            val sync =
+                async(Dispatchers.IO) { runCatching { graph.sync.syncDlsitePurchases(source) } }
             try {
                 assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
                 assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
                 cookieLock.withLock {
                     oldClient.session.clear()
                     clients[source] = newClient
-                    repo.dao.putSource(
-                        repo.dao
+                    graph.library.dao.putSource(
+                        graph.library.dao
                             .source(source)!!
                             .copy(secret = "new-session", lastScan = 12345, error = null),
                     )
                 }
                 val cancelled = withTimeout(5000) { sync.await() }
                 assertTrue(cancelled.exceptionOrNull() is CancellationException)
-                val stored = repo.dao.source(source)!!
+                val stored = graph.library.dao.source(source)!!
                 assertEquals(12345L, stored.lastScan)
                 assertEquals("new-session", stored.secret)
                 assertNull(stored.error)
@@ -177,7 +172,7 @@ class DlsiteScanLifecycleIntegrationTest {
                         clients.remove(source)?.session?.clear()
                         oldClient.http.dispatcher.cancelAll()
                         newClient.http.dispatcher.cancelAll()
-                        repo.dao.deleteSource(source)
+                        graph.library.dao.deleteSource(source)
                     }
                 }
             }

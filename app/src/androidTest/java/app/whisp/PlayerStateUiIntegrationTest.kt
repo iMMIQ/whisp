@@ -5,7 +5,6 @@ import android.content.ComponentName
 import android.graphics.Bitmap
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
-import androidx.lifecycle.ViewModelProvider
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -13,7 +12,6 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.whisp.data.*
 import app.whisp.playback.PlaybackService
-import app.whisp.ui.AppViewModel
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
@@ -33,13 +31,13 @@ class PlayerStateUiIntegrationTest {
     @Test
     fun subtitleRetryAndQueueRemainCorrectWhileLibraryChanges() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
-        val wave = SystemMediaIntegrationTest.silentWave(repo.context.filesDir)
-        val caption = File(repo.context.filesDir, "player-ui-probe.vtt").apply { delete() }
-        val work = WorkEntity("player-ui-probe", null, "播放器示例", "播放器示例")
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
+        val wave = SystemMediaIntegrationTest.silentWave(graph.context.filesDir)
+        val caption = File(graph.context.filesDir, "player-ui-probe.vtt").apply { delete() }
         val source =
             SourceEntity("player-ui-source", "示例来源", "local", wave.parentFile!!.toURI().toString())
+        val work = WorkEntity("player-ui-probe", null, "播放器示例", "播放器示例", sourceId = source.id)
         val tracks =
             listOf(
                 TrackEntity(
@@ -51,15 +49,38 @@ class PlayerStateUiIntegrationTest {
                     1,
                     40000,
                     "player-ui-caption",
+                    uri = wave.toURI().toString(),
+                    size = wave.length(),
                 ),
-                TrackEntity("player-ui-b", work.id, "示例曲目 B", "b.wav", "main/b.wav", 2, 40000),
+                TrackEntity(
+                    "player-ui-b",
+                    work.id,
+                    "示例曲目 B",
+                    "b.wav",
+                    "main/b.wav",
+                    2,
+                    40000,
+                    uri = wave.toURI().toString(),
+                    size = wave.length(),
+                ),
             )
-        val extra = TrackEntity("player-ui-c", work.id, "新扫描曲目 C", "c.wav", "main/c.wav", 3, 40000)
+        val extra =
+            TrackEntity(
+                "player-ui-c",
+                work.id,
+                "新扫描曲目 C",
+                "c.wav",
+                "main/c.wav",
+                3,
+                40000,
+                uri = wave.toURI().toString(),
+                size = wave.length(),
+            )
         runBlocking {
-            repo.dao.putWorks(listOf(work))
-            repo.dao.putSource(source)
-            repo.dao.putTracks(tracks)
-            repo.dao.putAttachments(
+            graph.library.dao.putSource(source)
+            graph.library.dao.putWorks(listOf(work))
+            graph.library.dao.putTracks(tracks)
+            graph.library.dao.putAttachments(
                 listOf(
                     AttachmentEntity(
                         "player-ui-caption",
@@ -68,85 +89,57 @@ class PlayerStateUiIntegrationTest {
                         caption.name,
                         caption.name,
                         "subtitle",
+                        uri = caption.toURI().toString(),
+                        size = 0,
                     ),
                 ),
             )
-            repo.dao.putLocations(
-                tracks.map {
-                    LocationEntity(
-                        "location-${it.id}",
-                        it.id,
-                        source.id,
-                        wave.toURI().toString(),
-                        wave.length(),
-                    )
-                } +
-                    LocationEntity(
-                        "location-caption",
-                        "player-ui-caption",
-                        source.id,
-                        caption.toURI().toString(),
-                        0,
-                    ),
-            )
         }
-        ui.waitUntil(5000) { repo.library.value.any { it.work.id == work.id } }
+        ui.waitUntil(5000) { graph.library.works.value.any { it.id == work.id } }
         val future =
             MediaController.Builder(
-                    repo.context,
+                    graph.context,
                     SessionToken(
-                        repo.context,
-                        ComponentName(repo.context, PlaybackService::class.java),
+                        graph.context,
+                        ComponentName(graph.context, PlaybackService::class.java),
                     ),
                 )
                 .buildAsync()
         val controller = future.get(20, TimeUnit.SECONDS)
-        lateinit var model: AppViewModel
-        instrumentation.runOnMainSync {
-            controller.volume = 0f
-            model = ViewModelProvider(ui.activity)[AppViewModel::class.java]
-        }
+        val playback = graph.playback
+        instrumentation.runOnMainSync { controller.volume = 0f }
         try {
             ui.onNodeWithContentDescription(work.title).performClick()
             ui.onNodeWithText("播放作品").performClick()
             ui.waitUntil(15_000) {
-                model.player.value.trackId == tracks.first().id &&
-                    model.subtitleError.value != null &&
-                    model.queueTracks.value.map { it.id } == tracks.map { it.id }
+                playback.state.value.trackId == tracks.first().id &&
+                    playback.subtitles.error.value != null &&
+                    playback.queueTracks.value.map { it.id } == tracks.map { it.id }
             }
             ui.onNodeWithText("重试字幕").assertIsDisplayed()
             ui.onNodeWithText("暂无字幕").assertDoesNotExist()
             ui.onNodeWithText("字幕暂时不可用").assertDoesNotExist()
             caption.writeText("WEBVTT\n\n00:00:00.000 --> 00:01:00.000\n恢复后的示例字幕\n")
             ui.onNodeWithText("重试字幕").performClick()
-            ui.waitUntil(5000) { model.cues.value.firstOrNull()?.text == "恢复后的示例字幕" }
-            assertNull(model.subtitleError.value)
+            ui.waitUntil(5000) { playback.subtitles.cues.value.firstOrNull()?.text == "恢复后的示例字幕" }
+            assertNull(playback.subtitles.error.value)
             ui.onNodeWithText("恢复后的示例字幕").assertIsDisplayed()
             ui.onNodeWithContentDescription("播放队列").performClick()
             ui.waitUntil(5000) { ui.onNodeWithText("示例曲目 B").isDisplayed() }
             runBlocking {
-                repo.dao.deleteStaleTracks(work.id, listOf(tracks.first().id))
-                repo.dao.putTracks(listOf(extra))
-                repo.dao.putLocations(
-                    listOf(
-                        LocationEntity(
-                            "location-${extra.id}",
-                            extra.id,
-                            source.id,
-                            wave.toURI().toString(),
-                            wave.length(),
-                        ),
-                    ),
-                )
+                graph.library.dao.deleteTracks(listOf(tracks.last().id))
+                graph.library.dao.putTracks(listOf(extra))
             }
             ui.waitUntil(5000) {
-                repo.library.value.first { it.work.id == work.id }.tracks.map { it.id }.toSet() ==
-                    setOf(tracks.first().id, extra.id)
+                runBlocking {
+                    graph.library.dao.tracksForWork(work.id).map { it.id }.toSet() ==
+                        setOf(tracks.first().id, extra.id)
+                }
             }
             ui.onNodeWithText("示例曲目 B").assertIsDisplayed()
             ui.onNodeWithText("新扫描曲目 C").assertDoesNotExist()
             ui.onNodeWithText("示例曲目 B").performClick()
-            ui.waitUntil(5000) { model.player.value.trackId == tracks.last().id }
+            ui.waitUntil(5000) { playback.state.value.trackId == tracks.last().id }
             ui.waitUntil(5000) {
                 ui.onAllNodesWithText("播放队列").fetchSemanticsNodes().isEmpty()
             }
@@ -157,17 +150,18 @@ class PlayerStateUiIntegrationTest {
                 assertEquals(tracks.last().id, controller.currentMediaItem?.mediaId)
             }
         } catch (e: Throwable) {
-            val folder = File(repo.context.getExternalFilesDir(null), "player-state-ui-diagnostics")
+            val folder =
+                File(graph.context.getExternalFilesDir(null), "player-state-ui-diagnostics")
             folder.mkdirs()
             File(folder, "semantics.txt")
                 .writeText(
                     ui.onAllNodes(isRoot(), useUnmergedTree = true)
                         .fetchSemanticsNodes()
                         .joinToString("\n\n") { node -> dump(node) } +
-                        "\nmodel=" +
-                        model.player.value +
+                        "\nstate=" +
+                        playback.state.value +
                         "\nqueue=" +
-                        model.queueTracks.value,
+                        playback.queueTracks.value,
                 )
             instrumentation.uiAutomation.takeScreenshot()?.let { bitmap ->
                 File(folder, "screen.png").outputStream().use {
@@ -183,12 +177,8 @@ class PlayerStateUiIntegrationTest {
                 MediaController.releaseFuture(future)
             }
             runBlocking {
-                repo.dao.deleteSourceLocations(source.id)
-                repo.dao.deleteSource(source.id)
-                repo.dao.deleteWorkAttachments(work.id)
-                repo.dao.deleteWorkTracks(work.id)
-                repo.dao.deleteWorkProgress(work.id)
-                repo.dao.deleteWork(work.id)
+                graph.library.dao.deleteWork(work.id)
+                graph.library.dao.deleteSource(source.id)
             }
             caption.delete()
             wave.delete()

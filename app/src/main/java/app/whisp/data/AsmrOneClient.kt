@@ -2,14 +2,90 @@
 package app.whisp.data
 
 import java.io.IOException
+import java.text.Normalizer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.*
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+
+@Serializable
+data class AsmrFacet(val kind: String, val name: String) {
+    init {
+        require(kind in setOf("va", "circle", "tagw"))
+        require(name.isNotBlank() && name.length <= 160 && '$' !in name)
+    }
+
+    val label
+        get() =
+            when (kind) {
+                "va" -> "声优"
+                "circle" -> "社团"
+                else -> "标签"
+            }
+
+    val token
+        get() = "$$kind:$name$"
+}
+
+@Serializable
+data class AsmrQuery(
+    val sourceId: String,
+    val text: String = "",
+    val order: String = "create_date",
+    val subtitlesOnly: Boolean = false,
+    val facets: List<AsmrFacet> = emptyList(),
+) {
+    val searching
+        get() = text.isNotBlank() || facets.isNotEmpty() || subtitlesOnly
+
+    val serverText
+        get() =
+            (listOf(normalizedAsmrInput(text)) + facets.distinct().map { it.token })
+                .filter(String::isNotBlank)
+                .joinToString(" ")
+}
+
+fun normalizedAsmrInput(input: String): String =
+    Normalizer.normalize(input, Normalizer.Form.NFKC).trim()
+
+fun asmrWorkNumber(input: String): Long? {
+    val text = normalizedAsmrInput(input)
+    val rj = Regex("(?i)RJ([0-9]{6,8})")
+    rj.matchEntire(text)?.let {
+        return it.groupValues[1].toLongOrNull()?.takeIf { id -> id > 0 }
+    }
+    val url = text.toHttpUrlOrNull() ?: return null
+    if (url.username.isNotEmpty() || url.password.isNotEmpty()) return null
+    val host = url.host
+    if (host == "asmr.one" || host.endsWith(".asmr.one")) {
+        val segments = url.pathSegments
+        if (segments.size == 2 && segments[0] == "work")
+            return segments[1].removePrefix("RJ").toLongOrNull()?.takeIf { it > 0 }
+    }
+    if (host == "dlsite.com" || host.endsWith(".dlsite.com")) {
+        val match = Regex("(?i)/product_id/(RJ[0-9]{6,8})\\.html/?$").find(url.encodedPath)
+        return match?.groupValues?.get(1)?.let(::asmrWorkNumber)
+    }
+    return null
+}
+
+private val asmrJson = Json {
+    ignoreUnknownKeys = true
+    isLenient = true
+}
+
+internal fun encodeAsmrQuery(query: AsmrQuery): String = asmrJson.encodeToString(query)
+
+internal fun decodeAsmrQuery(data: String?): AsmrQuery? = data?.let {
+    runCatching { asmrJson.decodeFromString<AsmrQuery>(it) }.getOrNull()
+}
 
 data class AsmrWork(
     val id: Long,
@@ -27,26 +103,67 @@ data class AsmrWork(
     val coverId
         get() = coverUrl?.let { stableId("$workId|$coverPath") }
 
-    fun entity() =
+    fun entity(sourceId: String? = null) =
         WorkEntity(
-            workId,
-            rj,
-            title,
-            title,
+            id = workId,
+            rj = rj,
+            title = title,
+            originalTitle = title,
             artist = artist,
             originalArtist = artist,
             coverUrl = coverUrl.takeIf { coverPath.startsWith("_dlsite-cover/") },
             series = series,
             coverId = coverId,
+            origin = SourceKind.ASMRONE.raw,
+            sourceId = sourceId,
         )
 }
 
-fun isAsmrOneWork(work: WorkEntity): Boolean {
-    val id = work.rj?.removePrefix("RJ")?.toLongOrNull() ?: return false
-    return work.id == stableId("asmr.one|work|$id")
+data class AsmrPage(val works: List<AsmrWork>, val hasMore: Boolean)
+
+data class AsmrPreview(
+    val sourceId: String,
+    val catalogArtist: String,
+    val work: AsmrWork,
+    val indexed: IndexedLibrary,
+    val metadata: DlsiteDetails? = null,
+) {
+    val details
+        get() = WorkDetails(indexed.works.single(), indexed.tracks, indexed.attachments)
 }
 
-data class AsmrPage(val works: List<AsmrWork>, val hasMore: Boolean)
+@Serializable private data class AsmrNamedDto(val name: String = "")
+
+@Serializable private data class AsmrPaginationDto(val totalCount: Long? = null)
+
+@Serializable
+private data class AsmrWorkDto(
+    val id: Long? = null,
+    @SerialName("source_id") val sourceId: String = "",
+    val title: String = "",
+    val vas: List<AsmrNamedDto>? = null,
+    val circle: AsmrNamedDto? = null,
+    val tags: List<AsmrNamedDto>? = null,
+    val mainCoverUrl: String = "",
+    val samCoverUrl: String = "",
+)
+
+@Serializable
+private data class AsmrCatalogDto(
+    val works: List<AsmrWorkDto>? = null,
+    val pagination: AsmrPaginationDto? = null,
+)
+
+@Serializable
+private data class AsmrTreeNodeDto(
+    val type: String = "",
+    val title: String = "",
+    val mediaStreamUrl: String = "",
+    val mediaDownloadUrl: String = "",
+    val size: Long? = null,
+    val duration: Double? = null,
+    val children: List<AsmrTreeNodeDto>? = null,
+)
 
 class AsmrOneClient(
     private val http: OkHttpClient,
@@ -73,10 +190,10 @@ class AsmrOneClient(
             .addQueryParameter("order", order)
             .addQueryParameter("sort", "desc")
             .addQueryParameter("subtitle", if (subtitlesOnly) "1" else "0")
-        val body = json(url.build()).jsonObject
-        val works = body["works"]?.jsonArray ?: throw IOException("作品列表格式错误")
-        val items = works.map { parseWork(it.jsonObject) }.distinctBy { it.id }
-        val total = body["pagination"]?.jsonObject?.get("totalCount")?.jsonPrimitive?.longOrNull
+        val body = decode<AsmrCatalogDto>(url.build())
+        val works = body.works ?: throw IOException("作品列表格式错误")
+        val items = works.map(::toWork).distinctBy { it.id }
+        val total = body.pagination?.totalCount
         return AsmrPage(
             items,
             works.isNotEmpty() && (total?.let { page * 20L < it } ?: (works.size == 20)),
@@ -85,72 +202,61 @@ class AsmrOneClient(
 
     suspend fun work(id: Long): AsmrWork {
         require(id > 0)
-        return parseWork(
-            json(
-                    root
-                        .newBuilder()
-                        .addPathSegments("api/workInfo")
-                        .addPathSegment(id.toString())
-                        .build(),
-                )
-                .jsonObject,
-        )
+        val url =
+            root.newBuilder().addPathSegments("api/workInfo").addPathSegment(id.toString()).build()
+        return toWork(decode<AsmrWorkDto>(url))
     }
 
-    suspend fun index(work: AsmrWork, sourceId: String, generation: Long): IndexedLibrary {
-        val tree =
-            json(
-                    root
-                        .newBuilder()
-                        .addPathSegments("api/tracks")
-                        .addPathSegment(work.id.toString())
-                        .build(),
-                )
-                .jsonArray
+    suspend fun index(work: AsmrWork, sourceId: String): IndexedLibrary {
+        val url =
+            root
+                .newBuilder()
+                .addPathSegments("api/tracks")
+                .addPathSegment(work.id.toString())
+                .build()
+        val tree = decode<List<AsmrTreeNodeDto>>(url)
         val files = mutableListOf<FileEntry>()
         val durations = mutableMapOf<String, Long>()
         val paths = mutableSetOf<String>()
         var visited = 0
-        fun walk(nodes: JsonArray, parent: String, depth: Int) {
+        fun walk(nodes: List<AsmrTreeNodeDto>, parent: String, depth: Int) {
             require(depth <= 32) { "作品目录层级过多" }
-            for (element in nodes) {
-                require(++visited <= 20000) { "作品文件数量过多" }
-                val node = element.jsonObject
-                val name = node.text("title").replace(illegalPathChars, "_").trim()
+            for (node in nodes) {
+                require(++visited <= 20_000) { "作品文件数量过多" }
+                val name = node.title.replace(illegalPathChars, "_").trim()
                 if (name.isEmpty() || name in setOf(".", "..")) continue
                 val path = "$parent/$name"
-                val children = node["children"] as? JsonArray
-                if (node.text("type") == "folder") {
-                    if (children != null) walk(children, path, depth + 1)
+                if (node.type == "folder") {
+                    node.children?.let { walk(it, path, depth + 1) }
                     continue
                 }
-                val raw = node.text("mediaStreamUrl").ifBlank { node.text("mediaDownloadUrl") }
+                val raw = node.mediaStreamUrl.ifBlank { node.mediaDownloadUrl }
                 if (raw.isBlank()) continue
-                val url = resourceUrl(raw)
-                val type = node.text("type")
-                val media = type in setOf("audio", "video")
-                val extensions = if (type == "video") MediaFormats.video else MediaFormats.audio
+                val resource = resourceUrl(raw)
+                val media = node.type in setOf("audio", "video")
+                val extensions =
+                    if (node.type == "video") MediaFormats.video else MediaFormats.audio
                 val filePath =
                     if (media && name.substringAfterLast('.', "").lowercase() !in extensions) {
-                        val extension =
-                            url.pathSegments
+                        val ext =
+                            resource.pathSegments
                                 .lastOrNull()
                                 ?.substringAfterLast('.', "")
                                 ?.lowercase()
                                 ?.takeIf { it in extensions }
-                                ?: if (type == "video") "mp4" else "mp3"
-                        "$path.$extension"
+                                ?: if (node.type == "video") "mp4" else "mp3"
+                        "$path.$ext"
                     } else path
                 require(paths.add(filePath)) { "作品目录存在重复文件名" }
                 files +=
                     FileEntry(
                         filePath,
-                        url.toString(),
+                        resource.toString(),
                         false,
-                        node["size"]?.jsonPrimitive?.longOrNull?.coerceAtLeast(0) ?: 0,
+                        (node.size ?: 0L).coerceAtLeast(0),
                     )
                 if (media) {
-                    val seconds = node["duration"]?.jsonPrimitive?.doubleOrNull ?: 0.0
+                    val seconds = node.duration ?: 0.0
                     if (seconds.isFinite() && seconds > 0)
                         durations[filePath.removePrefix("${work.rj}/")] = (seconds * 1000).toLong()
                 }
@@ -160,7 +266,7 @@ class AsmrOneClient(
         work.coverUrl?.let {
             files += FileEntry("${work.rj}/${work.coverPath}", resourceUrl(it).toString(), false)
         }
-        val indexed = LibraryIndexer.index(files, sourceId, generation, work.entity())
+        val indexed = LibraryIndexer.index(files, sourceId, work.entity(sourceId))
         require(indexed.tracks.isNotEmpty()) { "作品暂无可播放音轨" }
         return indexed.copy(
             attachments =
@@ -174,13 +280,13 @@ class AsmrOneClient(
     suspend fun bytes(url: String, limit: Int): ByteArray =
         http.onlineBytes(request(resourceUrl(url)), limit)
 
-    private suspend fun json(url: HttpUrl): JsonElement =
+    private suspend inline fun <reified T> decode(url: HttpUrl): T =
         try {
             val bytes = http.onlineBytes(request(url), 4 * 1024 * 1024)
             withContext(Dispatchers.Default) {
-                Json.parseToJsonElement(bytes.toString(Charsets.UTF_8))
+                asmrJson.decodeFromString<T>(bytes.toString(Charsets.UTF_8))
             }
-        } catch (e: kotlinx.coroutines.CancellationException) {
+        } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             throw IOException("ASMR.ONE 读取失败", e)
@@ -212,25 +318,19 @@ class AsmrOneClient(
             }
             .build()
 
-    private fun parseWork(body: JsonObject): AsmrWork {
-        val id = body["id"]?.jsonPrimitive?.longOrNull ?: throw IOException("作品编号无效")
+    private fun toWork(dto: AsmrWorkDto): AsmrWork {
+        val id = dto.id ?: throw IOException("作品编号无效")
         require(id > 0) { "作品编号无效" }
-        val sourceId = body.text("source_id").uppercase()
+        val rawSourceId = dto.sourceId.uppercase()
         val rj =
-            sourceId.takeIf { it.startsWith("RJ") && it.drop(2).toLongOrNull() == id }
-                ?: "RJ" + id.toString().padStart(if (id >= 1000000) 8 else 6, '0')
-        val voices =
-            (body["vas"] as? JsonArray).orEmpty().mapNotNull {
-                (it as? JsonObject)?.text("name")?.takeIf(String::isNotBlank)
-            }
-        val artist =
-            voices.joinToString(" / ").ifBlank {
-                (body["circle"] as? JsonObject)?.text("name").orEmpty()
-            }
+            rawSourceId.takeIf { it.startsWith("RJ") && it.drop(2).toLongOrNull() == id }
+                ?: "RJ" + id.toString().padStart(if (id >= 1_000_000) 8 else 6, '0')
+        val voices = dto.vas.orEmpty().mapNotNull { it.name.takeIf(String::isNotBlank) }
+        val circleName = dto.circle?.name.orEmpty()
+        val artist = voices.joinToString(" / ").ifBlank { circleName }
         val cover =
-            body
-                .text("mainCoverUrl")
-                .ifBlank { body.text("samCoverUrl") }
+            dto.mainCoverUrl
+                .ifBlank { dto.samCoverUrl }
                 .takeIf(String::isNotBlank)
                 ?.let { resourceUrl(it).toString() }
         val facets = mutableListOf<AsmrFacet>()
@@ -239,19 +339,8 @@ class AsmrOneClient(
                 facets += AsmrFacet(kind, name)
         }
         voices.forEach { add("va", it) }
-        add("circle", (body["circle"] as? JsonObject)?.text("name").orEmpty())
-        (body["tags"] as? JsonArray).orEmpty().forEach {
-            add("tagw", (it as? JsonObject)?.text("name").orEmpty())
-        }
-        return AsmrWork(
-            id,
-            body.text("title").ifBlank { rj },
-            rj,
-            artist,
-            cover,
-            facets = facets.distinct(),
-        )
+        add("circle", circleName)
+        dto.tags.orEmpty().forEach { add("tagw", it.name) }
+        return AsmrWork(id, dto.title.ifBlank { rj }, rj, artist, cover, facets = facets.distinct())
     }
-
-    private fun JsonObject.text(key: String) = (get(key) as? JsonPrimitive)?.contentOrNull.orEmpty()
 }

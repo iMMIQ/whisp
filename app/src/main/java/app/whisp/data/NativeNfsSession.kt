@@ -69,7 +69,7 @@ internal class NativeNfsSession(address: NfsAddress) : NfsSession {
     @Synchronized
     override fun open(path: String): RemoteReadHandle {
         val opened = NfsNative.open(current(), encodedPath(path))
-        return Reader(opened[0], opened[1])
+        return BufferedReadHandle(RawReader(opened[0], opened[1]))
     }
 
     @Synchronized
@@ -79,40 +79,14 @@ internal class NativeNfsSession(address: NfsAddress) : NfsSession {
         if (handle != 0L) NfsNative.close(handle)
     }
 
-    private inner class Reader(private var file: Long, override val length: Long) :
+    private inner class RawReader(private var file: Long, override val length: Long) :
         RemoteReadHandle {
-        private val buffer = ByteArray(256 * 1024)
-        private var start = -1L
-        private var available = 0
-
         override fun read(buffer: ByteArray, offset: Long, bufferOffset: Int, count: Int): Int =
             synchronized(this@NativeNfsSession) {
-                require(
-                    offset >= 0 &&
-                        bufferOffset >= 0 &&
-                        count >= 0 &&
-                        bufferOffset <= buffer.size - count,
-                )
                 if (file == 0L) throw IOException("NFS 文件已关闭")
-                if (count == 0) return@synchronized 0
-                if (offset >= length) return@synchronized -1
-                if (offset < start || offset - start >= available) {
-                    start = offset
-                    available =
-                        NfsNative.read(
-                            current(),
-                            file,
-                            offset,
-                            this.buffer,
-                            0,
-                            minOf(this.buffer.size.toLong(), length - offset).toInt(),
-                        )
-                    if (available <= 0) throw IOException("NFS 文件已改变，请重新扫描")
-                }
-                val cachedOffset = (offset - start).toInt()
-                val copied = minOf(count, available - cachedOffset)
-                this.buffer.copyInto(buffer, bufferOffset, cachedOffset, cachedOffset + copied)
-                copied
+                val n = NfsNative.read(current(), file, offset, buffer, bufferOffset, count)
+                if (n <= 0) throw IOException("NFS 文件已改变，请重新扫描")
+                n
             }
 
         override fun close() =

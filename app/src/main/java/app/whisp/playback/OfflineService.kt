@@ -18,10 +18,10 @@ class OfflineService :
         R.string.download_channel,
         0,
     ) {
-    private val repository
-        get() = (application as WhispApp).repository
+    private val media
+        get() = (application as WhispApp).graph.media
 
-    override fun getDownloadManager(): DownloadManager = repository.downloadManager
+    override fun getDownloadManager(): DownloadManager = media.downloadManager
 
     override fun getScheduler(): Scheduler = PlatformScheduler(this, 1701)
 
@@ -40,7 +40,7 @@ class OfflineService :
             )
 
     override fun onTimeout(startId: Int, fgsType: Int) {
-        repository.downloadManager.pauseDownloads()
+        media.downloadManager.pauseDownloads()
         stopSelf()
     }
 }

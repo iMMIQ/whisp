@@ -8,7 +8,6 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.lifecycle.ViewModelProvider
 import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
@@ -20,8 +19,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.rule.GrantPermissionRule
 import app.whisp.data.*
+import app.whisp.playback.PlaybackCoordinator
 import app.whisp.playback.PlaybackService
-import app.whisp.ui.AppViewModel
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
@@ -39,8 +38,8 @@ class PlaybackSubtitleRetryIntegrationTest {
     private val instrumentation
         get() = InstrumentationRegistry.getInstrumentation()
 
-    private val repo
-        get() = (ui.activity.application as WhispApp).repository
+    private val graph
+        get() = (ui.activity.application as WhispApp).graph
 
     private fun <T> main(block: () -> T): T {
         var result: T? = null
@@ -60,10 +59,10 @@ class PlaybackSubtitleRetryIntegrationTest {
 
     private fun controller(): MediaController = main {
         MediaController.Builder(
-                repo.context,
+                graph.context,
                 SessionToken(
-                    repo.context,
-                    ComponentName(repo.context, PlaybackService::class.java),
+                    graph.context,
+                    ComponentName(graph.context, PlaybackService::class.java),
                 ),
             )
             .buildAsync()
@@ -71,8 +70,17 @@ class PlaybackSubtitleRetryIntegrationTest {
         .get(20, TimeUnit.SECONDS)
 
     private fun seed(count: Int = 1): Pair<WorkDetails, File> {
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
-        val work = WorkEntity("subtitle-retry-work", null, "Subtitle retry", "Subtitle retry")
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
+        val wave = SystemMediaIntegrationTest.silentWave(graph.context.filesDir)
+        val subtitle = File(graph.context.filesDir, "subtitle-retry.vtt").apply { delete() }
+        val work =
+            WorkEntity(
+                "subtitle-retry-work",
+                null,
+                "Subtitle retry",
+                "Subtitle retry",
+                sourceId = "subtitle-retry-source",
+            )
         val attachment =
             AttachmentEntity(
                 "subtitle-retry-vtt",
@@ -81,6 +89,8 @@ class PlaybackSubtitleRetryIntegrationTest {
                 "test.vtt",
                 "audio/test.vtt",
                 "subtitle",
+                uri = subtitle.toURI().toString(),
+                size = 100,
             )
         val tracks =
             (1..count).map {
@@ -93,16 +103,13 @@ class PlaybackSubtitleRetryIntegrationTest {
                     it,
                     40000,
                     subtitleId = attachment.id,
+                    uri = wave.toURI().toString(),
+                    size = wave.length(),
                 )
             }
-        val wave = SystemMediaIntegrationTest.silentWave(repo.context.filesDir)
-        val subtitle = File(repo.context.filesDir, "subtitle-retry.vtt").apply { delete() }
         runBlocking {
-            repo.setSettings(reduceMotion = true)
-            repo.dao.putWorks(listOf(work))
-            repo.dao.putTracks(tracks)
-            repo.dao.putAttachments(listOf(attachment))
-            repo.dao.putSource(
+            graph.settings.update { it.copy(reduceMotion = true) }
+            graph.library.dao.putSource(
                 SourceEntity(
                     "subtitle-retry-source",
                     "Test",
@@ -110,30 +117,15 @@ class PlaybackSubtitleRetryIntegrationTest {
                     wave.parentFile!!.toURI().toString(),
                 ),
             )
-            repo.dao.putLocations(
-                tracks.map {
-                    LocationEntity(
-                        "subtitle-retry-location-${it.id}",
-                        it.id,
-                        "subtitle-retry-source",
-                        wave.toURI().toString(),
-                        wave.length(),
-                    )
-                } +
-                    LocationEntity(
-                        "subtitle-retry-location-vtt",
-                        attachment.id,
-                        "subtitle-retry-source",
-                        subtitle.toURI().toString(),
-                        100,
-                    ),
-            )
+            graph.library.dao.putWorks(listOf(work))
+            graph.library.dao.putTracks(tracks)
+            graph.library.dao.putAttachments(listOf(attachment))
         }
         return WorkDetails(work, tracks, listOf(attachment)) to subtitle
     }
 
     private fun missingSubtitle(
-        model: AppViewModel,
+        playback: PlaybackCoordinator,
         c: MediaController,
         detail: WorkDetails,
     ) {
@@ -141,17 +133,17 @@ class PlaybackSubtitleRetryIntegrationTest {
             c.volume = 0f
             c.pause()
             c.clearMediaItems()
-            model.playWork(detail, detail.tracks.first().id)
-            model.togglePlay()
+            playback.playWork(detail, detail.tracks.first().id)
+            playback.togglePlay()
         }
         waitFor("A missing subtitle must expose its retry state while audio remains ready") {
-            model.subtitleError.value != null &&
-                !model.subtitleLoading.value &&
-                model.openingTrackId.value == null &&
+            playback.subtitles.error.value != null &&
+                !playback.subtitles.loading.value &&
+                playback.openingTrackId.value == null &&
                 c.playbackState == Player.STATE_READY
         }
         main {
-            assertTrue(model.cues.value.isEmpty())
+            assertTrue(playback.subtitles.cues.value.isEmpty())
             assertFalse(c.playWhenReady)
         }
     }
@@ -164,24 +156,27 @@ class PlaybackSubtitleRetryIntegrationTest {
     fun playerEventsKeepFailureUntilContinuingTheSameTrackRetries() {
         val (detail, subtitle) = seed()
         val c = controller()
-        val model = main { ViewModelProvider(ui.activity)[AppViewModel::class.java] }
+        val playback = graph.playback
         try {
-            missingSubtitle(model, c, detail)
+            missingSubtitle(playback, c, detail)
             restoreSubtitle(subtitle)
             repeat(5) { index ->
                 main { c.seekTo(5000L + index) }
                 Thread.sleep(50)
             }
             main {
-                assertTrue("Player events must not retry subtitle IO", model.cues.value.isEmpty())
-                assertNotNull(model.subtitleError.value)
-                model.playWork(detail, detail.tracks.first().id)
-                model.togglePlay()
+                assertTrue(
+                    "Player events must not retry subtitle IO",
+                    playback.subtitles.cues.value.isEmpty(),
+                )
+                assertNotNull(playback.subtitles.error.value)
+                playback.playWork(detail, detail.tracks.first().id)
+                playback.togglePlay()
             }
             waitFor("Continuing the same track must recover its subtitle") {
-                model.cues.value.singleOrNull()?.text == "Recovered script" &&
-                    model.subtitleError.value == null &&
-                    !model.subtitleLoading.value
+                playback.subtitles.cues.value.singleOrNull()?.text == "Recovered script" &&
+                    playback.subtitles.error.value == null &&
+                    !playback.subtitles.loading.value
             }
             main {
                 assertEquals(5004L, c.currentPosition)
@@ -201,22 +196,21 @@ class PlaybackSubtitleRetryIntegrationTest {
     fun theSubtitleRetryButtonRecoversWithoutStartingOrSeekingAudio() {
         val (detail, subtitle) = seed()
         val c = controller()
-        val model = main { ViewModelProvider(ui.activity)[AppViewModel::class.java] }
+        val playback = graph.playback
         val launchIntent = Intent(ui.activity.intent)
         try {
-            missingSubtitle(model, c, detail)
+            missingSubtitle(playback, c, detail)
             main {
                 c.seekTo(6000)
                 requireNotNull(c.sessionActivity).send()
             }
             ui.onNodeWithText("重试字幕").assertIsDisplayed()
-            // Preserve ActivityScenario's launch filter after the real session PendingIntent.
             main { ui.activity.intent = launchIntent }
             restoreSubtitle(subtitle)
             ui.onNodeWithText("重试字幕").performClick()
             waitFor("The subtitle button must recover the current script") {
-                model.cues.value.singleOrNull()?.text == "Recovered script" &&
-                    model.subtitleError.value == null
+                playback.subtitles.cues.value.singleOrNull()?.text == "Recovered script" &&
+                    playback.subtitles.error.value == null
             }
             main {
                 assertEquals(6000L, c.currentPosition)
@@ -238,8 +232,8 @@ class PlaybackSubtitleRetryIntegrationTest {
         val (detail, subtitle) = seed(3)
         restoreSubtitle(subtitle)
         val c = controller()
-        val model = main { ViewModelProvider(ui.activity)[AppViewModel::class.java] }
-        val items = runBlocking { detail.tracks.map { repo.mediaItem(it, detail.work) } }
+        val playback = graph.playback
+        val items = runBlocking { detail.tracks.map { playback.mediaItem(it, detail.work) } }
         try {
             main {
                 c.volume = 0f
@@ -260,27 +254,29 @@ class PlaybackSubtitleRetryIntegrationTest {
             }
             waitFor("Queue IDs and records must follow the actual shuffled timeline") {
                 c.playbackState == Player.STATE_READY &&
-                    model.player.value.queueIds == expectedQueue() &&
-                    model.queueTracks.value.map { it.id } == expectedQueue() &&
-                    model.queueTracks.value.all { it.durationMs == 40000L }
+                    playback.state.value.queueIds == expectedQueue() &&
+                    playback.queueTracks.value.map { it.id } == expectedQueue() &&
+                    playback.queueTracks.value.all { it.durationMs == 40000L }
             }
             val removed = detail.tracks.last()
             runBlocking {
-                repo.database.withTransaction {
-                    repo.dao.deleteWorkTracks(detail.work.id)
-                    repo.dao.putTracks(detail.tracks.dropLast(1))
+                graph.database.withTransaction {
+                    graph.library.dao.deleteWorkTracks(detail.work.id)
+                    graph.library.dao.putTracks(detail.tracks.dropLast(1))
                 }
             }
-            main { model.selectQueuedTrack(removed.id) }
+            main { playback.selectQueuedTrack(removed.id) }
             waitFor("Selecting a queued track must survive its removal from the new index") {
                 c.currentMediaItem?.mediaId == removed.id &&
                     c.playWhenReady &&
-                    model.queueTracks.value.any { it.id == removed.id && it.title == removed.title }
+                    playback.queueTracks.value.any {
+                        it.id == removed.id && it.title == removed.title
+                    }
             }
             main {
                 assertEquals(3, c.mediaItemCount)
                 assertTrue(c.shuffleModeEnabled)
-                assertEquals(expectedQueue(), model.player.value.queueIds)
+                assertEquals(expectedQueue(), playback.state.value.queueIds)
             }
         } finally {
             main {

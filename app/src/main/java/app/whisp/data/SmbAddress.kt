@@ -2,7 +2,6 @@
 package app.whisp.data
 
 import java.net.URI
-import java.net.URLDecoder
 
 /** Credentials live in the source record, never in media URLs. */
 data class SmbAddress(
@@ -28,8 +27,6 @@ data class SmbAddress(
     fun filePath(relative: String) = (root + safeSegments(relative)).joinToString("\\")
 
     companion object {
-        private val sourceIdPattern = Regex("[A-Za-z0-9_-]+")
-
         fun parse(value: String, encrypt: Boolean? = null): SmbAddress {
             val uri =
                 try {
@@ -55,7 +52,7 @@ data class SmbAddress(
                     }
             }
             require(uri.port == -1 || uri.port in 1..65535) { "端口无效" }
-            val parts = decodeSegments(uri.rawPath.orEmpty())
+            val parts = RemoteAssetUri.decodeSegments(uri.rawPath.orEmpty(), forbidBackslash = true)
             require(parts.isNotEmpty()) { "请填写共享名" }
             return SmbAddress(
                 uri.host,
@@ -66,45 +63,14 @@ data class SmbAddress(
             )
         }
 
-        fun assetUri(sourceId: String, relative: String): String {
-            require(sourceIdPattern.matches(sourceId))
-            return URI("whisp-smb", sourceId, "/" + safeSegments(relative).joinToString("/"), null)
-                .toASCIIString()
-        }
+        fun assetUri(sourceId: String, relative: String): String =
+            RemoteAssetUri.encode("whisp-smb", sourceId, relative, forbidBackslash = true)
 
-        fun assetPath(value: String, sourceId: String): String {
-            val uri = URI(value)
-            require(
-                uri.scheme == "whisp-smb" &&
-                    uri.rawAuthority == sourceId &&
-                    uri.query == null &&
-                    uri.fragment == null,
-            ) {
-                "来源未关联"
-            }
-            return decodeSegments(uri.rawPath).joinToString("/")
-        }
-
-        private fun decodeSegments(path: String): List<String> =
-            path
-                .split('/')
-                .filter { it.isNotEmpty() }
-                .map {
-                    URLDecoder.decode(it.replace("+", "%2B"), "UTF-8").also(::validateSegment)
-                }
+        fun assetPath(value: String, sourceId: String): String =
+            RemoteAssetUri.decode(value, "whisp-smb", sourceId, forbidBackslash = true)
 
         fun safeSegments(path: String): List<String> =
-            path.split('/').filter { it.isNotEmpty() }.onEach(::validateSegment)
-
-        private fun validateSegment(segment: String) {
-            require(
-                segment != "." &&
-                    segment != ".." &&
-                    segment.none { it == '/' || it == '\\' || it.code < 32 || it.code == 127 },
-            ) {
-                "目录包含无效字符"
-            }
-        }
+            RemoteAssetUri.safeSegments(path, forbidBackslash = true)
     }
 }
 

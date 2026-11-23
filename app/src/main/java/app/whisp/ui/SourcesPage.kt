@@ -18,6 +18,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -26,29 +27,47 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
-import androidx.media3.exoplayer.offline.DownloadService
+import app.whisp.AppGraph
 import app.whisp.DlsiteLoginActivity
+import app.whisp.R
 import app.whisp.data.SourceKind
 import app.whisp.data.kindType
-import app.whisp.playback.OfflineService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 internal fun SourcesPage(
-    model: AppViewModel,
+    graph: AppGraph,
     online: (String) -> Unit,
     dlsite: (String) -> Unit,
     storage: () -> Unit,
 ) {
-    val sources by model.sources.collectAsStateWithLifecycle()
-    val busy by model.busy.collectAsStateWithLifecycle()
-    val downloads by model.downloads.collectAsStateWithLifecycle()
-    val library by model.library.collectAsStateWithLifecycle()
+    val sources by graph.library.sourceList.collectAsStateWithLifecycle()
+    val busy by graph.sync.busy.collectAsStateWithLifecycle()
+    val downloads by graph.media.downloads.collectAsStateWithLifecycle()
+    val works by graph.library.works.collectAsStateWithLifecycle()
+    val trackPairs by
+        remember(graph) { graph.library.dao.observeTrackWorkPairs() }
+            .collectAsStateWithLifecycle(emptyList())
+    val scope = rememberCoroutineScope()
+
     var adding by rememberSaveable { mutableStateOf(false) }
-    var remote by rememberSaveable { mutableStateOf<String?>(null) }
+    var remoteKind by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    fun runAction(block: suspend () -> Unit) {
+        scope.launch {
+            try {
+                block()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                graph.messages.tryEmit(e.message ?: "操作失败")
+            }
+        }
+    }
+
     val login =
         rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result
             ->
@@ -57,23 +76,29 @@ internal fun SourcesPage(
         }
     val folder =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-            if (uri != null)
-                model.action {
-                    model.repository.context.contentResolver.takePersistableUriPermission(
+            if (uri != null) {
+                runAction {
+                    graph.context.contentResolver.takePersistableUriPermission(
                         uri,
                         Intent.FLAG_GRANT_READ_URI_PERMISSION,
                     )
-                    val id = DocumentsContract.getTreeDocumentId(uri)
-                    model.repository.addLocal(
-                        uri.toString(),
-                        id.substringAfterLast('/').substringAfter(':').ifBlank { "本地作品" },
-                    )
+                    val docId = DocumentsContract.getTreeDocumentId(uri)
+                    val sourceId =
+                        graph.library.addLocal(
+                            uri.toString(),
+                            docId.substringAfterLast('/').substringAfter(':').ifBlank { "本地作品" },
+                        )
+                    graph.sync.scheduleScan(sourceId, force = true)
                 }
+            }
         }
+
+    val trackIdsByWork = remember(trackPairs) { trackPairs.groupBy({ it.workId }, { it.id }) }
     val offlineWorks =
-        remember(library, downloads) {
-            library.filter { detail -> detail.tracks.any { downloads.containsKey(it.id) } }
+        remember(works, trackIdsByWork, downloads) {
+            works.filter { work -> trackIdsByWork[work.id].orEmpty().any { it in downloads } }
         }
+
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(24.dp),
@@ -82,12 +107,12 @@ internal fun SourcesPage(
         item {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    androidx.compose.ui.res.stringResource(app.whisp.R.string.title_sources),
+                    stringResource(R.string.title_sources),
                     fontFamily = FontFamily.Serif,
                     fontSize = 30.sp,
                     modifier = Modifier.weight(1f),
                 )
-                IconAction(Icons.Outlined.Storage, "存储管理", Muted, storage)
+                IconAction(Icons.Outlined.Storage, "存储管理", Muted, action = storage)
                 IconAction(Icons.Outlined.Add, "添加来源") { adding = true }
             }
         }
@@ -113,35 +138,37 @@ internal fun SourcesPage(
                 )
                 Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
                     Text(source.name, fontSize = 17.sp)
-                    if (source.id in busy)
+                    if (source.id in busy) {
                         Text(
                             if (source.kindType == SourceKind.DLSITE) "同步中" else "扫描中",
                             color = Muted,
                             fontSize = 13.sp,
                         )
-                    else if (source.error != null)
+                    } else if (source.error != null) {
                         Text(
                             if (source.kindType == SourceKind.DLSITE) "同步失败" else "扫描失败",
                             color = Rose,
                             fontSize = 13.sp,
                         )
+                    }
                 }
-                if (source.id in busy)
+                if (source.id in busy) {
                     CircularProgressIndicator(
                         Modifier.size(22.dp).padding(3.dp),
                         strokeWidth = 2.dp,
                     )
-                else if (source.kindType in setOf(SourceKind.ASMRONE, SourceKind.DLSITE))
+                } else if (source.kindType in setOf(SourceKind.ASMRONE, SourceKind.DLSITE)) {
                     IconAction(Icons.Outlined.MoreVert, "管理${source.name}", Muted) {
                         selectedId = source.id
                     }
-                else
+                } else {
                     IconAction(Icons.Outlined.Refresh, "刷新${source.name}", Muted) {
-                        model.repository.scheduleScan(source.id)
+                        graph.sync.scheduleScan(source.id)
                     }
+                }
             }
         }
-        if (sources.isEmpty())
+        if (sources.isEmpty()) {
             item {
                 FilledTonalButton(
                     onClick = { adding = true },
@@ -152,50 +179,44 @@ internal fun SourcesPage(
                     Text("添加作品")
                 }
             }
-        if (offlineWorks.isNotEmpty())
+        }
+        if (offlineWorks.isNotEmpty()) {
             item {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text("离线", fontSize = 20.sp, modifier = Modifier.weight(1f))
                     IconAction(Icons.Outlined.PlayArrow, "继续下载", Rose) {
-                        DownloadService.sendResumeDownloads(
-                            model.repository.context,
-                            OfflineService::class.java,
-                            false,
-                        )
+                        graph.offline.resumeDownloads()
                     }
                     IconAction(Icons.Outlined.Pause, "暂停下载", Muted) {
-                        DownloadService.sendPauseDownloads(
-                            model.repository.context,
-                            OfflineService::class.java,
-                            false,
-                        )
+                        graph.offline.pauseDownloads()
                     }
                 }
             }
-        items(offlineWorks, key = { it.work.id }) { detail ->
-            val states = detail.tracks.mapNotNull { downloads[it.id] }
-            val complete = model.repository.offlineStore.isOffline(detail)
+        }
+        items(offlineWorks, key = { it.id }) { work ->
+            val trackIds = trackIdsByWork[work.id].orEmpty()
+            val states = trackIds.mapNotNull { downloads[it] }
+            val complete =
+                work.offlineAttachments &&
+                    trackIds.all { downloads[it]?.state == Download.STATE_COMPLETED }
             val failed = states.any { it.state == Download.STATE_FAILED }
             val percentage =
                 states.map { it.percentDownloaded.takeIf { value -> value >= 0 } ?: 0f }.sum() /
-                    detail.tracks.size.coerceAtLeast(1)
+                    trackIds.size.coerceAtLeast(1)
             Column(
                 Modifier.fillMaxWidth()
                     .background(Surface, RoundedCornerShape(18.dp))
                     .padding(18.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(detail.work.title, Modifier.weight(1f), maxLines = 2, fontSize = 15.sp)
+                    Text(work.title, Modifier.weight(1f), maxLines = 2, fontSize = 15.sp)
                     IconAction(
                         if (complete) Icons.Outlined.DeleteOutline else Icons.Outlined.Refresh,
                         if (complete) "移除离线副本" else "重试下载",
                         Muted,
                     ) {
-                        if (complete)
-                            model.action {
-                                model.repository.offlineStore.removeOffline(detail.work.id)
-                            }
-                        else model.download(detail.work.id)
+                        if (complete) runAction { graph.offline.removeOffline(work.id) }
+                        else runAction { graph.offline.downloadWork(work.id) }
                     }
                 }
                 if (!complete) {
@@ -213,85 +234,44 @@ internal fun SourcesPage(
             }
         }
     }
-    if (adding)
+
+    if (adding) {
         AlertDialog(
             onDismissRequest = { adding = false },
             containerColor = Surface,
             title = { Text("添加来源") },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
-                    TextButton(
-                        onClick = {
-                            adding = false
-                            login.launch(
-                                Intent(model.repository.context, DlsiteLoginActivity::class.java),
-                            )
-                        },
-                        Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Outlined.AccountCircle, null)
-                        Spacer(Modifier.width(12.dp))
-                        Text("DLsite")
+                    AddSourceRow(Icons.Outlined.AccountCircle, "DLsite") {
+                        adding = false
+                        login.launch(Intent(graph.context, DlsiteLoginActivity::class.java))
                     }
-                    TextButton(
-                        onClick = {
-                            adding = false
-                            model.action { online(model.repository.addAsmrOne()) }
-                        },
-                        Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Outlined.Headphones, null)
-                        Spacer(Modifier.width(12.dp))
-                        Text("ASMR.ONE")
+                    AddSourceRow(Icons.Outlined.Headphones, "ASMR.ONE") {
+                        adding = false
+                        runAction { online(graph.library.addAsmrOne()) }
                     }
-                    TextButton(
-                        onClick = {
-                            adding = false
-                            folder.launch(null)
-                        },
-                        Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Outlined.FolderOpen, null)
-                        Spacer(Modifier.width(12.dp))
-                        Text("本地目录")
+                    AddSourceRow(Icons.Outlined.FolderOpen, "本地目录") {
+                        adding = false
+                        folder.launch(null)
                     }
-                    TextButton(
-                        onClick = {
-                            adding = false
-                            remote = "SMB"
-                        },
-                        Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Outlined.Storage, null)
-                        Spacer(Modifier.width(12.dp))
-                        Text("SMB")
+                    AddSourceRow(Icons.Outlined.Storage, "SMB") {
+                        adding = false
+                        remoteKind = SourceKind.SMB.raw
                     }
-                    TextButton(
-                        onClick = {
-                            adding = false
-                            remote = "WebDAV"
-                        },
-                        Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Outlined.CloudQueue, null)
-                        Spacer(Modifier.width(12.dp))
-                        Text("WebDAV")
+                    AddSourceRow(Icons.Outlined.CloudQueue, "WebDAV") {
+                        adding = false
+                        remoteKind = SourceKind.WEBDAV.raw
                     }
-                    TextButton(
-                        onClick = {
-                            adding = false
-                            remote = "NFS"
-                        },
-                        Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Outlined.Storage, null)
-                        Spacer(Modifier.width(12.dp))
-                        Text("NFS")
+                    AddSourceRow(Icons.Outlined.Storage, "NFS") {
+                        adding = false
+                        remoteKind = SourceKind.NFS.raw
                     }
                 }
             },
             confirmButton = { TextButton(onClick = { adding = false }) { Text("取消") } },
         )
+    }
+
     sources
         .firstOrNull { it.id == selectedId }
         ?.let { source ->
@@ -304,24 +284,22 @@ internal fun SourcesPage(
                         if (source.kindType !in setOf(SourceKind.ASMRONE, SourceKind.DLSITE))
                             Text(source.root, color = Muted, fontSize = 13.sp)
                         source.error?.let { Text(it, color = Rose) }
-                        if (source.kindType == SourceKind.ASMRONE)
+                        if (source.kindType == SourceKind.ASMRONE) {
                             TextButton(
                                 onClick = {
-                                    model.repository.scheduleScan(source.id)
+                                    graph.sync.scheduleScan(source.id)
                                     selectedId = null
                                 },
                             ) {
                                 Text("更新已加入作品")
                             }
+                        }
                         if (source.kindType == SourceKind.DLSITE) {
                             TextButton(
                                 onClick = {
                                     selectedId = null
                                     login.launch(
-                                        Intent(
-                                                model.repository.context,
-                                                DlsiteLoginActivity::class.java,
-                                            )
+                                        Intent(graph.context, DlsiteLoginActivity::class.java)
                                             .putExtra(DlsiteLoginActivity.SOURCE, source.id),
                                     )
                                 },
@@ -330,7 +308,7 @@ internal fun SourcesPage(
                             }
                             TextButton(
                                 onClick = {
-                                    model.repository.scheduleScan(source.id)
+                                    graph.sync.scheduleScan(source.id)
                                     selectedId = null
                                 },
                             ) {
@@ -342,9 +320,11 @@ internal fun SourcesPage(
                 confirmButton = {
                     TextButton(
                         onClick = {
-                            if (source.kindType == SourceKind.ASMRONE) online(source.id)
-                            else if (source.kindType == SourceKind.DLSITE) dlsite(source.id)
-                            else model.repository.scheduleScan(source.id)
+                            when (source.kindType) {
+                                SourceKind.ASMRONE -> online(source.id)
+                                SourceKind.DLSITE -> dlsite(source.id)
+                                else -> graph.sync.scheduleScan(source.id)
+                            }
                             selectedId = null
                         },
                     ) {
@@ -358,7 +338,7 @@ internal fun SourcesPage(
                 dismissButton = {
                     TextButton(
                         onClick = {
-                            model.removeSource(source.id)
+                            runAction { graph.sync.removeSource(source.id) }
                             selectedId = null
                         },
                     ) {
@@ -367,11 +347,27 @@ internal fun SourcesPage(
                 },
             )
         }
-    remote?.let { kind -> RemoteDialog(model, kind) { remote = null } }
+
+    remoteKind?.let { raw ->
+        SourceKind.of(raw)?.let { kind -> RemoteDialog(graph, kind) { remoteKind = null } }
+    }
 }
 
 @Composable
-private fun RemoteDialog(model: AppViewModel, kind: String, dismiss: () -> Unit) {
+private fun AddSourceRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    TextButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+        Icon(icon, null)
+        Spacer(Modifier.width(12.dp))
+        Text(label)
+    }
+}
+
+@Composable
+private fun RemoteDialog(graph: AppGraph, kind: SourceKind, dismiss: () -> Unit) {
     var name by rememberSaveable(kind) { mutableStateOf("") }
     var address by rememberSaveable(kind) { mutableStateOf("") }
     var username by rememberSaveable(kind) { mutableStateOf("") }
@@ -383,10 +379,16 @@ private fun RemoteDialog(model: AppViewModel, kind: String, dismiss: () -> Unit)
     var connecting by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    val title =
+        when (kind) {
+            SourceKind.SMB -> "SMB"
+            SourceKind.NFS -> "NFS"
+            else -> "WebDAV"
+        }
     AlertDialog(
         onDismissRequest = { if (!connecting) dismiss() },
         containerColor = Surface,
-        title = { Text(kind) },
+        title = { Text(title) },
         text = {
             Column(
                 Modifier.verticalScroll(rememberScrollState()),
@@ -400,15 +402,15 @@ private fun RemoteDialog(model: AppViewModel, kind: String, dismiss: () -> Unit)
                     placeholder = {
                         Text(
                             when (kind) {
-                                "SMB" -> "smb://nas.example/media/Audio/"
-                                "NFS" -> "nfs://nas.example/media/Audio"
+                                SourceKind.SMB -> "smb://nas.example/media/Audio/"
+                                SourceKind.NFS -> "nfs://nas.example/media/Audio"
                                 else -> "https://nas.example/Audio/"
                             },
                         )
                     },
                     singleLine = true,
                 )
-                if (kind == "NFS") {
+                if (kind == SourceKind.NFS) {
                     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                         listOf(3 to "3", 4 to "4.0", 42 to "4.2").forEachIndexed {
                             index,
@@ -455,15 +457,13 @@ private fun RemoteDialog(model: AppViewModel, kind: String, dismiss: () -> Unit)
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                     )
-                    if (kind == "SMB") {
+                    if (kind == SourceKind.SMB) {
                         Row(
                             Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                androidx.compose.ui.res.stringResource(
-                                    app.whisp.R.string.label_smb_compat,
-                                ),
+                                stringResource(R.string.label_smb_compat),
                                 Modifier.weight(1f),
                                 fontSize = 14.sp,
                                 color = Muted,
@@ -487,26 +487,28 @@ private fun RemoteDialog(model: AppViewModel, kind: String, dismiss: () -> Unit)
                     error = null
                     scope.launch {
                         try {
-                            when (kind) {
-                                "SMB" ->
-                                    model.repository.addSmb(
-                                        name,
-                                        address,
-                                        username,
-                                        password,
-                                        encrypt = if (allowUnencryptedSmb) false else null,
-                                    )
-                                "NFS" ->
-                                    model.repository.addNfs(
-                                        name,
-                                        address,
-                                        version,
-                                        uid.trim().toIntOrNull() ?: error("UID 应为非负整数"),
-                                        gid.trim().toIntOrNull() ?: error("GID 应为非负整数"),
-                                    )
-                                else ->
-                                    model.repository.addWebDav(name, address, username, password)
-                            }
+                            val id =
+                                when (kind) {
+                                    SourceKind.SMB ->
+                                        graph.library.addSmb(
+                                            name,
+                                            address,
+                                            username,
+                                            password,
+                                            encrypt = if (allowUnencryptedSmb) false else null,
+                                        )
+                                    SourceKind.NFS ->
+                                        graph.library.addNfs(
+                                            name,
+                                            address,
+                                            version,
+                                            uid.trim().toIntOrNull() ?: error("UID 应为非负整数"),
+                                            gid.trim().toIntOrNull() ?: error("GID 应为非负整数"),
+                                        )
+                                    else ->
+                                        graph.library.addWebDav(name, address, username, password)
+                                }
+                            graph.sync.scheduleScan(id, force = true)
                             dismiss()
                         } catch (e: CancellationException) {
                             throw e

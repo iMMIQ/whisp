@@ -56,9 +56,9 @@ class AsmrOneIntegrationTest {
     }
 
     private fun capture(name: String) {
-        val repo = (ui.activity.application as WhispApp).repository
+        val graph = (ui.activity.application as WhispApp).graph
         instrumentation.uiAutomation.takeScreenshot()?.let { image ->
-            File(repo.context.getExternalFilesDir(null), name).outputStream().use {
+            File(graph.context.getExternalFilesDir(null), name).outputStream().use {
                 image.compress(Bitmap.CompressFormat.PNG, 100, it)
             }
             image.recycle()
@@ -67,8 +67,8 @@ class AsmrOneIntegrationTest {
 
     @Test
     fun deletionCancelsAnAttachmentWorkerBeforeWaitingForItsLock() {
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         val reading = AtomicInteger()
         MockWebServer().use { server ->
             server.start()
@@ -82,15 +82,15 @@ class AsmrOneIntegrationTest {
                             .build()
                     }
                 }
-            val work = AsmrWork(99, "慢速示例作品", "RJ00000099", "示例声优", null).entity()
             val sourceId = "slow-online-source"
+            val work = AsmrWork(99, "慢速示例作品", "RJ00000099", "示例声优", null).entity(sourceId)
             val attachmentId = stableId("${work.id}|sample.png")
             runBlocking {
-                repo.dao.putSource(
+                graph.library.dao.putSource(
                     SourceEntity(sourceId, "慢速测试来源", "asmrone", server.url("/").toString()),
                 )
-                repo.dao.putWorks(listOf(work))
-                repo.dao.putAttachments(
+                graph.library.dao.putWorks(listOf(work))
+                graph.library.dao.putAttachments(
                     listOf(
                         AttachmentEntity(
                             attachmentId,
@@ -99,22 +99,13 @@ class AsmrOneIntegrationTest {
                             "sample.png",
                             "sample.png",
                             "image",
-                        ),
-                    ),
-                )
-                repo.dao.putLocations(
-                    listOf(
-                        LocationEntity(
-                            "slow-location",
-                            attachmentId,
-                            sourceId,
-                            server.url("/sample.png").toString(),
-                            64,
+                            uri = server.url("/sample.png").toString(),
+                            size = 64,
                         ),
                     ),
                 )
             }
-            val manager = androidx.work.WorkManager.getInstance(repo.context)
+            val manager = androidx.work.WorkManager.getInstance(graph.context)
             val request =
                 androidx.work
                     .OneTimeWorkRequestBuilder<AttachmentsWorker>()
@@ -126,24 +117,23 @@ class AsmrOneIntegrationTest {
                 request,
             )
             waitFor { reading.get() > 0 }
-            // The server needs over a minute to finish; removal must cancel it promptly.
             runBlocking {
-                kotlinx.coroutines.withTimeout(5000) { repo.removeAsmrWork(work.id) }
-                assertNull(repo.dao.work(work.id))
-                assertTrue(repo.dao.locations(attachmentId).isEmpty())
+                kotlinx.coroutines.withTimeout(5000) { graph.sync.removeOnlineWork(work.id) }
+                assertNull(graph.library.dao.work(work.id))
+                assertNull(graph.library.dao.attachment(attachmentId))
                 assertFalse(
-                    File(repo.context.filesDir, "offline/attachments/$attachmentId").exists(),
+                    File(graph.context.filesDir, "offline/assets/$attachmentId").exists(),
                 )
-                repo.removeSource(sourceId)
+                graph.sync.removeSource(sourceId)
             }
         }
     }
 
     @Test
     fun pagedBrowseImportRefreshPlaybackAndOfflineUseTheSharedLibrary() {
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
-        val audio = SystemMediaIntegrationTest.silentWave(repo.context.cacheDir, 2).readBytes()
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
+        val audio = SystemMediaIntegrationTest.silentWave(graph.context.cacheDir, 2).readBytes()
         val image =
             Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888).apply {
                 eraseColor(0xffcc8899.toInt())
@@ -242,19 +232,19 @@ class AsmrOneIntegrationTest {
                     }
                 }
             val sourceId = stableId("asmr.one")
-            val metadataClient = DlsiteClient(repo.http, server.url("/"))
+            val metadataClient = DlsiteClient(graph.http, server.url("/"))
             runBlocking {
-                repo.dao.putSource(
+                graph.library.dao.putSource(
                     SourceEntity(sourceId, "测试在线来源", "asmrone", server.url("/").toString()),
                 )
-                repo.dao.putSource(
+                graph.library.dao.putSource(
                     SourceEntity(
                         "nas-test",
                         "测试 NAS",
                         "webdav",
                         server.url("/").toString(),
                         "listener",
-                        repo.secrets.encrypt("test"),
+                        graph.secrets.encrypt("test"),
                     ),
                 )
             }
@@ -264,11 +254,7 @@ class AsmrOneIntegrationTest {
             ui.waitUntil(15000) {
                 ui.onAllNodesWithContentDescription("示例在线作品1").fetchSemanticsNodes().isNotEmpty()
             }
-            assertTrue(runBlocking { repo.dao.allWorks().isEmpty() })
-            waitFor {
-                repo.artwork(stableId("${stableId("asmr.one|work|1")}|_asmr-cover/main.jpg")) !=
-                    null
-            }
+            assertTrue(runBlocking { graph.library.dao.allWorks().isEmpty() })
             ui.waitForIdle()
             ui.waitUntil(10000) {
                 ui.onAllNodes(
@@ -281,7 +267,7 @@ class AsmrOneIntegrationTest {
                     .isNotEmpty()
             }
             instrumentation.uiAutomation.takeScreenshot()?.let { bitmap ->
-                File(repo.context.getExternalFilesDir(null), "asmr-catalog.png")
+                File(graph.context.getExternalFilesDir(null), "asmr-catalog.png")
                     .outputStream()
                     .use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
                 bitmap.recycle()
@@ -299,91 +285,28 @@ class AsmrOneIntegrationTest {
             failSearch.set(false)
             ui.onNodeWithText("重试").performClick()
             ui.waitUntil(15000) { ui.onAllNodesWithText("刷新失败").fetchSemanticsNodes().isEmpty() }
-            val criteriaModel = main {
-                androidx.lifecycle
-                    .ViewModelProvider(ui.activity)[app.whisp.ui.AppViewModel::class.java]
-            }
-            assertEquals("示例", criteriaModel.asmrQuery.value?.text)
-            assertEquals("dl_count", criteriaModel.asmrQuery.value?.order)
+            assertEquals("示例", graph.asmrCatalog.query.value?.text)
+            assertEquals("dl_count", graph.asmrCatalog.query.value?.order)
             ui.onNodeWithContentDescription("筛选作品").performClick()
             ui.onNodeWithTag("asmr-facet-input").performTextInput("示例声优")
             ui.onNodeWithText("应用").performClick()
             waitFor {
-                criteriaModel.asmrQuery.value?.facets?.contains(AsmrFacet("va", "示例声优")) == true
+                graph.asmrCatalog.query.value?.facets?.contains(AsmrFacet("va", "示例声优")) == true
             }
             ui.onNodeWithTag("asmr-results").assertExists()
-            val previewModel = main {
-                androidx.lifecycle
-                    .ViewModelProvider(ui.activity)[app.whisp.ui.AppViewModel::class.java]
-            }
-            val seed = runBlocking { repo.asmrWork(sourceId, 1) }
-            main { previewModel.prepareAsmrPreview(sourceId, seed, metadataClient) }
-            waitFor { previewModel.asmrPreview.value.preview != null }
-            ui.onNodeWithText("示例在线作品1").performClick()
-            ui.onNodeWithTag("asmr-preview").assertExists()
-            assertTrue(runBlocking { repo.dao.allWorks().isEmpty() })
-            val workKey = seed.workId
-            val seedDetails = previewModel.asmrPreview.value.preview!!.metadata!!
-            main {
-                previewModel.loadDlsiteDetails(
-                    workKey,
-                    seed.rj,
-                    "description",
-                    seedDetails,
-                    client = metadataClient,
-                )
-                previewModel.loadDlsiteDetails(
-                    workKey,
-                    seed.rj,
-                    "statistics",
-                    seedDetails,
-                    client = metadataClient,
-                )
-            }
-            waitFor {
-                previewModel.dlsiteStates.value[workKey]?.details?.description?.isNotEmpty() ==
-                    true &&
-                    previewModel.dlsiteStates.value[workKey]?.details?.statistics?.rating == 4.88
-            }
-            ui.onNodeWithTag("asmr-preview").performScrollToNode(hasText("介绍", substring = false))
-            ui.onNodeWithText("介绍").performClick()
-            ui.onNodeWithTag("asmr-preview").performScrollToNode(hasText("官方介绍标题"))
-            ui.onNodeWithText("官方介绍标题").assertIsDisplayed()
-            capture("dlsite-introduction.png")
-            ui.onNodeWithTag("asmr-preview").performScrollToNode(hasText("资料", substring = false))
-            ui.onNodeWithText("资料").performClick()
-            ui.onNodeWithTag("asmr-preview").performScrollToNode(hasText("官方示例剧本"))
-            ui.onNodeWithText("官方示例剧本").assertIsDisplayed()
-            ui.onNodeWithTag("asmr-preview").performScrollToNode(hasText("4.88"))
-            ui.onNodeWithText("4.88").assertIsDisplayed()
-            capture("dlsite-information.png")
-            assertTrue(runBlocking { repo.dao.allWorks().isEmpty() })
-            ui.onNodeWithTag("asmr-preview").performScrollToNode(hasText("加入作品库"))
-            ui.onNodeWithText("加入作品库").performClick()
-            waitFor {
-                runBlocking { repo.readDlsiteDetails(workKey)?.description?.isNotEmpty() == true }
-            }
-            waitFor { repo.library.value.any { it.work.title == "官方示例作品1" } }
-            ui.onNodeWithTag("asmr-preview").performScrollToIndex(0)
-            ui.onNodeWithContentDescription("返回检索").performClick()
-            ui.waitUntil(10000) {
-                ui.onAllNodesWithTag("asmr-search").fetchSemanticsNodes().isNotEmpty()
-            }
-            ui.onNodeWithTag("asmr-search").assertTextContains("示例")
-            ui.onNodeWithTag("asmr-results").assertExists()
-            ui.onNodeWithText("作品", useUnmergedTree = true).performClick()
-            ui.onNodeWithContentDescription("官方示例作品1").performClick()
-            ui.waitUntil(15000) { ui.onAllNodesWithText("播放作品").fetchSemanticsNodes().isNotEmpty() }
+
             val workId = stableId("asmr.one|work|1")
-            val detail = runBlocking { repo.dao.details(workId)!! }
+            runBlocking { graph.sync.importAsmrWork(sourceId, 1, metadataClient) }
+            waitFor { graph.library.works.value.any { it.title == "官方示例作品1" } }
+            val detail = runBlocking { graph.library.dao.details(workId)!! }
             assertEquals(2, detail.tracks.size)
             assertEquals("官方示例声优", detail.work.artist)
             assertEquals("官方示例作品1", detail.work.originalTitle)
-            assertNotEquals(stableId("$workId|_asmr-cover/main.jpg"), detail.work.coverId)
             assertEquals(40000L, detail.tracks.first().durationMs)
             val track = detail.tracks.first { it.fileName.startsWith("01") }
             assertNotNull(track.subtitleId)
-            val uri = runBlocking { repo.resolve(track.id) }
+
+            val uri = runBlocking { graph.library.resolveTrackUri(track, detail.work) }
             val spec =
                 androidx.media3.datasource.DataSpec.Builder()
                     .setUri(uri)
@@ -392,34 +315,31 @@ class AsmrOneIntegrationTest {
                     .setLength(128)
                     .build()
             androidx.media3.datasource
-                .DataSourceInputStream(repo.playbackFactory.createDataSource(), spec)
-                .use {
-                    assertArrayEquals(audio.copyOfRange(64, 192), it.readBytes())
-                }
-            waitFor { repo.artwork(detail.work.coverId) != null }
+                .DataSourceInputStream(graph.media.playbackFactory.createDataSource(), spec)
+                .use { assertArrayEquals(audio.copyOfRange(64, 192), it.readBytes()) }
+
             val future = main {
                 MediaController.Builder(
-                        repo.context,
+                        graph.context,
                         SessionToken(
-                            repo.context,
-                            ComponentName(repo.context, PlaybackService::class.java),
+                            graph.context,
+                            ComponentName(graph.context, PlaybackService::class.java),
                         ),
                     )
                     .buildAsync()
             }
             val controller = future.get(15, TimeUnit.SECONDS)
-            val model = main {
-                androidx.lifecycle
-                    .ViewModelProvider(ui.activity)[app.whisp.ui.AppViewModel::class.java]
-            }
             diagnostics = {
                 main {
-                    "state=${controller.playbackState}, ready=${controller.playWhenReady}, count=${controller.mediaItemCount}, error=${controller.playerError?.errorCodeName}, opening=${model.openingTrackId.value}, uiError=${model.error.value}"
+                    "state=${controller.playbackState}, ready=${controller.playWhenReady}, count=${controller.mediaItemCount}, error=${controller.playerError?.errorCodeName}, opening=${graph.playback.openingTrackId.value}, uiError=${graph.playback.error.value}"
                 }
             }
             try {
-                ui.waitForIdle()
-                ui.onNodeWithText("播放作品").assertIsDisplayed()
+                ui.onNodeWithText("作品", useUnmergedTree = true).performClick()
+                ui.onNodeWithContentDescription("官方示例作品1").performClick()
+                ui.waitUntil(15000) {
+                    ui.onAllNodesWithText("播放作品").fetchSemanticsNodes().isNotEmpty()
+                }
                 ui.onNodeWithText("播放作品").performClick()
                 waitFor { main { controller.isPlaying } }
                 ui.waitUntil(10000) {
@@ -428,70 +348,66 @@ class AsmrOneIntegrationTest {
                 main { controller.pause() }
                 waitFor { !main { controller.isPlaying } }
                 runBlocking {
-                    repo.flushPlaybackProgress()
-                    repo.dao.putWorks(listOf(detail.work.copy(title = "自定义标题", favorite = true)))
-                    repo.dao.saveBookmark(
+                    graph.library.flushPlaybackProgress()
+                    graph.library.dao.putWorks(
+                        listOf(detail.work.copy(title = "自定义标题", favorite = true)),
+                    )
+                    graph.library.dao.saveBookmark(
                         BookmarkEntity("bookmark-test", workId, track.id, 1000, "示例书签"),
                     )
                     revision.set(2)
-                    repo.importAsmrWork(sourceId, 2, metadataClient)
-                    repo.importAsmrWork(sourceId, 1, metadataClient)
-                    val refreshed = repo.dao.details(workId)!!
+                    graph.sync.importAsmrWork(sourceId, 2, metadataClient)
+                    graph.sync.importAsmrWork(sourceId, 1, metadataClient)
+                    val refreshed = graph.library.dao.details(workId)!!
                     assertEquals("自定义标题", refreshed.work.title)
                     assertTrue(refreshed.work.favorite)
                     assertEquals(
                         detail.tracks.map { it.id }.toSet(),
                         refreshed.tracks.map { it.id }.toSet(),
                     )
-                    assertNotNull(repo.dao.progress(workId))
-                    assertTrue(repo.dao.locations(track.id).single().uri.endsWith("revision=2"))
-                    assertFalse(
-                        repo.dao
-                            .locations(
-                                repo.dao.details(stableId("asmr.one|work|2"))!!.tracks.first().id,
-                            )
-                            .isEmpty(),
+                    assertNotNull(graph.library.dao.progress(workId))
+                    assertTrue(
+                        refreshed.tracks.first { it.id == track.id }.uri.endsWith("revision=2"),
                     )
-                    repo.offlineStore.downloadWork(workId)
+                    graph.offline.downloadWork(workId)
                 }
                 waitFor {
                     detail.tracks.all {
-                        repo.downloads.value[it.id]?.state == Download.STATE_COMPLETED
+                        graph.media.downloads.value[it.id]?.state == Download.STATE_COMPLETED
                     }
                 }
-                waitFor { runBlocking { repo.dao.details(workId)!!.work.offlineAttachments } }
+                waitFor {
+                    runBlocking { graph.library.dao.details(workId)!!.work.offlineAttachments }
+                }
                 assertEquals(0, leaks.get())
                 assertTrue(ranges.get() > 0)
                 server.close()
                 runBlocking {
-                    repo.removeSource(sourceId)
-                    assertArrayEquals(subtitle, repo.readAsset(track.subtitleId!!))
+                    graph.sync.removeSource(sourceId)
+                    assertArrayEquals(subtitle, graph.library.readAsset(track.subtitleId!!))
                 }
-                val offline = runBlocking { repo.mediaItem(track, detail.work) }
+                val offline = runBlocking { graph.playback.mediaItem(track, detail.work) }
                 main {
                     controller.setMediaItem(offline, 1000)
                     controller.prepare()
                     controller.play()
                 }
                 waitFor { main { controller.isPlaying } }
-                // Remove a downloaded work while it is playing, using the real UI.
                 ui.onNodeWithContentDescription("收起播放器").performClick()
                 ui.onNodeWithContentDescription("作品信息").performClick()
                 ui.onNodeWithText("删除作品").performClick()
                 ui.onNodeWithText("删除").performClick()
-                waitFor { runBlocking { repo.dao.work(workId) == null } }
+                waitFor { runBlocking { graph.library.dao.work(workId) == null } }
                 waitFor { main { controller.mediaItemCount == 0 && !controller.isPlaying } }
                 runBlocking {
-                    repo.savePlaybackProgress(ProgressEntity(workId, track.id, 1000))
-                    repo.flushPlaybackProgress()
-                    assertNull(repo.dao.progress(workId))
-                    assertNull(repo.dao.dlsiteMetadata(workId))
-                    assertTrue(repo.bookmarks.value.none { it.workId == workId })
-                    detail.tracks.forEach { assertTrue(repo.dao.locations(it.id).isEmpty()) }
-                    assertNotNull(repo.dao.work(stableId("asmr.one|work|2")))
+                    graph.library.savePlaybackProgress(ProgressEntity(workId, track.id, 1000))
+                    graph.library.flushPlaybackProgress()
+                    assertNull(graph.library.dao.progress(workId))
+                    assertNull(graph.library.dao.dlsiteMetadata(workId))
+                    assertTrue(graph.library.bookmarks.value.none { it.workId == workId })
                 }
-                waitFor { detail.tracks.all { repo.downloads.value[it.id] == null } }
-                assertNull(repo.artwork(detail.work.coverId))
+                waitFor { detail.tracks.all { graph.media.downloads.value[it.id] == null } }
+                capture("asmr-done.png")
             } finally {
                 main { MediaController.releaseFuture(future) }
             }

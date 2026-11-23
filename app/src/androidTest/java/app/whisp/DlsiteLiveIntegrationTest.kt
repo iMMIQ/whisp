@@ -20,10 +20,10 @@ class DlsiteLiveIntegrationTest {
         assumeNotNull(rj)
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         assertTrue(context.packageName.endsWith(".smoketest"))
-        val repo = (context.applicationContext as WhispApp).repository
+        val graph = (context.applicationContext as WhispApp).graph
         val requests = CopyOnWriteArrayList<String>()
         val http =
-            repo.http
+            graph.http
                 .newBuilder()
                 .followRedirects(true)
                 .addInterceptor { chain ->
@@ -57,12 +57,7 @@ class DlsiteLiveIntegrationTest {
             if (InstrumentationRegistry.getArguments().getString("probeAsmr") == "true") {
                 val client = AsmrOneClient(http)
                 val catalog = client.work(rj.drop(2).toLong())
-                val indexed =
-                    client.index(
-                        metadata.applyTo(catalog),
-                        "probe-source",
-                        System.currentTimeMillis(),
-                    )
+                val indexed = client.index(metadata.applyTo(catalog), "probe-source")
                 assertTrue(indexed.tracks.isNotEmpty())
                 println(
                     "DLSITE_PROBE tracks=${indexed.tracks.size}; subtitles=${indexed.tracks.count { it.subtitleId != null }}",

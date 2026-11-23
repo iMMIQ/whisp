@@ -34,14 +34,14 @@ class PlaybackIntegrationTest {
     private val instrumentation
         get() = InstrumentationRegistry.getInstrumentation()
 
-    private val repo
-        get() = (ui.activity.application as WhispApp).repository
+    private val graph
+        get() = (ui.activity.application as WhispApp).graph
 
     private lateinit var server: MockWebServer
     private val ranged = AtomicInteger()
     private val badAuth = AtomicInteger()
     private val fixture
-        get() = File(repo.context.filesDir, "fixture")
+        get() = File(graph.context.filesDir, "fixture")
 
     private fun xml(value: String) = value.replace("&", "&amp;").replace("<", "&lt;")
 
@@ -118,12 +118,12 @@ class PlaybackIntegrationTest {
                     "webdav",
                     server.url("/ASMR/").toString(),
                     "listener",
-                    repo.secrets.encrypt("test"),
+                    graph.secrets.encrypt("test"),
                 )
-            repo.dao.putSource(source)
-            repo.scan(source.id)
+            graph.library.dao.putSource(source)
+            graph.sync.scan(source.id)
         }
-        ui.waitUntil(20000) { repo.library.value.isNotEmpty() }
+        ui.waitUntil(20000) { graph.library.works.value.isNotEmpty() }
     }
 
     private fun waitFor(timeoutMs: Long = 20000, predicate: () -> Boolean) {
@@ -139,7 +139,7 @@ class PlaybackIntegrationTest {
         ui.waitForIdle()
         Thread.sleep(700)
         instrumentation.uiAutomation.takeScreenshot()?.let { bitmap ->
-            File(repo.context.filesDir, "$name.png").outputStream().use {
+            File(graph.context.filesDir, "$name.png").outputStream().use {
                 bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
             }
             bitmap.recycle()
@@ -148,7 +148,8 @@ class PlaybackIntegrationTest {
 
     @Test
     fun generatedAudioBackgroundSeekSubtitlesAndOfflinePlayback() {
-        val detail = repo.library.value.first { it.work.rj == "RJ00000001" }
+        val work = graph.library.works.value.first { it.rj == "RJ00000001" }
+        val detail = runBlocking { graph.library.dao.details(work.id)!! }
         assertEquals(1, detail.tracks.size)
         assertNotNull(detail.tracks.single().subtitleId)
         screenshot("library")
@@ -158,10 +159,10 @@ class PlaybackIntegrationTest {
         ui.onNodeWithText("播放作品").performClick()
         val future =
             MediaController.Builder(
-                    repo.context,
+                    graph.context,
                     SessionToken(
-                        repo.context,
-                        ComponentName(repo.context, PlaybackService::class.java),
+                        graph.context,
+                        ComponentName(graph.context, PlaybackService::class.java),
                     ),
                 )
                 .buildAsync()
@@ -206,22 +207,22 @@ class PlaybackIntegrationTest {
             )
         }
         Thread.sleep(1000)
-        runBlocking { repo.offlineStore.downloadWork(detail.work.id) }
+        runBlocking { graph.offline.downloadWork(detail.work.id) }
         waitFor(90000) {
-            repo.downloads.value[detail.tracks.single().id]?.state ==
+            graph.media.downloads.value[detail.tracks.single().id]?.state ==
                 androidx.media3.exoplayer.offline.Download.STATE_COMPLETED
         }
         waitFor(20000) {
-            runBlocking { repo.dao.details(detail.work.id)!!.work.offlineAttachments }
+            runBlocking { graph.library.dao.details(detail.work.id)!!.work.offlineAttachments }
         }
-        val position = runBlocking { repo.dao.progress(detail.work.id)!! }
+        val position = runBlocking { graph.library.dao.progress(detail.work.id)!! }
         assertTrue(position.positionMs >= 15 * 60_000L)
         server.close()
         runBlocking {
-            repo.removeSource("integration-nas")
-            assertTrue(repo.dao.details(detail.work.id)!!.work.offlineAttachments)
+            graph.sync.removeSource("integration-nas")
+            assertTrue(graph.library.dao.details(detail.work.id)!!.work.offlineAttachments)
         }
-        val item = runBlocking { repo.mediaItem(detail.tracks.single(), detail.work) }
+        val item = runBlocking { graph.playback.mediaItem(detail.tracks.single(), detail.work) }
         instrumentation.runOnMainSync {
             controller.sendCustomCommand(
                 SessionCommand(PlaybackService.TIMER, Bundle.EMPTY),
@@ -232,7 +233,9 @@ class PlaybackIntegrationTest {
             controller.play()
         }
         waitFor { playing() }
-        runBlocking { assertFalse(repo.readAsset(detail.tracks.single().subtitleId!!).isEmpty()) }
+        runBlocking {
+            assertFalse(graph.library.readAsset(detail.tracks.single().subtitleId!!).isEmpty())
+        }
         instrumentation.runOnMainSync { controller.pause() }
         instrumentation.runOnMainSync { MediaController.releaseFuture(future) }
     }

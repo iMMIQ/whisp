@@ -51,10 +51,9 @@ class DlsiteLoginActivity : ComponentActivity() {
         checking = true
         lifecycleScope.launch {
             try {
-                val id =
-                    (application as WhispApp)
-                        .repository
-                        .acceptDlsiteLogin(snapshot, intent.getStringExtra(SOURCE))
+                val graph = (application as WhispApp).graph
+                val id = graph.sources.acceptDlsiteLogin(snapshot, intent.getStringExtra(SOURCE))
+                graph.sync.scheduleScan(id, force = true)
                 closing = true
                 setResult(RESULT_OK, Intent().putExtra(SOURCE, id))
                 finish()

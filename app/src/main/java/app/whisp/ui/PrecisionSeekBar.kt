@@ -16,7 +16,57 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import app.whisp.data.PrecisionScrubber
+import kotlin.math.abs
+
+/**
+ * Pure fine-scrubbing gesture state: pulling vertically away from the bar zooms to a 60s window.
+ */
+class PrecisionScrubber(
+    private val durationMs: Long,
+    private val widthPx: Float,
+    startX: Float,
+    private val startY: Float,
+    private val fineThresholdPx: Float,
+    private val fineWindowMs: Long = 60_000L,
+) {
+    var positionMs: Long =
+        ((startX / widthPx.coerceAtLeast(1f)) * durationMs).toLong().coerceIn(0L, durationMs)
+        private set
+
+    var fine: Boolean = false
+        private set
+
+    var rangeStart: Long = 0L
+        private set
+
+    var rangeEnd: Long = durationMs
+        private set
+
+    private var anchorX: Float = startX
+    private var anchorPositionMs: Long = positionMs
+
+    fun move(x: Float, y: Float): Long {
+        val wantFine = abs(y - startY) >= fineThresholdPx
+        if (wantFine != fine) {
+            fine = wantFine
+            anchorX = x
+            anchorPositionMs = positionMs
+            if (fine) {
+                val half = fineWindowMs / 2
+                rangeStart = (positionMs - half).coerceAtLeast(0L)
+                rangeEnd = (positionMs + half).coerceAtMost(durationMs)
+            } else {
+                rangeStart = 0L
+                rangeEnd = durationMs
+            }
+            return positionMs
+        }
+        val span = if (fine) fineWindowMs.coerceAtMost(durationMs) else durationMs
+        val delta = (((x - anchorX) / widthPx.coerceAtLeast(1f)) * span).toLong()
+        positionMs = (anchorPositionMs + delta).coerceIn(rangeStart, rangeEnd)
+        return positionMs
+    }
+}
 
 @Composable
 internal fun PrecisionSeekBar(
@@ -40,12 +90,13 @@ internal fun PrecisionSeekBar(
         update(null)
     }
     Box(Modifier.fillMaxWidth().height(56.dp), contentAlignment = Alignment.TopCenter) {
-        if (preview != null)
+        if (preview != null) {
             Text(
                 if (fine) "${clock(preview!!)} · 精细" else clock(preview!!),
                 color = Rose,
                 fontSize = 14.sp,
             )
+        }
         Canvas(
             Modifier.fillMaxSize()
                 .testTag("seek-bar")
@@ -65,7 +116,7 @@ internal fun PrecisionSeekBar(
                     }
                 }
                 .pointerInput(duration, enabled) {
-                    if (enabled)
+                    if (enabled) {
                         detectTapGestures(
                             onTap = { point ->
                                 seek(
@@ -75,9 +126,10 @@ internal fun PrecisionSeekBar(
                                 )
                             },
                         )
+                    }
                 }
                 .pointerInput(duration, enabled) {
-                    if (enabled)
+                    if (enabled) {
                         detectDragGestures(
                             onDragStart = { point ->
                                 drag =
@@ -105,6 +157,7 @@ internal fun PrecisionSeekBar(
                                 }
                             },
                         )
+                    }
                 },
         ) {
             val start = if (fine) drag?.rangeStart ?: 0 else 0
@@ -115,7 +168,7 @@ internal fun PrecisionSeekBar(
             val tint = if (enabled) Rose else Muted.copy(alpha = .35f)
             drawLine(Raised, Offset(0f, y), Offset(size.width, y), 4.dp.toPx(), StrokeCap.Round)
             if (loopStart >= 0) {
-                if (loopEnd > loopStart && loopEnd >= start && loopStart <= end)
+                if (loopEnd > loopStart && loopEnd >= start && loopStart <= end) {
                     drawLine(
                         Rose.copy(alpha = .35f),
                         Offset(x(loopStart), y),
@@ -123,6 +176,7 @@ internal fun PrecisionSeekBar(
                         10.dp.toPx(),
                         StrokeCap.Round,
                     )
+                }
                 listOf(loopStart, loopEnd)
                     .filter { it in start..end }
                     .forEach { marker ->

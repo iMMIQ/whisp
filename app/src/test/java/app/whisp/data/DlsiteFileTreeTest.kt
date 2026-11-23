@@ -22,7 +22,6 @@ class DlsiteFileTreeTest {
             DlsiteFileTree.index(
                 DlsiteOwnedWork("RJ00000001", "示例作品"),
                 "account-a",
-                1,
                 Json.parseToJsonElement(fixture).jsonObject,
             )
         val track = result.tracks.single()
@@ -32,15 +31,15 @@ class DlsiteFileTreeTest {
         assertEquals("subtitle", caption.kind)
         assertEquals("01_示例.vtt", caption.fileName)
         assertEquals("dlsite", result.works.single().origin)
+        assertTrue(track.uri.startsWith("dlsite-resource://RJ00000001/optimized/"))
         assertTrue(
-            result.locations.all { it.uri.startsWith("dlsite-resource://RJ00000001/optimized/") },
+            result.attachments.all { it.uri.startsWith("dlsite-resource://RJ00000001/optimized/") },
         )
-        assertEquals(3, result.locations.size)
+        assertEquals(2, result.attachments.size)
         val otherAccount =
             DlsiteFileTree.index(
                 DlsiteOwnedWork("RJ00000001", "示例作品"),
                 "account-b",
-                1,
                 Json.parseToJsonElement(fixture).jsonObject,
             )
         assertNotEquals(track.id, otherAccount.tracks.single().id)
@@ -51,8 +50,7 @@ class DlsiteFileTreeTest {
         val root = Json.parseToJsonElement(fixture).jsonObject
         val files = root.getValue("playfile").jsonObject - "caption-hash"
         val changed = JsonObject(root + ("playfile" to JsonObject(files)))
-        val result =
-            DlsiteFileTree.index(DlsiteOwnedWork("RJ00000001", "示例作品"), "account", 1, changed)
+        val result = DlsiteFileTree.index(DlsiteOwnedWork("RJ00000001", "示例作品"), "account", changed)
         assertNull(result.tracks.single().subtitleId)
         assertEquals(1, result.attachments.size)
     }
@@ -64,7 +62,7 @@ class DlsiteFileTreeTest {
                     fixture.replace("本編", "本編.ver2").replace("01_示例.wav", "01_示例"),
                 )
                 .jsonObject
-        val result = DlsiteFileTree.index(DlsiteOwnedWork("RJ00000001", "示例作品"), "account", 1, tree)
+        val result = DlsiteFileTree.index(DlsiteOwnedWork("RJ00000001", "示例作品"), "account", tree)
         assertEquals("本編.ver2/01_示例.mp3", result.tracks.single().relativePath)
         assertEquals(
             "本編.ver2/01_示例.vtt",
@@ -78,7 +76,6 @@ class DlsiteFileTreeTest {
             DlsiteFileTree.index(
                 DlsiteOwnedWork("RJ00000001", "示例作品"),
                 "account",
-                1,
                 Json.parseToJsonElement(fixture.replace("audio.mp3", "../../audio.mp3")).jsonObject,
             )
         }

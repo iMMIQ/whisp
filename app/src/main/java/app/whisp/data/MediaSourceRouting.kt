@@ -2,24 +2,23 @@
 package app.whisp.data
 
 import android.content.Context
-import androidx.core.net.toUri
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.TransferListener
+import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheEvictor
+import androidx.media3.datasource.cache.CacheSpan
 import androidx.media3.datasource.cache.NoOpCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
-import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadManager
 import androidx.media3.exoplayer.offline.DownloadProgress
 import androidx.media3.exoplayer.scheduler.Requirements
 import java.io.File
-import java.io.IOException
+import java.util.TreeSet
 import java.util.concurrent.Executors
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,29 +27,83 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 
 /**
- * Owns Media3 DataSource routing (Local/HTTP/WebDAV/SMB/NFS/ASMR.ONE/DLsite), streaming/download
- * SimpleCaches, and DownloadManager observation.
+ * Same LRU policy as Media3, using only Cache's public API and an internal span index lock so
+ * callers never depend on SimpleCache's private monitor object.
  */
 @androidx.annotation.OptIn(UnstableApi::class)
-internal class MediaSourceRouting(
-    private val context: Context,
-    private val scope: CoroutineScope,
-    private val dao: LibraryDao,
-    private val http: OkHttpClient,
-    private val onlineHttp: OkHttpClient,
-    private val smb: SmbClient,
-    private val nfs: NfsClient,
+internal class AdjustableCacheEvictor(
+    limit: Long,
+    private val changed: () -> Unit = {},
+) : CacheEvictor {
+    private val lock = Any()
+    @Volatile private var limit: Long = limit.coerceAtLeast(0)
+    private val spans =
+        TreeSet<CacheSpan>(
+            compareBy<CacheSpan> { it.lastTouchTimestamp }.thenBy { it.key }.thenBy { it.position },
+        )
+    private var bytes = 0L
+
+    fun resize(cache: Cache, newLimit: Long) {
+        limit = newLimit.coerceAtLeast(0)
+        evict(cache, 0)
+    }
+
+    override fun requiresCacheSpanTouches() = true
+
+    override fun onCacheInitialized() = Unit
+
+    override fun onStartFile(cache: Cache, key: String, position: Long, length: Long) {
+        evict(cache, length.coerceAtLeast(0))
+        changed()
+    }
+
+    override fun onSpanAdded(cache: Cache, span: CacheSpan) {
+        synchronized(lock) { if (spans.add(span)) bytes += span.length }
+        evict(cache, 0)
+        changed()
+    }
+
+    override fun onSpanRemoved(cache: Cache, span: CacheSpan) {
+        val removed =
+            synchronized(lock) { spans.remove(span).also { if (it) bytes -= span.length } }
+        if (removed) changed()
+    }
+
+    override fun onSpanTouched(cache: Cache, oldSpan: CacheSpan, newSpan: CacheSpan) {
+        synchronized(lock) {
+            spans.remove(oldSpan)
+            spans.add(newSpan)
+        }
+    }
+
+    private fun evict(cache: Cache, incoming: Long) {
+        val skipped = mutableSetOf<CacheSpan>()
+        while (true) {
+            val candidate =
+                synchronized(lock) {
+                    if (bytes + incoming <= limit) null else spans.firstOrNull { it !in skipped }
+                } ?: break
+            cache.removeSpan(candidate)
+            val stillPresent = synchronized(lock) { candidate in spans }
+            if (stillPresent) skipped += candidate
+        }
+    }
+}
+
+/**
+ * Owns lazy Media3 DataSource routing, streaming/download SimpleCaches, and DownloadManager state.
+ */
+@androidx.annotation.OptIn(UnstableApi::class)
+class MediaSourceRouting(
+    context: Context,
+    scope: CoroutineScope,
+    private val sources: SourceRegistry,
     private val headersFor: (String) -> Map<String, String>,
-    private val sourceSecret: (SourceEntity) -> String,
-    private val dlsiteResource: suspend (String, String) -> DlsiteMediaResource,
-    private val onDlsiteLoginRequired: (String, DlsiteAccountClient?) -> Unit,
     private val storageChanged: () -> Unit,
-    private val streamingCacheMiBUpdates: Flow<Int>,
+    streamingCacheMiBUpdates: Flow<Int>,
     private val messages: MutableSharedFlow<String>,
 ) {
     private val streamingEvictor = AdjustableCacheEvictor(Long.MAX_VALUE, storageChanged)
@@ -60,82 +113,36 @@ internal class MediaSourceRouting(
     val streamingCache =
         SimpleCache(File(context.cacheDir, "streaming"), streamingEvictor, mediaDatabase)
 
-    private val httpFactory =
-        ResolvingDataSource.Factory(
-            DefaultDataSource.Factory(context, OkHttpDataSource.Factory(http)),
-        ) { spec ->
-            spec.withRequestHeaders(spec.httpRequestHeaders + headersFor(spec.uri.toString()))
-        }
-
+    // Lazy scheme-dispatched DataSource: instantiates only the single backend needed for open().
     private val networkFactory = DataSource.Factory {
-        val fallback = httpFactory.createDataSource()
-        val online =
-            ResolvingDataSource.Factory(
-                    OkHttpDataSource.Factory(onlineHttp)
-                        .setDefaultRequestProperties(AsmrOneClient.MEDIA_HEADERS),
-                ) { spec ->
-                    val asset = spec.uri.lastPathSegment ?: throw IOException("文件标识无效")
-                    val sourceId = spec.uri.authority ?: throw IOException("来源未关联")
-                    val location =
-                        runBlocking(Dispatchers.IO) {
-                            val source = dao.source(sourceId) ?: throw IOException("来源已移除")
-                            require(source.kindType == SourceKind.ASMRONE) { "来源类型不匹配" }
-                            dao.locations(asset).firstOrNull { it.sourceId == sourceId }
-                                ?: throw IOException("文件已移除")
-                        }
-                    spec.withUri(location.uri.toUri())
-                }
-                .createDataSource()
-        val smbData =
-            RemoteFileDataSource("SMB") { uri ->
-                val sourceId = uri.toUri().authority ?: throw IOException("来源未关联")
-                val source =
-                    runBlocking(Dispatchers.IO) { dao.source(sourceId) }
-                        ?: throw IOException("来源已移除")
-                require(source.kindType == SourceKind.SMB) { "来源类型不匹配" }
-                smb.open(source, sourceSecret(source), uri)
-            }
-        val nfsData =
-            RemoteFileDataSource("NFS") { uri ->
-                val sourceId = uri.toUri().authority ?: throw IOException("来源未关联")
-                val source =
-                    runBlocking(Dispatchers.IO) { dao.source(sourceId) }
-                        ?: throw IOException("来源已移除")
-                require(source.kindType == SourceKind.NFS) { "来源类型不匹配" }
-                nfs.open(source, uri)
-            }
-        val dlsiteData = DlsiteDataSource(dlsiteResource, onDlsiteLoginRequired)
         object : DataSource {
-            private var active: DataSource = fallback
+            private val listeners = mutableListOf<TransferListener>()
+            private var active: DataSource? = null
 
             override fun addTransferListener(listener: TransferListener) {
-                fallback.addTransferListener(listener)
-                smbData.addTransferListener(listener)
-                nfsData.addTransferListener(listener)
-                online.addTransferListener(listener)
-                dlsiteData.addTransferListener(listener)
+                listeners += listener
+                active?.addTransferListener(listener)
             }
 
             override fun open(spec: DataSpec): Long {
-                active =
-                    when (spec.uri.scheme) {
-                        "whisp-smb" -> smbData
-                        "whisp-nfs" -> nfsData
-                        "whisp-asmr" -> online
-                        "whisp-dlsite" -> dlsiteData
-                        else -> fallback
-                    }
-                return active.open(spec)
+                val created = sources.createDataSourceForScheme(spec.uri.scheme, headersFor)
+                listeners.forEach(created::addTransferListener)
+                active = created
+                return created.open(spec)
             }
 
             override fun read(buffer: ByteArray, offset: Int, length: Int) =
-                active.read(buffer, offset, length)
+                active?.read(buffer, offset, length) ?: -1
 
-            override fun getUri() = active.uri
+            override fun getUri() = active?.uri
 
-            override fun getResponseHeaders() = active.responseHeaders
+            override fun getResponseHeaders() = active?.responseHeaders ?: emptyMap()
 
-            override fun close() = active.close()
+            override fun close() {
+                val current = active
+                active = null
+                current?.close()
+            }
         }
     }
 
@@ -145,11 +152,10 @@ internal class MediaSourceRouting(
             .setUpstreamDataSourceFactory(networkFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
-    val playbackFactory =
+    val playbackFactory: DataSource.Factory =
         CacheDataSource.Factory()
             .setCache(downloadCache)
-            // Only DownloadManager writes pinned copies. Playback must not hold a cache
-            // hole while paused, which would block a concurrent download of that track.
+            // Only DownloadManager writes pinned copies so paused playback never blocks downloads.
             .setCacheWriteDataSinkFactory(null)
             .setUpstreamDataSourceFactory(streamingFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
@@ -164,7 +170,6 @@ internal class MediaSourceRouting(
             )
             .apply {
                 maxParallelDownloads = 2
-                // Local copies and isolated NAS networks do not require validated Internet.
                 requirements = Requirements(Requirements.DEVICE_STORAGE_NOT_LOW)
             }
 
@@ -236,6 +241,17 @@ internal class MediaSourceRouting(
         }
     }
 
+    fun isCompleted(trackId: String): Boolean =
+        downloadManager.downloadIndex.getDownload(trackId)?.state == Download.STATE_COMPLETED
+
+    fun completedUri(trackId: String): String? =
+        downloadManager.downloadIndex
+            .getDownload(trackId)
+            ?.takeIf { it.state == Download.STATE_COMPLETED }
+            ?.request
+            ?.uri
+            ?.toString()
+
     fun clearStreamingCache() {
         streamingCache.keys.toList().forEach { streamingCache.removeResource(it) }
     }
@@ -248,8 +264,6 @@ internal class MediaSourceRouting(
         return result
     }
 
-    // DownloadManager mutates its in-memory byte counters. Copy them for StateFlow
-    // delivery; progress sampling never traverses the download database.
     private fun sampleDownloadProgress() {
         val current = downloadManager.currentDownloads
         activeDownloads.value = current.any { it.state == Download.STATE_DOWNLOADING }

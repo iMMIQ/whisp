@@ -4,7 +4,6 @@ package app.whisp
 import android.content.ComponentName
 import android.os.Bundle
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
-import androidx.lifecycle.ViewModelProvider
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
@@ -18,7 +17,6 @@ import androidx.test.platform.app.InstrumentationRegistry
 import app.whisp.data.*
 import app.whisp.playback.OfflineService
 import app.whisp.playback.PlaybackService
-import app.whisp.ui.AppViewModel
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.flow.first
@@ -41,8 +39,8 @@ class PlaybackRegressionIntegrationTest {
     private val instrumentation
         get() = InstrumentationRegistry.getInstrumentation()
 
-    private val repo
-        get() = (ui.activity.application as WhispApp).repository
+    private val graph
+        get() = (ui.activity.application as WhispApp).graph
 
     private fun <T> main(block: () -> T): T {
         var result: T? = null
@@ -61,8 +59,16 @@ class PlaybackRegressionIntegrationTest {
     }
 
     private fun seed(): WorkDetails {
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
-        val work = WorkEntity("regression-work", null, "Playback test", "Playback test")
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
+        val wave = SystemMediaIntegrationTest.silentWave(graph.context.filesDir)
+        val work =
+            WorkEntity(
+                "regression-work",
+                null,
+                "Playback test",
+                "Playback test",
+                sourceId = "regression-source",
+            )
         val tracks =
             (1..2).map {
                 TrackEntity(
@@ -73,13 +79,12 @@ class PlaybackRegressionIntegrationTest {
                     "audio/$it.wav",
                     it,
                     40000,
+                    uri = wave.toURI().toString(),
+                    size = wave.length(),
                 )
             }
-        val wave = SystemMediaIntegrationTest.silentWave(repo.context.filesDir)
         runBlocking {
-            repo.dao.putWorks(listOf(work))
-            repo.dao.putTracks(tracks)
-            repo.dao.putSource(
+            graph.library.dao.putSource(
                 SourceEntity(
                     "regression-source",
                     "Test",
@@ -87,27 +92,18 @@ class PlaybackRegressionIntegrationTest {
                     wave.parentFile!!.toURI().toString(),
                 ),
             )
-            repo.dao.putLocations(
-                tracks.map {
-                    LocationEntity(
-                        "regression-location-${it.id}",
-                        it.id,
-                        "regression-source",
-                        wave.toURI().toString(),
-                        wave.length(),
-                    )
-                },
-            )
+            graph.library.dao.putWorks(listOf(work))
+            graph.library.dao.putTracks(tracks)
         }
         return WorkDetails(work, tracks, emptyList())
     }
 
     private fun controller(): MediaController = main {
         MediaController.Builder(
-                repo.context,
+                graph.context,
                 SessionToken(
-                    repo.context,
-                    ComponentName(repo.context, PlaybackService::class.java),
+                    graph.context,
+                    ComponentName(graph.context, PlaybackService::class.java),
                 ),
             )
             .buildAsync()
@@ -116,7 +112,7 @@ class PlaybackRegressionIntegrationTest {
 
     @Test
     fun replacingAnEvictedMetadataRequestRetainsLoadingAndItsInFlightRequest() {
-        val model = main { ViewModelProvider(ui.activity)[AppViewModel::class.java] }
+        val loader = graph.dlsiteLoader
         val firstRequests = AtomicInteger()
         MockWebServer().use { server ->
             server.start()
@@ -136,7 +132,7 @@ class PlaybackRegressionIntegrationTest {
             val client = DlsiteClient(OkHttpClient(), server.url("/"))
             fun load(index: Int) {
                 val number = "RJ" + (index + 1).toString().padStart(8, '0')
-                model.loadDlsiteDetails(
+                loader.load(
                     "request-$index",
                     number,
                     seed = DlsiteDetails(number),
@@ -155,7 +151,7 @@ class PlaybackRegressionIntegrationTest {
             main {
                 assertTrue(
                     "Finishing an evicted request must not clear the replacement's loading state",
-                    "product" in model.dlsiteStates.value.getValue("request-0").loading,
+                    "product" in loader.states.value.getValue("request-0").loading,
                 )
                 load(0)
             }
@@ -166,8 +162,8 @@ class PlaybackRegressionIntegrationTest {
                 firstRequests.get(),
             )
             waitFor("The replacement must complete normally") {
-                model.dlsiteStates.value["request-0"]?.details?.completeProduct == true &&
-                    model.dlsiteStates.value.getValue("request-0").loading.isEmpty()
+                loader.states.value["request-0"]?.details?.completeProduct == true &&
+                    loader.states.value.getValue("request-0").loading.isEmpty()
             }
         }
     }
@@ -175,9 +171,9 @@ class PlaybackRegressionIntegrationTest {
     @Test
     fun continuingTheCurrentTrackUpdatesTheQueueAndClearsShuffleWithoutRewinding() {
         val detail = seed()
-        val items = runBlocking { detail.tracks.map { repo.mediaItem(it, detail.work) } }
+        val items = runBlocking { detail.tracks.map { graph.playback.mediaItem(it, detail.work) } }
         val c = controller()
-        val model = main { ViewModelProvider(ui.activity)[AppViewModel::class.java] }
+        val playback = graph.playback
         try {
             main {
                 c.volume = 0f
@@ -187,11 +183,11 @@ class PlaybackRegressionIntegrationTest {
             waitFor("Audio must prepare") { c.playbackState == Player.STATE_READY }
             main {
                 c.shuffleModeEnabled = true
-                model.playWork(detail)
-                model.togglePlay()
+                playback.playWork(detail)
+                playback.togglePlay()
             }
             waitFor("Continuing must install the complete current queue") {
-                model.openingTrackId.value == null &&
+                playback.openingTrackId.value == null &&
                     c.mediaItemCount == 2 &&
                     c.playbackState == Player.STATE_READY
             }
@@ -200,14 +196,13 @@ class PlaybackRegressionIntegrationTest {
                 assertEquals(12000L, c.currentPosition)
                 assertFalse(c.playWhenReady)
                 assertFalse(c.shuffleModeEnabled)
-                // Exercise the shortcut as well as replacement of an outdated queue.
                 c.shuffleModeEnabled = true
                 c.repeatMode = Player.REPEAT_MODE_ONE
-                model.playWork(detail, detail.tracks.first().id)
-                model.togglePlay()
+                playback.playWork(detail, detail.tracks.first().id)
+                playback.togglePlay()
             }
             waitFor("Normal playback must clear shuffle even when the queue already matches") {
-                model.openingTrackId.value == null && !c.shuffleModeEnabled
+                playback.openingTrackId.value == null && !c.shuffleModeEnabled
             }
             main {
                 assertEquals(12000L, c.currentPosition)
@@ -227,41 +222,41 @@ class PlaybackRegressionIntegrationTest {
     fun aPartiallySavedWorkPlaysAfterItsSourceIsRemovedAndUnavailableSelectionFailsClearly() {
         val detail = seed()
         val first = detail.tracks.first()
-        val original = SystemMediaIntegrationTest.silentWave(repo.context.filesDir)
+        val original = SystemMediaIntegrationTest.silentWave(graph.context.filesDir)
         runBlocking {
             val request =
                 DownloadRequest.Builder(first.id, android.net.Uri.fromFile(original))
                     .setCustomCacheKey(first.id)
                     .build()
             DownloadService.sendAddDownload(
-                repo.context,
+                graph.context,
                 OfflineService::class.java,
                 request,
                 false,
             )
             withTimeout(30_000) {
-                repo.downloads.first { it[first.id]?.state == Download.STATE_COMPLETED }
+                graph.media.downloads.first { it[first.id]?.state == Download.STATE_COMPLETED }
             }
-            // Audio succeeds independently of the optional attachment worker.
-            assertFalse(repo.dao.work(detail.work.id)!!.offlineAttachments)
-            repo.removeSource("regression-source")
+            assertFalse(graph.library.dao.work(detail.work.id)!!.offlineAttachments)
+            graph.sync.removeSource("regression-source")
         }
         original.delete()
         waitFor("Completed audio must keep a work visible even without saved attachments") {
-            repo.library.value.any { it.work.id == detail.work.id }
+            graph.library.works.value.any { it.id == detail.work.id }
         }
-        val model = main { ViewModelProvider(ui.activity)[AppViewModel::class.java] }
+        val playback = graph.playback
         val c = controller()
+        val updatedDetail = runBlocking { graph.library.dao.details(detail.work.id)!! }
         try {
             main {
                 c.volume = 0f
                 c.pause()
                 c.clearMediaItems()
-                model.playWork(detail, first.id)
-                model.togglePlay()
+                playback.playWork(updatedDetail, first.id)
+                playback.togglePlay()
             }
             waitFor("A saved track must prepare despite unavailable sibling tracks") {
-                model.openingTrackId.value == null &&
+                playback.openingTrackId.value == null &&
                     c.currentMediaItem?.mediaId == first.id &&
                     c.playbackState == Player.STATE_READY
             }
@@ -269,11 +264,11 @@ class PlaybackRegressionIntegrationTest {
                 assertEquals(1, c.mediaItemCount)
                 assertFalse(c.playWhenReady)
                 c.clearMediaItems()
-                model.error.value = null
-                model.playWork(detail, detail.tracks.last().id)
+                playback.error.value = null
+                playback.playWork(updatedDetail, detail.tracks.last().id)
             }
             waitFor("Selecting an unavailable track must expose a useful error") {
-                model.error.value?.startsWith("音轨文件不可用") == true
+                playback.error.value?.startsWith("音轨文件不可用") == true
             }
             main {
                 assertEquals(
@@ -290,8 +285,8 @@ class PlaybackRegressionIntegrationTest {
                 c.release()
             }
             runBlocking {
-                repo.offlineStore.removeOffline(detail.work.id)
-                withTimeout(15_000) { repo.downloads.first { first.id !in it } }
+                graph.offline.removeOffline(detail.work.id)
+                withTimeout(15_000) { graph.media.downloads.first { first.id !in it } }
             }
         }
     }
@@ -299,7 +294,7 @@ class PlaybackRegressionIntegrationTest {
     @Test
     fun anAbLoopAtEofKeepsItsTrackAndAnOutOfBoundsRangeIsCleared() {
         val detail = seed()
-        val items = runBlocking { detail.tracks.map { repo.mediaItem(it, detail.work) } }
+        val items = runBlocking { detail.tracks.map { graph.playback.mediaItem(it, detail.work) } }
         val c = controller()
         try {
             main {

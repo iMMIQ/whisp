@@ -53,7 +53,7 @@ class DlsiteClientTest {
             assertEquals(old.workId, new.workId)
             assertNotEquals(old.coverId, new.coverId)
             assertEquals(metadata.artist, new.entity().originalArtist)
-            assertTrue(isAsmrOneWork(new.entity()))
+            assertEquals(SourceKind.ASMRONE, new.entity().originKind)
             val requests = listOf(server.takeRequest())
             assertEquals("/maniax/api/=/product.json", requests.single().url.encodedPath)
             assertEquals("RJ00000001", requests.single().url.queryParameter("workno"))

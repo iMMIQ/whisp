@@ -10,50 +10,43 @@ object DlsiteFileTree {
     private val bonusPattern = Regex("特典|おまけ|omake|bonus|附赠", RegexOption.IGNORE_CASE)
     private val supportedAudioExtensions = setOf("mp3", "m4a", "aac", "flac", "wav", "ogg", "opus")
 
-    fun index(
-        work: DlsiteOwnedWork,
-        sourceId: String,
-        generation: Long,
-        tree: JsonObject,
-    ): IndexedLibrary {
+    fun index(work: DlsiteOwnedWork, sourceId: String, tree: JsonObject): IndexedLibrary {
         val entity = work.entity(sourceId)
         val files = tree["playfile"] as? JsonObject ?: throw IOException("DLsite 文件目录格式错误")
         val nodes = tree["tree"] as? JsonArray ?: throw IOException("DLsite 文件目录格式错误")
         val tracks = mutableListOf<TrackEntity>()
         val attachments = linkedMapOf<String, AttachmentEntity>()
-        val locations = linkedMapOf<String, LocationEntity>()
         val seen = mutableSetOf<String>()
         var visited = 0
-        fun resource(id: String, optimized: JsonObject) {
+
+        fun resourceInfo(optimized: JsonObject): Pair<String, Long> {
             val name = optimized.text("name")
             require(safeNamePattern.matches(name) && !name.contains("..")) { "DLsite 文件标识无效" }
-            locations[id] =
-                LocationEntity(
-                    stableId("$sourceId|$id"),
-                    id,
-                    sourceId,
-                    "dlsite-resource://${work.workno}/optimized/$name",
-                    optimized["length"]?.jsonPrimitive?.longOrNull?.coerceAtLeast(0) ?: 0,
-                    generation = generation,
-                )
+            val size = optimized["length"]?.jsonPrimitive?.longOrNull?.coerceAtLeast(0) ?: 0L
+            return "dlsite-resource://${work.workno}/optimized/$name" to size
         }
+
         fun subtitle(hash: String, relative: String): String? {
             val item = files[hash] as? JsonObject ?: return null
             val optimized =
                 (item["text"] as? JsonObject)?.get("optimized") as? JsonObject ?: return null
+            val (uri, size) = resourceInfo(optimized)
             val id = stableId("${entity.id}|subtitle|$hash")
+            val fileName = relative.substringAfterLast('/')
             attachments[id] =
                 AttachmentEntity(
-                    id,
-                    entity.id,
-                    LibraryIndexer.trackTitle(relative.substringAfterLast('/')),
-                    relative.substringAfterLast('/'),
-                    relative,
-                    "subtitle",
+                    id = id,
+                    workId = entity.id,
+                    title = LibraryIndexer.trackTitle(fileName),
+                    fileName = fileName,
+                    relativePath = relative,
+                    kind = "subtitle",
+                    uri = uri,
+                    size = size,
                 )
-            resource(id, optimized)
             return id
         }
+
         fun walk(children: JsonArray, parent: String, depth: Int) {
             require(depth <= 32) { "作品目录层级过多" }
             children.forEach { element ->
@@ -75,6 +68,7 @@ object DlsiteFileTree {
                     val optimized = audio["optimized"] as? JsonObject ?: return@forEach
                     val extension = optimized.text("name").substringAfterLast('.', "").lowercase()
                     if (extension !in supportedAudioExtensions) return@forEach
+                    val (uri, size) = resourceInfo(optimized)
                     val stem = name.substringBeforeLast('.', name)
                     val relative =
                         listOf(parent, "$stem.$extension")
@@ -82,7 +76,7 @@ object DlsiteFileTree {
                             .joinToString("/")
                     val id = stableId("${entity.id}|$path|$hash")
                     val seconds = optimized["duration"]?.jsonPrimitive?.doubleOrNull ?: 0.0
-                    val subtitle =
+                    val subtitleId =
                         audio.text("vtt").takeIf(String::isNotBlank)?.let {
                             subtitle(
                                 it,
@@ -93,17 +87,20 @@ object DlsiteFileTree {
                         }
                     tracks +=
                         TrackEntity(
-                            id,
-                            entity.id,
-                            LibraryIndexer.trackTitle(name),
-                            relative.substringAfterLast('/'),
-                            relative,
-                            LibraryIndexer.number(name),
-                            if (seconds.isFinite() && seconds > 0) (seconds * 1000).toLong() else 0,
-                            subtitleId = subtitle,
+                            id = id,
+                            workId = entity.id,
+                            title = LibraryIndexer.trackTitle(name),
+                            fileName = relative.substringAfterLast('/'),
+                            relativePath = relative,
+                            order = LibraryIndexer.number(name),
+                            durationMs =
+                                if (seconds.isFinite() && seconds > 0) (seconds * 1000).toLong()
+                                else 0,
+                            subtitleId = subtitleId,
                             bonus = bonusPattern.containsMatchIn(path),
+                            uri = uri,
+                            size = size,
                         )
-                    resource(id, optimized)
                 } else if (
                     file.text("type") == "text" &&
                         name.substringAfterLast('.', "").lowercase() == "txt"
@@ -111,27 +108,29 @@ object DlsiteFileTree {
                     val optimized =
                         (file["text"] as? JsonObject)?.get("optimized") as? JsonObject
                             ?: return@forEach
+                    val (uri, size) = resourceInfo(optimized)
                     val id = stableId("${entity.id}|text|$hash")
                     attachments[id] =
                         AttachmentEntity(
-                            id,
-                            entity.id,
-                            LibraryIndexer.trackTitle(name),
-                            name,
-                            path,
-                            "script",
+                            id = id,
+                            workId = entity.id,
+                            title = LibraryIndexer.trackTitle(name),
+                            fileName = name,
+                            relativePath = path,
+                            kind = "script",
+                            uri = uri,
+                            size = size,
                         )
-                    resource(id, optimized)
                 }
             }
         }
         walk(nodes, "", 0)
         if (tracks.isEmpty()) throw DlsiteNoPlayableAudioException("作品暂无可播放音轨")
         return IndexedLibrary(
-            listOf(entity),
-            tracks.sortedWith(compareBy<TrackEntity> { it.order }.thenBy { it.relativePath }),
-            attachments.values.toList(),
-            locations.values.toList(),
+            works = listOf(entity),
+            tracks =
+                tracks.sortedWith(compareBy<TrackEntity> { it.order }.thenBy { it.relativePath }),
+            attachments = attachments.values.toList(),
         )
     }
 }

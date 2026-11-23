@@ -23,8 +23,8 @@ class NfsSourceUiIntegrationTest {
     fun nfsDialogConnectsWithProtocolAndUnixIdentity() {
         val root = InstrumentationRegistry.getArguments().getString("nfsRoot")
         assumeTrue("Provide a dedicated synthetic NFS fixture", root != null)
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         ui.onNodeWithText("来源").performClick()
         ui.onNodeWithContentDescription("添加来源").performClick()
         ui.onNodeWithText("NFS", useUnmergedTree = true).performClick()
@@ -38,20 +38,20 @@ class NfsSourceUiIntegrationTest {
         ui.onNodeWithText("NFS 界面示例").assertIsDisplayed()
         ui.onNodeWithText(root).assertIsDisplayed()
         ui.onNodeWithText("连接").performClick()
-        ui.waitUntil(30_000) { repo.sources.value.any { it.name == "NFS 界面示例" } }
-        val source = repo.sources.value.single { it.name == "NFS 界面示例" }
+        ui.waitUntil(30_000) { graph.library.sourceList.value.any { it.name == "NFS 界面示例" } }
+        val source = graph.library.sourceList.value.single { it.name == "NFS 界面示例" }
         assertEquals("nfs", source.kind)
         assertTrue(source.root.contains("version=4.2"))
         assertTrue(source.secret.isEmpty())
         ui.onNodeWithText("NFS 界面示例").assertIsDisplayed()
-        ui.waitUntil(30_000) { repo.library.value.isNotEmpty() }
-        val detail = repo.library.value.single()
-        assertEquals(detail.work.id, runBlocking { repo.dao.sourceWorkIds(source.id).single() })
+        ui.waitUntil(30_000) { graph.library.works.value.isNotEmpty() }
+        val work = graph.library.works.value.single()
+        assertEquals(work.id, runBlocking { graph.library.dao.sourceWorkIds(source.id).single() })
         ui.onNodeWithText("作品").performClick()
-        ui.onNodeWithContentDescription(detail.work.title).performClick()
+        ui.onNodeWithContentDescription(work.title).performClick()
         ui.onNodeWithText("播放作品").performClick()
         ui.waitUntil(20_000) { ui.onNodeWithText("示例字幕").isDisplayed() }
         ui.onNodeWithContentDescription("暂停").performClick()
-        runBlocking { repo.removeSource(source.id) }
+        runBlocking { graph.sync.removeSource(source.id) }
     }
 }

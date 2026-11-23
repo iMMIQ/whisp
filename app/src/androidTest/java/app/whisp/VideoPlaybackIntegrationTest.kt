@@ -3,7 +3,6 @@ package app.whisp
 
 import android.content.ComponentName
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.ViewModelProvider
 import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -18,7 +17,6 @@ import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import app.whisp.data.*
 import app.whisp.playback.PlaybackService
-import app.whisp.ui.AppViewModel
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
@@ -39,8 +37,8 @@ class VideoPlaybackIntegrationTest {
     private val device = UiDevice.getInstance(instrumentation)
     @get:Rule(order = 2) val testName = org.junit.rules.TestName()
     private val seedId = "video-example-" + java.util.UUID.randomUUID().toString()
-    private val repo
-        get() = (instrumentation.targetContext.applicationContext as WhispApp).repository
+    private val graph
+        get() = (instrumentation.targetContext.applicationContext as WhispApp).graph
 
     private fun waitFor(timeoutMs: Long = 10000, condition: () -> Boolean) {
         val end = android.os.SystemClock.elapsedRealtime() + timeoutMs
@@ -79,22 +77,21 @@ class VideoPlaybackIntegrationTest {
     }
 
     private fun seed(portrait: Boolean = false): WorkDetails {
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
-        val folder = File(repo.context.filesDir, "video-fixture").apply { mkdirs() }
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
+        val folder = File(graph.context.filesDir, "video-fixture").apply { mkdirs() }
         val video = File(folder, "01_画面.mp4")
         instrumentation.context.assets
             .open(if (portrait) "video-portrait-example.mp4" else "video-example.mp4")
-            .use { input ->
-                video.outputStream().use { output -> input.copyTo(output) }
-            }
+            .use { input -> video.outputStream().use { output -> input.copyTo(output) } }
         val nextVideo = File(folder, "02_画面续篇.mp4").also { video.copyTo(it, overwrite = true) }
         val caption =
             File(folder, "01_画面.mp4.srt").apply {
                 writeText("1\n00:00:00,000 --> 00:00:40,000\n视频示例字幕\n")
             }
         val wave = SystemMediaIntegrationTest.silentWave(folder)
-        val work = WorkEntity(seedId, null, "视频示例 ${seedId.takeLast(6)}", "视频示例")
         val source = SourceEntity(seedId + "-source", "视频来源", "local", folder.toURI().toString())
+        val work =
+            WorkEntity(seedId, null, "视频示例 ${seedId.takeLast(6)}", "视频示例", sourceId = source.id)
         val indexed =
             LibraryIndexer.index(
                 listOf(video, nextVideo, caption, wave).map { file ->
@@ -102,23 +99,24 @@ class VideoPlaybackIntegrationTest {
                     FileEntry("视频示例/$name", file.toURI().toString(), false, file.length())
                 },
                 source.id,
-                1,
                 work,
             )
         runBlocking {
-            repo.dao.putSource(source)
-            repo.dao.putWorks(indexed.works)
-            repo.dao.putTracks(indexed.tracks)
-            repo.dao.putAttachments(indexed.attachments)
-            repo.dao.putLocations(indexed.locations)
+            graph.library.dao.putSource(source)
+            graph.library.dao.putWorks(indexed.works)
+            graph.library.dao.putTracks(indexed.tracks)
+            graph.library.dao.putAttachments(indexed.attachments)
         }
-        waitFor(5000) { repo.library.value.any { it.work.id == work.id } }
-        return runBlocking { repo.dao.details(work.id)!! }
+        waitFor(5000) { graph.library.works.value.any { it.id == work.id } }
+        return runBlocking { graph.library.dao.details(work.id)!! }
     }
 
     private fun diagnose() {
         val folder =
-            File(repo.context.getExternalFilesDir(null), "video-diagnostics/${testName.methodName}")
+            File(
+                    graph.context.getExternalFilesDir(null),
+                    "video-diagnostics/${testName.methodName}",
+                )
                 .apply { mkdirs() }
         device.dumpWindowHierarchy(File(folder, "ui.xml"))
         instrumentation.uiAutomation.takeScreenshot()?.let { bitmap ->
@@ -127,14 +125,12 @@ class VideoPlaybackIntegrationTest {
             }
             bitmap.recycle()
         }
-        ui.scenario.onActivity { activity ->
-            val model = ViewModelProvider(activity)[AppViewModel::class.java]
-            val p = model.videoPlayer.value
-            File(folder, "state.txt")
-                .writeText(
-                    "${model.player.value}\naudioOnly=${model.audioOnly.value}\nselected=${p?.currentTracks?.isTypeSelected(C.TRACK_TYPE_VIDEO)}\ndisabled=${p?.trackSelectionParameters?.disabledTrackTypes}",
-                )
-        }
+        val playback = graph.playback
+        val p = playback.playerFlow.value
+        File(folder, "state.txt")
+            .writeText(
+                "${playback.state.value}\naudioOnly=${playback.audioOnly.value}\nselected=${p?.currentTracks?.isTypeSelected(C.TRACK_TYPE_VIDEO)}\ndisabled=${p?.trackSelectionParameters?.disabledTrackTypes}",
+            )
     }
 
     private fun assertFrame() {
@@ -144,7 +140,7 @@ class VideoPlaybackIntegrationTest {
             try {
                 val pixel = screenshot.getPixel(bounds.centerX(), bounds.centerY())
                 val folder =
-                    File(repo.context.getExternalFilesDir(null), "video-diagnostics").apply {
+                    File(graph.context.getExternalFilesDir(null), "video-diagnostics").apply {
                         mkdirs()
                     }
                 File(folder, "frame.png").outputStream().use {
@@ -161,7 +157,7 @@ class VideoPlaybackIntegrationTest {
 
     @Test
     fun nfsVideoScanSeekAndOfflineRenderFrames() {
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         val root = InstrumentationRegistry.getArguments().getString("nfsRoot")
         assumeTrue("Provide a dedicated synthetic NFS video fixture", root != null)
         val source =
@@ -172,9 +168,9 @@ class VideoPlaybackIntegrationTest {
                 NfsAddress.parse(root!!, 42).normalized,
             )
         val detail = runBlocking {
-            repo.dao.putSource(source)
-            repo.scan(source.id)
-            repo.dao.details(repo.dao.sourceWorkIds(source.id).single())!!
+            graph.library.dao.putSource(source)
+            graph.sync.scan(source.id)
+            graph.library.dao.details(graph.library.dao.sourceWorkIds(source.id).single())!!
         }
         assertEquals(1, detail.tracks.size)
         val video = detail.tracks.single()
@@ -182,17 +178,17 @@ class VideoPlaybackIntegrationTest {
         assertNotNull(video.subtitleId)
         val future =
             MediaController.Builder(
-                    repo.context,
+                    graph.context,
                     SessionToken(
-                        repo.context,
-                        ComponentName(repo.context, PlaybackService::class.java),
+                        graph.context,
+                        ComponentName(graph.context, PlaybackService::class.java),
                     ),
                 )
                 .buildAsync()
         val controller = future.get(20, TimeUnit.SECONDS)
         try {
             main { controller.volume = 0f }
-            waitFor(5000) { repo.library.value.any { it.work.id == detail.work.id } }
+            waitFor(5000) { graph.library.works.value.any { it.id == detail.work.id } }
             clickDescription(detail.work.title)
             clickText("播放作品")
             waitFor(15000) { main { controller.isPlaying && controller.videoSize.width > 0 } }
@@ -209,18 +205,18 @@ class VideoPlaybackIntegrationTest {
                 }
             }
             assertFrame()
-            runBlocking { repo.offlineStore.downloadWork(detail.work.id) }
+            runBlocking { graph.offline.downloadWork(detail.work.id) }
             waitFor(15000) {
-                repo.downloads.value[video.id]?.state == Download.STATE_COMPLETED
+                graph.media.downloads.value[video.id]?.state == Download.STATE_COMPLETED
             }
             waitFor(15000) {
-                repo.library.value.first { it.work.id == detail.work.id }.work.offlineAttachments
+                graph.library.works.value.first { it.id == detail.work.id }.offlineAttachments
             }
             main { controller.clearMediaItems() }
-            runBlocking { repo.removeSource(source.id) }
-            val saved = runBlocking { repo.dao.details(detail.work.id)!! }
-            assertTrue(repo.offlineStore.isOffline(saved))
-            val item = runBlocking { repo.mediaItem(video, saved.work) }
+            runBlocking { graph.sync.removeSource(source.id) }
+            val saved = runBlocking { graph.library.dao.details(detail.work.id)!! }
+            assertTrue(graph.offline.isOffline(saved))
+            val item = runBlocking { graph.playback.mediaItem(video, saved.work) }
             main {
                 controller.setMediaItem(item)
                 controller.prepare()
@@ -235,8 +231,8 @@ class VideoPlaybackIntegrationTest {
                 MediaController.releaseFuture(future)
             }
             runBlocking {
-                repo.removeSource(source.id)
-                repo.offlineStore.removeOffline(detail.work.id)
+                graph.sync.removeSource(source.id)
+                graph.offline.removeOffline(detail.work.id)
             }
         }
     }
@@ -247,10 +243,10 @@ class VideoPlaybackIntegrationTest {
         val video = detail.tracks.first { it.isVideo }
         val future =
             MediaController.Builder(
-                    repo.context,
+                    graph.context,
                     SessionToken(
-                        repo.context,
-                        ComponentName(repo.context, PlaybackService::class.java),
+                        graph.context,
+                        ComponentName(graph.context, PlaybackService::class.java),
                     ),
                 )
                 .buildAsync()
@@ -318,19 +314,21 @@ class VideoPlaybackIntegrationTest {
                 }
             }
             assertTrue(main { controller.currentPosition >= 15000 })
-            runBlocking { repo.offlineStore.downloadWork(detail.work.id) }
+            runBlocking { graph.offline.downloadWork(detail.work.id) }
             waitFor(15000) {
-                detail.tracks.all { repo.downloads.value[it.id]?.state == Download.STATE_COMPLETED }
+                detail.tracks.all {
+                    graph.media.downloads.value[it.id]?.state == Download.STATE_COMPLETED
+                }
             }
             waitFor(15000) {
-                repo.library.value.first { it.work.id == detail.work.id }.work.offlineAttachments
+                graph.library.works.value.first { it.id == detail.work.id }.offlineAttachments
             }
             main { controller.clearMediaItems() }
-            runBlocking { repo.removeSource(seedId + "-source") }
-            File(repo.context.filesDir, "video-fixture").deleteRecursively()
-            val saved = runBlocking { repo.dao.details(detail.work.id)!! }
-            assertTrue(repo.offlineStore.isOffline(saved))
-            val item = runBlocking { repo.mediaItem(video, saved.work) }
+            runBlocking { graph.sync.removeSource(seedId + "-source") }
+            File(graph.context.filesDir, "video-fixture").deleteRecursively()
+            val saved = runBlocking { graph.library.dao.details(detail.work.id)!! }
+            assertTrue(graph.offline.isOffline(saved))
+            val item = runBlocking { graph.playback.mediaItem(video, saved.work) }
             main {
                 controller.setMediaItem(item)
                 controller.prepare()
@@ -346,8 +344,8 @@ class VideoPlaybackIntegrationTest {
                 MediaController.releaseFuture(future)
             }
             runBlocking {
-                repo.removeSource(seedId + "-source")
-                repo.offlineStore.removeOffline(detail.work.id)
+                graph.sync.removeSource(seedId + "-source")
+                graph.offline.removeOffline(detail.work.id)
             }
         }
     }
@@ -358,20 +356,17 @@ class VideoPlaybackIntegrationTest {
         val video = detail.tracks.first { it.isVideo }
         val future =
             MediaController.Builder(
-                    repo.context,
+                    graph.context,
                     SessionToken(
-                        repo.context,
-                        ComponentName(repo.context, PlaybackService::class.java),
+                        graph.context,
+                        ComponentName(graph.context, PlaybackService::class.java),
                     ),
                 )
                 .buildAsync()
         val controller = future.get(20, TimeUnit.SECONDS)
-        lateinit var model: AppViewModel
+        val playback = graph.playback
         try {
-            main {
-                controller.volume = 0f
-                ui.scenario.onActivity { model = ViewModelProvider(it)[AppViewModel::class.java] }
-            }
+            main { controller.volume = 0f }
             clickDescription(detail.work.title)
             clickText("播放作品")
             waitFor(15000) {
@@ -380,7 +375,7 @@ class VideoPlaybackIntegrationTest {
                         controller.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)
                 }
             }
-            waitFor { model.player.value.videoAspectRatio < 1f }
+            waitFor { playback.state.value.videoAspectRatio < 1f }
             clickDescription("全屏")
             waitFor { visibleDescription("退出全屏") }
             assertTrue(device.displayHeight > device.displayWidth)
@@ -398,7 +393,7 @@ class VideoPlaybackIntegrationTest {
             waitFor(10000) {
                 main { controller.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO) }
             }
-            assertTrue(model.player.value.videoAspectRatio < 1f)
+            assertTrue(playback.state.value.videoAspectRatio < 1f)
             assertTrue(device.displayHeight > device.displayWidth)
             if (!visibleDescription("退出全屏")) clickDescription("视频画面")
             clickDescription("退出全屏")
@@ -406,7 +401,7 @@ class VideoPlaybackIntegrationTest {
             ui.scenario.recreate()
             waitFor { visibleDescription("显示画面") }
             waitFor { !visibleDescription("视频画面") }
-            assertTrue(model.audioOnly.value)
+            assertTrue(playback.audioOnly.value)
             assertEquals(video.id, main { controller.currentMediaItem?.mediaId })
             assertTrue(main { controller.isPlaying && controller.currentPosition >= before })
             assertTrue(
@@ -427,12 +422,12 @@ class VideoPlaybackIntegrationTest {
             waitFor { !visibleDescription("显示画面") }
         } finally {
             main {
-                model.setAudioOnly(false)
+                playback.setAudioOnly(false)
                 controller.pause()
                 controller.clearMediaItems()
                 MediaController.releaseFuture(future)
             }
-            runBlocking { repo.removeSource(seedId + "-source") }
+            runBlocking { graph.sync.removeSource(seedId + "-source") }
         }
     }
 }

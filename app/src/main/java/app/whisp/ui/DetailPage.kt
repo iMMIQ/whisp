@@ -7,7 +7,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -26,6 +25,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -33,50 +33,273 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
+import app.whisp.AppGraph
 import app.whisp.R
 import app.whisp.data.*
-import coil3.compose.AsyncImage
-import java.io.File
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import java.util.LinkedHashMap
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
 
+/** Bounded LRU cache and per-work-part request deduplication for DLsite detail tabs. */
+class DlsiteDetailsLoader(
+    private val scope: CoroutineScope,
+    private val library: LibraryStore,
+    private val defaultClient: DlsiteClient,
+) {
+    companion object {
+        private const val MAX_ENTRIES = 6
+        private const val PRODUCT_TTL_MS = 7L * 24 * 60 * 60 * 1000
+        private const val STATS_TTL_MS = 24L * 60 * 60 * 1000
+
+        fun isFresh(
+            cached: DlsiteDetails?,
+            part: String,
+            now: Long = System.currentTimeMillis(),
+        ): Boolean {
+            if (cached == null) return false
+            return when (part) {
+                "product" ->
+                    cached.completeProduct && now - cached.productFetchedAt < PRODUCT_TTL_MS
+                "description" -> cached.descriptionFetchedAt > 0
+                "statistics" ->
+                    cached.statistics != null && now - cached.statistics.fetchedAt < STATS_TTL_MS
+                else -> false
+            }
+        }
+    }
+
+    val states = MutableStateFlow<Map<String, DlsiteUiState>>(emptyMap())
+    private val cache = LinkedHashMap<String, DlsiteUiState>(MAX_ENTRIES + 1, 0.75f, true)
+    private val activeJobs = mutableMapOf<Pair<String, String>, Job>()
+
+    fun accept(workId: String, details: DlsiteDetails) {
+        val current = cache[workId]
+        val merged = details.preserving(current?.details)
+        put(workId, (current ?: DlsiteUiState()).copy(details = merged))
+    }
+
+    fun load(
+        workId: String,
+        rj: String,
+        part: String = "product",
+        seed: DlsiteDetails? = null,
+        force: Boolean = false,
+        client: DlsiteClient = defaultClient,
+    ) {
+        val key = workId to part
+        if (activeJobs[key]?.isActive == true) return
+        val existing = cache[workId]
+        val baseline = existing?.details ?: seed
+        if (seed != null && existing?.details == null) {
+            put(workId, (existing ?: DlsiteUiState()).copy(details = seed))
+        }
+        if (!force && isFresh(baseline, part)) return
+        put(
+            workId,
+            (cache[workId] ?: DlsiteUiState(baseline)).let {
+                it.copy(loading = it.loading + part, errors = it.errors - part)
+            },
+        )
+        val job =
+            scope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    val stored = library.readDlsiteDetails(workId)
+                    val mergedSeed =
+                        (cache[workId]?.details ?: seed).let { current ->
+                            stored?.preserving(current) ?: current
+                        }
+                    if (!force && isFresh(mergedSeed, part)) {
+                        if (mergedSeed != null && cache.containsKey(workId)) {
+                            put(workId, cache[workId]!!.copy(details = mergedSeed))
+                        }
+                        return@launch
+                    }
+                    val fetched: DlsiteDetails =
+                        withContext(Dispatchers.IO) {
+                            when (part) {
+                                "description" ->
+                                    DlsiteDetails(
+                                        rj = rj,
+                                        description = client.description(rj),
+                                        descriptionFetchedAt = System.currentTimeMillis(),
+                                    )
+                                "statistics" ->
+                                    DlsiteDetails(rj = rj, statistics = client.statistics(rj))
+                                else -> client.work(rj).details
+                            }
+                        }
+                    val combined = fetched.preserving(cache[workId]?.details ?: mergedSeed)
+                    library.saveDlsiteDetails(workId, combined)
+                    val me = currentCoroutineContext()[Job]
+                    if (activeJobs[key] === me && cache.containsKey(workId)) {
+                        put(workId, cache[workId]!!.copy(details = combined))
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    val me = currentCoroutineContext()[Job]
+                    if (activeJobs[key] === me && cache.containsKey(workId)) {
+                        put(
+                            workId,
+                            cache[workId]!!.let {
+                                it.copy(errors = it.errors + (part to (e.message ?: "读取失败")))
+                            },
+                        )
+                    }
+                } finally {
+                    val me = currentCoroutineContext()[Job]
+                    if (activeJobs[key] === me) {
+                        activeJobs.remove(key)
+                        cache[workId]?.let { put(workId, it.copy(loading = it.loading - part)) }
+                    }
+                }
+            }
+        activeJobs[key] = job
+        job.start()
+    }
+
+    private fun put(workId: String, state: DlsiteUiState) {
+        cache[workId] = state
+        while (cache.size > MAX_ENTRIES) {
+            val evicted = cache.entries.iterator().next().key
+            cache.remove(evicted)
+            activeJobs.keys
+                .filter { it.first == evicted }
+                .forEach { key ->
+                    activeJobs.remove(key)?.cancel()
+                }
+        }
+        states.value = cache.toMap()
+    }
+}
+
+sealed interface WorkDetailTarget {
+    data class Library(val workId: String) : WorkDetailTarget
+
+    data class AsmrPreview(val sourceId: String, val asmrId: Long) : WorkDetailTarget
+}
+
+/** Unified detail screen handling both indexed library works and unsaved ASMR.ONE previews. */
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-internal fun DetailPage(
-    detail: WorkDetails,
-    model: AppViewModel,
+internal fun WorkDetailScreen(
+    graph: AppGraph,
+    target: WorkDetailTarget,
     back: () -> Unit,
     player: () -> Unit,
     filter: ((AsmrFacet) -> Unit)? = null,
 ) {
+    val isPreview = target is WorkDetailTarget.AsmrPreview
+    val libraryWorkId =
+        when (target) {
+            is WorkDetailTarget.Library -> target.workId
+            is WorkDetailTarget.AsmrPreview -> stableId("asmr.one|work|${target.asmrId}")
+        }
+    val storedDetail by
+        remember(libraryWorkId) { graph.library.observeDetails(libraryWorkId) }
+            .collectAsStateWithLifecycle(initialValue = null)
+
+    var preview by remember(target) { mutableStateOf<AsmrPreview?>(null) }
+    var previewLoading by remember(target) { mutableStateOf(isPreview) }
+    var previewError by remember(target) { mutableStateOf<String?>(null) }
+    var savingPreview by remember(target) { mutableStateOf(false) }
+    var previewReload by remember(target) { mutableIntStateOf(0) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(target, previewReload) {
+        if (target is WorkDetailTarget.AsmrPreview) {
+            previewLoading = true
+            previewError = null
+            try {
+                preview = graph.sync.previewAsmrWork(target.sourceId, target.asmrId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                previewError = e.message ?: "读取作品失败"
+            } finally {
+                previewLoading = false
+            }
+        }
+    }
+
+    val effectiveDetail: WorkDetails? =
+        storedDetail
+            ?: preview?.let {
+                WorkDetails(
+                    it.indexed.works.single(),
+                    it.indexed.tracks,
+                    it.indexed.attachments,
+                )
+            }
+
+    if (effectiveDetail == null) {
+        Box(
+            Modifier.fillMaxSize()
+                .then(if (isPreview) Modifier.testTag("asmr-preview") else Modifier),
+            contentAlignment = Alignment.Center,
+        ) {
+            Box(Modifier.align(Alignment.TopStart).padding(8.dp)) {
+                IconAction(
+                    Icons.AutoMirrored.Outlined.ArrowBack,
+                    if (isPreview) "返回检索" else stringResource(R.string.action_back_library),
+                    action = back,
+                )
+            }
+            when {
+                previewLoading -> CircularProgressIndicator()
+                previewError != null ->
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(previewError!!, color = Muted)
+                        TextButton(onClick = { previewReload++ }) { Text("重试") }
+                    }
+            }
+        }
+        return
+    }
+
+    val detail = effectiveDetail
+    val inLibrary = storedDetail != null
     var tab by rememberSaveable(detail.work.id) { mutableStateOf("曲目") }
-    val official = rememberDlsiteWork(model, detail.work.id, detail.work.rj, tab)
     var information by rememberSaveable(detail.work.id) { mutableStateOf(false) }
     var attachment by remember { mutableStateOf<AttachmentEntity?>(null) }
-    val playback by model.player.collectAsStateWithLifecycle()
-    val history by model.progress.collectAsStateWithLifecycle()
-    // Observe only this work's offline readiness instead of recomposing on every unrelated download
-    // tick.
+
+    val dlsiteStates by graph.dlsiteLoader.states.collectAsStateWithLifecycle()
+    val storedDlsite by
+        remember(detail.work.id) { graph.library.dlsiteDetails(detail.work.id) }
+            .collectAsStateWithLifecycle(initialValue = null)
+    val seedDetails = preview?.metadata
+    LaunchedEffect(detail.work.id, storedDlsite) {
+        storedDlsite?.let { graph.dlsiteLoader.accept(detail.work.id, it) }
+    }
+    LaunchedEffect(detail.work.id, detail.work.rj, seedDetails) {
+        detail.work.rj?.let { rj ->
+            graph.dlsiteLoader.load(detail.work.id, rj, seed = seedDetails)
+        }
+    }
+    LaunchedEffect(detail.work.id, detail.work.rj, tab, seedDetails) {
+        val rj = detail.work.rj ?: return@LaunchedEffect
+        if (tab == "介绍") graph.dlsiteLoader.load(detail.work.id, rj, "description", seedDetails)
+        if (tab == "资料") graph.dlsiteLoader.load(detail.work.id, rj, "statistics", seedDetails)
+    }
+    val official = dlsiteStates[detail.work.id] ?: DlsiteUiState(seedDetails)
+
+    val playback by graph.playback.state.collectAsStateWithLifecycle()
+    val history by graph.library.progress.collectAsStateWithLifecycle()
     val offline by
         remember(detail.work.id, detail.work.offlineAttachments, detail.tracks) {
-                model.downloads
+                graph.media.downloads
                     .map { states ->
                         detail.work.offlineAttachments &&
                             detail.tracks.all { states[it.id]?.state == Download.STATE_COMPLETED }
                     }
                     .distinctUntilChanged()
             }
-            .collectAsStateWithLifecycle(
-                initialValue = model.repository.offlineStore.isOffline(detail),
-            )
+            .collectAsStateWithLifecycle(initialValue = graph.offline.isOffline(detail))
+
     val sections = remember(detail.tracks) { TrackSections.groups(detail.tracks) }
     val remembered =
         remember(history, detail.work.id) { history.firstOrNull { it.workId == detail.work.id } }
-    val resume = remembered != null
+    val resume = inLibrary && remembered != null
     val finished =
         if (detail.tracks.any { it.id == playback.trackId }) playback.ended
         else
@@ -94,14 +317,54 @@ internal fun DetailPage(
                 .filter { it.kind !in setOf("script", "subtitle", "cover") }
                 .sortedBy { it.relativePath }
         }
-    LazyColumn(Modifier.fillMaxSize()) {
+
+    val coverImage: WhispImage? =
+        remember(detail.work.coverId, detail.work.coverUrl, target, inLibrary) {
+            val coverId = detail.work.coverId ?: return@remember null
+            if (
+                !inLibrary && detail.work.coverUrl != null && target is WorkDetailTarget.AsmrPreview
+            ) {
+                WhispImage.Official(coverId, detail.work.coverUrl)
+            } else {
+                WhispImage.Asset(coverId)
+            }
+        }
+
+    fun commitPreview(playAfter: Boolean = false, trackId: String? = null) {
+        val currentPreview = preview ?: return
+        if (savingPreview) return
+        savingPreview = true
+        scope.launch {
+            try {
+                val mergedMetadata =
+                    official.details?.preserving(currentPreview.metadata) ?: currentPreview.metadata
+                val savedId =
+                    graph.sync.addAsmrPreview(currentPreview.copy(metadata = mergedMetadata))
+                if (playAfter) {
+                    graph.library.workDetails(savedId)?.let { saved ->
+                        graph.playback.playWork(saved, trackId)
+                        player()
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                graph.messages.tryEmit(e.message ?: "保存作品失败")
+            } finally {
+                savingPreview = false
+            }
+        }
+    }
+
+    LazyColumn(
+        Modifier.fillMaxSize().then(if (isPreview) Modifier.testTag("asmr-preview") else Modifier),
+    ) {
         item {
             Box(Modifier.fillMaxWidth().aspectRatio(.92f).background(Surface)) {
                 Artwork(
-                    model,
-                    detail.work.coverId,
-                    detail.work.title,
-                    Modifier.matchParentSize(),
+                    image = coverImage,
+                    description = detail.work.title,
+                    modifier = Modifier.matchParentSize(),
                     sharedKey = detail.work.id,
                 )
                 Box(
@@ -119,33 +382,40 @@ internal fun DetailPage(
                     ) {
                         IconAction(
                             Icons.AutoMirrored.Outlined.ArrowBack,
-                            stringResource(R.string.action_back_library),
+                            if (isPreview) "返回检索" else stringResource(R.string.action_back_library),
                             action = back,
                         )
-                        Row {
-                            IconAction(
-                                if (detail.work.favorite) Icons.Outlined.Favorite
-                                else Icons.Outlined.FavoriteBorder,
-                                stringResource(R.string.action_favorite),
-                                if (detail.work.favorite) Rose else Cream,
-                                enabled = true,
-                                feedback = true,
-                            ) {
-                                model.favorite(detail.work.id)
-                            }
-                            IconAction(
-                                if (offline) Icons.Outlined.DownloadDone
-                                else Icons.Outlined.Download,
-                                stringResource(R.string.action_download),
-                                if (offline) Rose else Cream,
-                            ) {
-                                model.download(detail.work.id)
-                            }
-                            IconAction(
-                                Icons.Outlined.MoreHoriz,
-                                stringResource(R.string.action_work_info),
-                            ) {
-                                information = true
+                        if (inLibrary) {
+                            Row {
+                                IconAction(
+                                    if (detail.work.favorite) Icons.Outlined.Favorite
+                                    else Icons.Outlined.FavoriteBorder,
+                                    stringResource(R.string.action_favorite),
+                                    if (detail.work.favorite) Rose else Cream,
+                                    enabled = true,
+                                    feedback = true,
+                                ) {
+                                    scope.launch { graph.library.toggleFavorite(detail.work.id) }
+                                }
+                                IconAction(
+                                    if (offline) Icons.Outlined.DownloadDone
+                                    else Icons.Outlined.Download,
+                                    stringResource(R.string.action_download),
+                                    if (offline) Rose else Cream,
+                                ) {
+                                    scope.launch {
+                                        runCatching { graph.offline.downloadWork(detail.work.id) }
+                                            .onFailure {
+                                                graph.messages.tryEmit(it.message ?: "下载失败")
+                                            }
+                                    }
+                                }
+                                IconAction(
+                                    Icons.Outlined.MoreHoriz,
+                                    stringResource(R.string.action_work_info),
+                                ) {
+                                    information = true
+                                }
                             }
                         }
                     }
@@ -160,42 +430,56 @@ internal fun DetailPage(
                         fontSize = 32.sp,
                         lineHeight = 40.sp,
                     )
-                    if (detail.work.artist.isNotBlank())
+                    if (detail.work.artist.isNotBlank()) {
                         Text(
                             detail.work.artist,
                             color = Muted,
                             modifier = Modifier.padding(top = 6.dp),
                             fontSize = 14.sp,
                         )
+                    }
                 }
             }
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Button(
-                    onClick = {
-                        model.playWork(detail, restart = finished)
-                        player()
-                    },
-                    modifier = Modifier.weight(1f).height(52.dp),
-                    shape = RoundedCornerShape(17.dp),
-                ) {
-                    Icon(Icons.Filled.PlayArrow, null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        when {
-                            finished -> stringResource(R.string.action_replay_work)
-                            resume -> stringResource(R.string.action_resume_work)
-                            else -> stringResource(R.string.action_play_work)
+                if (inLibrary) {
+                    Button(
+                        onClick = {
+                            graph.playback.playWork(detail, restart = finished)
+                            player()
                         },
-                        fontSize = 16.sp,
-                    )
-                }
-                Spacer(Modifier.width(10.dp))
-                IconAction(Icons.Outlined.Shuffle, stringResource(R.string.action_shuffle)) {
-                    model.playWork(detail, shuffle = true)
-                    player()
+                        modifier = Modifier.weight(1f).height(52.dp),
+                        shape = RoundedCornerShape(17.dp),
+                    ) {
+                        Icon(Icons.Filled.PlayArrow, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            when {
+                                finished -> stringResource(R.string.action_replay_work)
+                                resume -> stringResource(R.string.action_resume_work)
+                                else -> stringResource(R.string.action_play_work)
+                            },
+                            fontSize = 16.sp,
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    IconAction(Icons.Outlined.Shuffle, stringResource(R.string.action_shuffle)) {
+                        graph.playback.playWork(detail, shuffle = true)
+                        player()
+                    }
+                } else {
+                    Button(
+                        onClick = { commitPreview(playAfter = false) },
+                        enabled = !savingPreview,
+                        modifier = Modifier.weight(1f).height(52.dp),
+                        shape = RoundedCornerShape(17.dp),
+                    ) {
+                        Icon(Icons.Outlined.Add, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(if (savingPreview) "加入中" else "加入作品库", fontSize = 16.sp)
+                    }
                 }
             }
             OfficialCircle(official.details, filter)
@@ -204,7 +488,7 @@ internal fun DetailPage(
         when (tab) {
             "曲目" ->
                 sections.forEach { section ->
-                    if (sections.size > 1)
+                    if (sections.size > 1) {
                         item(key = "section:${section.key}") {
                             Row(
                                 Modifier.fillMaxWidth()
@@ -218,26 +502,49 @@ internal fun DetailPage(
                                     modifier = Modifier.weight(1f),
                                 )
                                 IconAction(Icons.Outlined.PlayArrow, "播放${section.title}", Rose) {
-                                    model.playWork(
-                                        detail,
-                                        section.tracks.first().id,
-                                        startPosition = 0,
-                                    )
-                                    player()
+                                    if (inLibrary) {
+                                        graph.playback.playWork(
+                                            detail,
+                                            section.tracks.first().id,
+                                            startPosition = 0,
+                                        )
+                                        player()
+                                    } else {
+                                        commitPreview(
+                                            playAfter = true,
+                                            trackId = section.tracks.first().id,
+                                        )
+                                    }
                                 }
                             }
                         }
+                    }
                     items(section.tracks, key = { it.id }) { track ->
                         TrackRow(track, playback.trackId == track.id) {
-                            model.playWork(detail, track.id)
-                            player()
+                            if (inLibrary) {
+                                graph.playback.playWork(detail, track.id)
+                                player()
+                            } else {
+                                commitPreview(playAfter = true, trackId = track.id)
+                            }
                         }
                     }
                 }
             else -> {
-                dlsiteContent(tab, official, model, detail.work.id, detail.work.rj, filter = filter)
-                if (tab == "资料") {
-                    if (scripts.isNotEmpty())
+                dlsiteContent(
+                    tab = tab,
+                    state = official,
+                    rj = detail.work.rj,
+                    onLoad = { part, force ->
+                        detail.work.rj?.let { rj ->
+                            graph.dlsiteLoader.load(detail.work.id, rj, part, seedDetails, force)
+                        }
+                    },
+                    seed = seedDetails,
+                    filter = filter,
+                )
+                if (tab == "资料" && inLibrary) {
+                    if (scripts.isNotEmpty()) {
                         item(key = "header-scripts") {
                             Text(
                                 "台本",
@@ -246,10 +553,11 @@ internal fun DetailPage(
                                 fontFamily = FontFamily.Serif,
                             )
                         }
+                    }
                     items(scripts, key = { it.id }) {
                         ResourceRow(it.title, Icons.Outlined.Description) { attachment = it }
                     }
-                    if (extras.isNotEmpty())
+                    if (extras.isNotEmpty()) {
                         item(key = "header-extras") {
                             Text(
                                 "附赠",
@@ -258,6 +566,7 @@ internal fun DetailPage(
                                 fontFamily = FontFamily.Serif,
                             )
                         }
+                    }
                     items(extras, key = { it.id }) {
                         ResourceRow(
                             it.title,
@@ -272,8 +581,10 @@ internal fun DetailPage(
         }
         item(key = "detail-footer") { Spacer(Modifier.height(24.dp)) }
     }
-    if (information) InfoDialog(detail, model, onRemoved = back) { information = false }
-    attachment?.let { AttachmentDialog(it, model) { attachment = null } }
+    if (information && inLibrary) {
+        InfoDialog(detail, graph, onRemoved = back) { information = false }
+    }
+    attachment?.let { AttachmentDialog(it, graph) { attachment = null } }
 }
 
 @Composable
@@ -293,23 +604,22 @@ private fun ResourceRow(title: String, icon: ImageVector, click: () -> Unit) {
 @Composable
 private fun AttachmentDialog(
     attachment: AttachmentEntity,
-    model: AppViewModel,
+    graph: AppGraph,
     dismiss: () -> Unit,
 ) {
-    val settings by model.settings.collectAsStateWithLifecycle()
+    val settings by graph.settings.settings.collectAsStateWithLifecycle()
     var encoding by remember(attachment.id) { mutableStateOf(settings.textEncoding) }
     var rawBytes by remember(attachment.id) { mutableStateOf<ByteArray?>(null) }
     var text by remember(attachment.id) { mutableStateOf<String?>(null) }
-    var image by remember(attachment.id) { mutableStateOf<File?>(null) }
-    var loading by remember(attachment.id) { mutableStateOf(true) }
+    var loading by remember(attachment.id) { mutableStateOf(attachment.kind != "image") }
     LaunchedEffect(attachment.id) {
+        if (attachment.kind == "image") return@LaunchedEffect
         try {
-            if (attachment.kind == "image") image = model.repository.previewImage(attachment.id)
-            else rawBytes = model.repository.readAsset(attachment.id, 64 * 1024 * 1024)
+            rawBytes = graph.library.readAsset(attachment.id, 64 * 1024 * 1024)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            model.error.value = e.message
+            graph.messages.tryEmit(e.message ?: "附件不可读")
             dismiss()
         } finally {
             loading = false
@@ -319,40 +629,27 @@ private fun AttachmentDialog(
         val bytes = rawBytes ?: return@LaunchedEffect
         text = withContext(Dispatchers.Default) { TextEncoding.decode(bytes, encoding) }
     }
-    WhispSheet(onDismissRequest = dismiss) {
+    WhispSheet(onDismissRequest = dismiss) { _ ->
         Text(
             attachment.title,
             fontSize = 20.sp,
             modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
         )
         if (rawBytes != null) {
-            LazyRow(
-                contentPadding = PaddingValues(horizontal = 24.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(TextEncoding.supported, key = { it }) { candidate ->
-                    FilterChip(
-                        selected = encoding == candidate,
-                        onClick = { encoding = candidate },
-                        label = {
-                            Text(
-                                if (candidate == TextEncoding.AUTO)
-                                    stringResource(R.string.label_encoding_auto)
-                                else candidate,
-                                fontSize = 12.sp,
-                            )
-                        },
-                    )
-                }
-            }
+            EncodingChips(
+                selected = encoding,
+                onSelect = { encoding = it },
+                horizontalPadding = 24.dp,
+            )
         }
         if (loading) CircularProgressIndicator(Modifier.padding(32.dp))
-        image?.let {
-            AsyncImage(
-                it,
-                attachment.title,
-                Modifier.fillMaxWidth().heightIn(max = 600.dp).padding(16.dp),
-                contentScale = ContentScale.Fit,
+        if (attachment.kind == "image") {
+            Artwork(
+                image = WhispImage.Asset(attachment.id),
+                description = attachment.title,
+                modifier =
+                    Modifier.fillMaxWidth().heightIn(min = 240.dp, max = 600.dp).padding(16.dp),
+                scale = ContentScale.Fit,
             )
         }
         text?.let {
@@ -374,7 +671,7 @@ private fun AttachmentDialog(
 @Composable
 private fun InfoDialog(
     detail: WorkDetails,
-    model: AppViewModel,
+    graph: AppGraph,
     onRemoved: () -> Unit,
     dismiss: () -> Unit,
 ) {
@@ -385,7 +682,12 @@ private fun InfoDialog(
     val scope = rememberCoroutineScope()
     val cover =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            uri?.let { model.action { model.repository.offlineStore.setCover(detail.work, it) } }
+            uri?.let {
+                scope.launch {
+                    runCatching { graph.offline.setCover(detail.work, it) }
+                        .onFailure { err -> graph.messages.tryEmit(err.message ?: "更换封面失败") }
+                }
+            }
         }
     if (confirmingRemoval) {
         AlertDialog(
@@ -400,13 +702,13 @@ private fun InfoDialog(
                         loading = true
                         scope.launch {
                             try {
-                                model.removeAsmrWork(detail)
+                                graph.sync.removeOnlineWork(detail.work.id)
                                 dismiss()
                                 onRemoved()
                             } catch (e: CancellationException) {
                                 throw e
                             } catch (e: Exception) {
-                                model.error.value = e.message ?: "删除失败"
+                                graph.messages.tryEmit(e.message ?: "删除失败")
                             } finally {
                                 loading = false
                             }
@@ -433,18 +735,18 @@ private fun InfoDialog(
                 OutlinedTextField(title, { title = it }, label = { Text("作品名") })
                 OutlinedTextField(artist, { artist = it }, label = { Text("声优") })
                 TextButton(onClick = { cover.launch(arrayOf("image/*")) }) { Text("更换封面") }
-                if (detail.work.rj != null)
+                if (detail.work.rj != null) {
                     TextButton(
                         enabled = !loading,
                         onClick = {
                             loading = true
                             scope.launch {
                                 try {
-                                    model.repository.updateDlsiteMetadata(detail.work.id)
+                                    graph.sync.updateDlsiteMetadata(detail.work.id)
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {
-                                    model.error.value = e.message ?: "元数据更新失败"
+                                    graph.messages.tryEmit(e.message ?: "元数据更新失败")
                                 } finally {
                                     loading = false
                                 }
@@ -453,22 +755,26 @@ private fun InfoDialog(
                     ) {
                         Text(if (loading) "读取中" else "更新 DLsite 元数据")
                     }
-                if (isAsmrOneWork(detail.work) || detail.work.origin == "dlsite")
+                }
+                if (detail.work.isRemovableOnline) {
                     TextButton(enabled = !loading, onClick = { confirmingRemoval = true }) {
                         Text("删除作品", color = Rose)
                     }
+                }
                 detail.work.rj?.let { Text(it, color = Muted) }
             }
         },
         confirmButton = {
             TextButton(
                 onClick = {
-                    model.action {
-                        model.repository.editWorkIdentity(
-                            detail.work.id,
-                            title.ifBlank { detail.work.title },
-                            artist,
-                        )
+                    scope.launch {
+                        runCatching {
+                            graph.library.editWorkIdentity(
+                                detail.work.id,
+                                title.ifBlank { detail.work.title },
+                                artist,
+                            )
+                        }
                     }
                     dismiss()
                 },

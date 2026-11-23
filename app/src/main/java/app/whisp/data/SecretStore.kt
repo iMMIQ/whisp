@@ -16,6 +16,10 @@ class SecretStoreException(message: String, cause: Throwable? = null) : IOExcept
 
 class SecretStore {
     private val alias = "whisp-source-credentials"
+    private val cache =
+        object : LinkedHashMap<String, String>(32, 0.75f, true) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 32
+        }
 
     @Synchronized
     private fun key(): SecretKey {
@@ -74,5 +78,16 @@ class SecretStore {
         } catch (e: GeneralSecurityException) {
             throw SecretStoreException("来源凭据已失效，请重新配置或登录", e)
         }
+    }
+
+    /** Key carries the ciphertext so password rotations never return stale entries. */
+    fun decryptCached(source: SourceEntity): String =
+        synchronized(cache) {
+            cache.getOrPut("${source.id}|${source.secret}") { decrypt(source.secret) }
+        }
+
+    fun evict(sourceId: String) {
+        val prefix = "$sourceId|"
+        synchronized(cache) { cache.keys.removeAll { it.startsWith(prefix) } }
     }
 }

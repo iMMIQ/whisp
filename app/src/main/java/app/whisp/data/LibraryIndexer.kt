@@ -15,7 +15,6 @@ data class IndexedLibrary(
     val works: List<WorkEntity>,
     val tracks: List<TrackEntity>,
     val attachments: List<AttachmentEntity>,
-    val locations: List<LocationEntity>,
 )
 
 fun stableId(value: String): String = value.encodeUtf8().sha256().substring(0, 16).hex()
@@ -72,10 +71,8 @@ object LibraryIndexer {
     fun index(
         files: List<FileEntry>,
         sourceId: String,
-        generation: Long,
         workOverride: WorkEntity? = null,
     ): IndexedLibrary {
-        // Determine each file's work once, instead of walking every path again for every work.
         val fileGroups =
             files.filterNot { it.directory }.groupBy { workOverride?.rj ?: rootOf(it.path) }
         val groups =
@@ -87,14 +84,12 @@ object LibraryIndexer {
         val works = mutableListOf<WorkEntity>()
         val tracks = mutableListOf<TrackEntity>()
         val attachments = mutableListOf<AttachmentEntity>()
-        val locations = mutableListOf<LocationEntity>()
         groups.toSortedMap().forEach { (root, group) ->
             val name = root.basename().ifBlank { "未命名作品" }
             val rj = rjPattern.find(name)?.value?.uppercase()
-            val mediaSignature =
-                group.map { "${it.path.removePrefix("$root/")}:${it.size}" }.sorted()
-            val workId =
-                workOverride?.id ?: stableId("${rj ?: name}|${mediaSignature.joinToString("|")}")
+            // Per-source directory identity stays stable automatically when tracks are
+            // added/removed.
+            val workId = workOverride?.id ?: stableId("$sourceId|$root")
             val inWork = fileGroups.getValue(root)
             val resourceFiles = inWork.filter {
                 it.path.extension() !in MediaFormats.playable &&
@@ -114,12 +109,14 @@ object LibraryIndexer {
                         else -> "document"
                     }
                 AttachmentEntity(
-                    stableId("$workId|$relative"),
-                    workId,
-                    trackTitle(fileName),
-                    fileName,
-                    relative,
-                    kind,
+                    id = stableId("$workId|$relative"),
+                    workId = workId,
+                    title = trackTitle(fileName),
+                    fileName = fileName,
+                    relativePath = relative,
+                    kind = kind,
+                    uri = file.uri,
+                    size = file.size,
                 )
             }
             val cover =
@@ -149,25 +146,20 @@ object LibraryIndexer {
                     ?.takeUnless { rjPattern.containsMatchIn(it) }
                     ?.replace(seriesFrame, "")
             works +=
-                workOverride?.copy(coverId = workOverride.coverId ?: cover)
-                    ?: WorkEntity(workId, rj, title, name, series = series, coverId = cover)
-            fun addLocation(file: FileEntry, id: String) {
-                locations +=
-                    LocationEntity(
-                        stableId("$sourceId|$id|${file.uri}"),
-                        id,
-                        sourceId,
-                        file.uri,
-                        file.size,
-                        file.modified,
-                        generation,
+                workOverride?.copy(
+                    coverId = workOverride.coverId ?: cover,
+                    sourceId = workOverride.sourceId ?: sourceId,
+                )
+                    ?: WorkEntity(
+                        id = workId,
+                        rj = rj,
+                        title = title,
+                        originalTitle = name,
+                        series = series,
+                        coverId = cover,
+                        sourceId = sourceId,
                     )
-            }
-            resources.forEach { (file, attachment) ->
-                attachments += attachment
-                addLocation(file, attachment.id)
-            }
-            // Index companion resources by normalized stem once (O(T + R) instead of O(T * R)).
+            attachments += resources.values
             val resourcesByStem =
                 resources.entries.groupBy { stem(it.key.path.basename()).lowercase() }
             group
@@ -176,7 +168,6 @@ object LibraryIndexer {
                     val fileName = file.path.basename()
                     val relative = file.path.removePrefix("$root/")
                     val sameName = resourcesByStem[stem(fileName).lowercase()].orEmpty()
-                    // Exact stem wins; script folders sometimes prefix the work's code.
                     fun match(kind: String) =
                         sameName
                             .filter { it.value.kind == kind }
@@ -207,22 +198,22 @@ object LibraryIndexer {
                             )
                             ?.value
                             ?.id
-                    val track =
+                    tracks +=
                         TrackEntity(
-                            stableId("$workId|$relative"),
-                            workId,
-                            trackTitle(fileName),
-                            fileName,
-                            relative,
-                            number(fileName),
+                            id = stableId("$workId|$relative"),
+                            workId = workId,
+                            title = trackTitle(fileName),
+                            fileName = fileName,
+                            relativePath = relative,
+                            order = number(fileName),
                             subtitleId = subtitle,
                             scriptId = match("script"),
                             bonus = bonusPattern.containsMatchIn(relative),
+                            uri = file.uri,
+                            size = file.size,
                         )
-                    tracks += track
-                    addLocation(file, track.id)
                 }
         }
-        return IndexedLibrary(works, tracks, attachments, locations)
+        return IndexedLibrary(works, tracks, attachments)
     }
 }

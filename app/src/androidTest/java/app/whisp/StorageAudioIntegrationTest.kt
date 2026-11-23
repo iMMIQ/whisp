@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp
 
-import android.net.Uri
+import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -25,8 +25,8 @@ class StorageAudioIntegrationTest {
     @Test
     fun clearingCommittedAudioCachePreservesPlaybackPauseResumeAndSeek() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val repo = (instrumentation.targetContext.applicationContext as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        val graph = (instrumentation.targetContext.applicationContext as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         val args = InstrumentationRegistry.getArguments()
         val path =
             String(
@@ -40,16 +40,15 @@ class StorageAudioIntegrationTest {
                 "smb",
                 SmbAddress.parse(requireNotNull(args.getString("smbRoot"))).normalized,
                 requireNotNull(args.getString("smbUser")),
-                repo.secrets.encrypt(requireNotNull(args.getString("smbPassword"))),
+                graph.secrets.encrypt(requireNotNull(args.getString("smbPassword"))),
             )
         runBlocking {
-            repo.dao.putSource(source)
-            repo.storageUsage()
+            graph.library.dao.putSource(source)
+            graph.images.storageUsage()
         }
         val uri = SmbAddress.assetUri(source.id, path)
         val key = "cache-audio-track"
-        // Commit a real span before playback; clearing an empty cache would prove little.
-        val data = repo.playbackFactory.createDataSource()
+        val data = graph.media.playbackFactory.createDataSource()
         var cached = 0L
         try {
             data.open(DataSpec.Builder().setUri(uri).setKey(key).setLength(MIB).build())
@@ -61,23 +60,23 @@ class StorageAudioIntegrationTest {
             }
             assertTrue(
                 "Storage includes files still being written",
-                runBlocking { repo.storageUsage().streaming } >= MIB / 2,
+                runBlocking { graph.images.storageUsage().streaming } >= MIB / 2,
             )
         } finally {
             data.close()
         }
         assertEquals(MIB, cached)
-        assertTrue(runBlocking { repo.storageUsage().streaming } >= MIB)
+        assertTrue(runBlocking { graph.images.storageUsage().streaming } >= MIB)
         lateinit var player: ExoPlayer
         instrumentation.runOnMainSync {
             player =
-                ExoPlayer.Builder(repo.context)
-                    .setMediaSourceFactory(DefaultMediaSourceFactory(repo.playbackFactory))
+                ExoPlayer.Builder(graph.context)
+                    .setMediaSourceFactory(DefaultMediaSourceFactory(graph.media.playbackFactory))
                     .build()
             player.setAudioAttributes(AudioAttributes.DEFAULT, false)
             player.volume = 0f
             player.setMediaItem(
-                MediaItem.Builder().setUri(Uri.parse(uri)).setCustomCacheKey(key).build(),
+                MediaItem.Builder().setUri(uri.toUri()).setCustomCacheKey(key).build(),
             )
             player.prepare()
             player.play()
@@ -102,8 +101,8 @@ class StorageAudioIntegrationTest {
             var before = 0L
             instrumentation.runOnMainSync { before = player.currentPosition }
             runBlocking {
-                repo.clearTemporaryCache()
-                repo.setSettings(streamingCacheMiB = 64)
+                graph.images.clearCaches(graph.media::clearStreamingCache)
+                graph.settings.update { it.copy(streamingCacheMiB = 64) }
             }
             waitFor("playback after clear") {
                 player.isPlaying && player.currentPosition > before + 700

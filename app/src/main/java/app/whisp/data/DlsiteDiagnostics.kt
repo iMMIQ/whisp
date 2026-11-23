@@ -7,7 +7,8 @@ import android.os.Build
 import androidx.core.content.FileProvider
 import androidx.core.content.edit
 import java.io.File
-import kotlinx.serialization.json.*
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 
 enum class DlsitePhase {
     AUTHORIZE,
@@ -18,27 +19,34 @@ enum class DlsitePhase {
     OTHER,
 }
 
+@Serializable
 data class DlsiteRequestEvent(val phase: DlsitePhase, val status: Int, val elapsedMs: Long)
+
+@Serializable
+private data class DlsiteDiagnosticReport(
+    val schema: Int,
+    val androidSdk: Int,
+    val version: String?,
+    val requests: List<DlsiteRequestEvent>,
+)
 
 /** Only fixed phases, HTTP status codes and timings enter the diagnostic report. */
 class DlsiteDiagnostics(private val context: Context) {
     private val preferences =
         context.getSharedPreferences("dlsite-diagnostics", Context.MODE_PRIVATE)
+    private val json = Json { ignoreUnknownKeys = true }
+
+    private fun readEvents(): List<DlsiteRequestEvent> = runCatching {
+        json.decodeFromString<List<DlsiteRequestEvent>>(
+            preferences.getString("events", "[]")!!,
+        )
+    }
+        .getOrDefault(emptyList())
 
     @Synchronized
     fun record(event: DlsiteRequestEvent) {
-        val previous = runCatching {
-            Json.parseToJsonElement(preferences.getString("events", "[]")!!).jsonArray
-        }
-            .getOrDefault(JsonArray(emptyList()))
-        val next =
-            previous.takeLast(63) +
-                buildJsonObject {
-                    put("phase", event.phase.name)
-                    put("status", event.status)
-                    put("elapsedMs", event.elapsedMs)
-                }
-        preferences.edit { putString("events", JsonArray(next).toString()) }
+        val next = readEvents().takeLast(63) + event
+        preferences.edit { putString("events", json.encodeToString(next)) }
     }
 
     @Synchronized
@@ -48,21 +56,16 @@ class DlsiteDiagnostics(private val context: Context) {
 
     @Synchronized
     fun shareIntent(): Intent {
-        val events = runCatching {
-            Json.parseToJsonElement(preferences.getString("events", "[]")!!)
-        }
-            .getOrDefault(JsonArray(emptyList()))
-        val report = buildJsonObject {
-            put("schema", 1)
-            put("androidSdk", Build.VERSION.SDK_INT)
-            put(
-                "version",
-                context.packageManager.getPackageInfo(context.packageName, 0).versionName,
+        val report =
+            DlsiteDiagnosticReport(
+                schema = 1,
+                androidSdk = Build.VERSION.SDK_INT,
+                version = context.packageManager.getPackageInfo(context.packageName, 0).versionName,
+                requests = readEvents(),
             )
-            put("requests", events)
-        }
         val directory = File(context.cacheDir, "diagnostics").apply { mkdirs() }
-        val file = File(directory, "whisp-dlsite.json").apply { writeText(report.toString()) }
+        val file =
+            File(directory, "whisp-dlsite.json").apply { writeText(json.encodeToString(report)) }
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.diagnostics", file)
         return Intent(Intent.ACTION_SEND)
             .setType("application/json")

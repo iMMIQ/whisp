@@ -39,29 +39,30 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.compose.PlayerSurface
 import androidx.media3.ui.compose.modifiers.resizeWithContentScale
+import app.whisp.playback.PlaybackCoordinator
 import kotlinx.coroutines.delay
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 internal fun VideoOutput(
-    model: AppViewModel,
+    playback: PlaybackCoordinator,
     trackId: String,
     active: Boolean,
     playing: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    val player by model.videoPlayer.collectAsStateWithLifecycle()
-    val state by model.player.collectAsStateWithLifecycle()
+    val player by playback.playerFlow.collectAsStateWithLifecycle()
+    val state by playback.state.collectAsStateWithLifecycle()
     val view = LocalView.current
     var resumed by remember { mutableStateOf(false) }
     val owner = remember { Any() }
     val attached = if (active) player else null
-    LifecycleResumeEffect(model, attached) {
+    LifecycleResumeEffect(playback, attached) {
         resumed = true
-        model.videoVisibility(owner, attached != null)
+        playback.videoVisibility(owner, attached != null)
         onPauseOrDispose {
             resumed = false
-            model.videoVisibility(owner, false)
+            playback.videoVisibility(owner, false)
         }
     }
     DisposableEffect(view, resumed, playing) {
@@ -86,7 +87,7 @@ internal fun VideoOutput(
 
 @Composable
 internal fun FullScreenVideo(
-    model: AppViewModel,
+    playback: PlaybackCoordinator,
     trackId: String,
     title: String,
     state: PlaybackState,
@@ -137,7 +138,7 @@ internal fun FullScreenVideo(
         }
     }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        VideoOutput(model, trackId, active, state.playing, Modifier.matchParentSize())
+        VideoOutput(playback, trackId, active, state.playing, Modifier.matchParentSize())
         Box(
             Modifier.matchParentSize()
                 .semantics { contentDescription = "视频画面" }
@@ -171,7 +172,7 @@ internal fun FullScreenVideo(
                     overflow = TextOverflow.Ellipsis,
                 )
                 IconAction(Icons.Outlined.Headphones, "只听声音") {
-                    model.setAudioOnly(true)
+                    playback.setAudioOnly(true)
                     exit()
                 }
             }
@@ -185,7 +186,7 @@ internal fun FullScreenVideo(
                 .displayCutoutPadding(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (caption.isNotBlank())
+            if (caption.isNotBlank()) {
                 Text(
                     caption,
                     Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
@@ -194,6 +195,7 @@ internal fun FullScreenVideo(
                     maxLines = 4,
                     overflow = TextOverflow.Ellipsis,
                 )
+            }
             AnimatedVisibility(
                 controls || !state.playing,
                 enter = fadeIn(tween(if (reduced) 0 else 120)),
@@ -207,7 +209,7 @@ internal fun FullScreenVideo(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         IconAction(Icons.Outlined.Replay10, "后退十秒", enabled = active) {
-                            model.skip(-10000)
+                            playback.skip(-10_000)
                             interaction++
                         }
                         IconAction(
@@ -216,11 +218,11 @@ internal fun FullScreenVideo(
                             Rose,
                             enabled = active,
                         ) {
-                            model.togglePlay()
+                            playback.togglePlay()
                             interaction++
                         }
                         IconAction(Icons.Outlined.Forward10, "前进十秒", enabled = active) {
-                            model.skip(10000)
+                            playback.skip(10_000)
                             interaction++
                         }
                     }

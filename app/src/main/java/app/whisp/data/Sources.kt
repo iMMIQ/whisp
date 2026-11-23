@@ -9,12 +9,7 @@ import java.io.IOException
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import javax.xml.parsers.DocumentBuilderFactory
-import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.Credentials
 import okhttp3.HttpUrl
@@ -30,44 +25,58 @@ class LocalDirectory(private val context: Context) {
             val tree = root.toUri()
             val rootId = DocumentsContract.getTreeDocumentId(tree)
             val files = mutableListOf<FileEntry>()
-            val pending = ArrayDeque<Pair<String, String>>()
-            pending.add(rootId to "")
             val seen = mutableSetOf<String>()
-            while (pending.isNotEmpty()) {
-                coroutineContext.ensureActive()
-                val (id, prefix) = pending.removeFirst()
-                check(seen.size < 100_000) { "目录过大" }
-                if (!seen.add(id)) continue
-                val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, id)
-                val projection =
-                    arrayOf(
-                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                        DocumentsContract.Document.COLUMN_MIME_TYPE,
-                        DocumentsContract.Document.COLUMN_SIZE,
-                        DocumentsContract.Document.COLUMN_LAST_MODIFIED,
-                    )
-                val cursor =
-                    context.contentResolver.query(children, projection, null, null, null)
-                        ?: throw IOException("无法读取目录")
-                cursor.use {
-                    while (it.moveToNext()) {
-                        val docId = it.getString(0)
-                        val name = it.getString(1)
-                        val path = if (prefix.isBlank()) name else "$prefix/$name"
-                        val directory = it.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR
-                        files +=
-                            FileEntry(
-                                path,
-                                DocumentsContract.buildDocumentUriUsingTree(tree, docId).toString(),
-                                directory,
-                                if (it.isNull(3)) 0 else it.getLong(3),
-                                if (it.isNull(4)) 0 else it.getLong(4),
-                            )
-                        if (directory) pending.add(docId to path)
+            val projection =
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_SIZE,
+                    DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+                )
+            walkTree(
+                root = rootId to "",
+                concurrency = 1,
+                listBatch = { batch ->
+                    batch.mapNotNull { node ->
+                        val (id, _) = node
+                        check(seen.size < 100_000) { "目录过大" }
+                        if (!seen.add(id)) return@mapNotNull null
+                        val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, id)
+                        val rows = mutableListOf<Pair<String, FileEntry>>()
+                        val cursor =
+                            context.contentResolver.query(children, projection, null, null, null)
+                                ?: throw IOException("无法读取目录")
+                        cursor.use {
+                            while (it.moveToNext()) {
+                                val docId = it.getString(0)
+                                val name = it.getString(1)
+                                val path =
+                                    if (node.second.isBlank()) name else "${node.second}/$name"
+                                val directory =
+                                    it.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR
+                                rows +=
+                                    docId to
+                                        FileEntry(
+                                            path,
+                                            DocumentsContract.buildDocumentUriUsingTree(tree, docId)
+                                                .toString(),
+                                            directory,
+                                            if (it.isNull(3)) 0 else it.getLong(3),
+                                            if (it.isNull(4)) 0 else it.getLong(4),
+                                        )
+                            }
+                        }
+                        node to rows
                     }
-                }
-            }
+                },
+                onDirectory = { _, rows, enqueue ->
+                    for ((docId, entry) in rows) {
+                        files += entry
+                        if (entry.directory) enqueue(docId to entry.path)
+                    }
+                },
+            )
             files
         }
 }
@@ -198,74 +207,63 @@ class WebDavClient(private val http: OkHttpClient) {
     suspend fun walk(source: SourceEntity, password: String): List<FileEntry> =
         withContext(Dispatchers.IO) {
             val root = (source.root.trimEnd('/') + "/").toHttpUrl()
-            var pending = listOf(root)
             val seen = mutableSetOf<String>()
             val files = mutableListOf<FileEntry>()
             val rootDepth = root.pathSegments.dropLastWhile { it.isEmpty() }.size
-            while (pending.isNotEmpty()) {
-                val nextLevel = mutableListOf<HttpUrl>()
-                val uniqueBatch =
-                    pending
-                        .filter { seen.add(it.toString().trimEnd('/')) }
-                        .also {
-                            check(seen.size < 10_000 && files.size < 100_000) { "目录过大" }
-                        }
-                // Match SMB/NFS concurrency: up to 4 parallel PROPFIND calls preserve order and cap
-                // load.
-                for (batch in uniqueBatch.chunked(4)) {
-                    coroutineContext.ensureActive()
-                    val responses = coroutineScope {
+            walkTree(
+                root = root,
+                concurrency = 4,
+                listBatch = { batch ->
+                    val unique =
                         batch
-                            .map { directory ->
-                                async(Dispatchers.IO) {
-                                    directory to
-                                        parse(
-                                            http.onlineBytes(
-                                                listRequest(directory, source, password),
-                                                8 * 1024 * 1024,
-                                            ),
-                                            directory,
-                                        )
-                                }
+                            .filter { seen.add(it.toString().trimEnd('/')) }
+                            .also {
+                                check(seen.size < 10_000 && files.size < 100_000) { "目录过大" }
                             }
-                            .awaitAll()
+                    parallelList(unique) { _, directory ->
+                        parse(
+                            http.onlineBytes(
+                                listRequest(directory, source, password),
+                                8 * 1024 * 1024,
+                            ),
+                            directory,
+                        )
                     }
-                    for ((directory, entries) in responses) {
-                        coroutineContext.ensureActive()
-                        entries.forEach { entry ->
-                            if (!insideRoot(entry.url, root)) return@forEach
-                            if (
-                                entry.url.encodedPath.trimEnd('/') ==
-                                    directory.encodedPath.trimEnd('/')
+                },
+                onDirectory = { directory, entries, enqueue ->
+                    entries.forEach { entry ->
+                        if (!insideRoot(entry.url, root)) return@forEach
+                        if (
+                            entry.url.encodedPath.trimEnd('/') == directory.encodedPath.trimEnd('/')
+                        )
+                            return@forEach
+                        val path =
+                            entry.url.pathSegments
+                                .drop(rootDepth)
+                                .filter { it.isNotEmpty() }
+                                .joinToString("/")
+                        if (path.isBlank() || path.split('/').any { it == ".." }) return@forEach
+                        files +=
+                            FileEntry(
+                                path,
+                                entry.url.toString(),
+                                entry.directory,
+                                entry.size,
+                                entry.modified,
                             )
-                                return@forEach
-                            val relativeSegments = entry.url.pathSegments.drop(rootDepth)
-                            val path = relativeSegments.filter { it.isNotEmpty() }.joinToString("/")
-                            if (path.isBlank() || path.split('/').any { it == ".." }) return@forEach
-                            files +=
-                                FileEntry(
-                                    path,
-                                    entry.url.toString(),
-                                    entry.directory,
-                                    entry.size,
-                                    entry.modified,
-                                )
-                            check(files.size < 100_000) { "目录过大" }
-                            if (entry.directory)
-                                nextLevel.add(
-                                    entry.url
-                                        .newBuilder()
-                                        .apply {
-                                            if (!entry.url.encodedPath.endsWith('/'))
-                                                addPathSegment("")
-                                        }
-                                        .build(),
-                                )
-                        }
+                        check(files.size < 100_000) { "目录过大" }
+                        if (entry.directory)
+                            enqueue(
+                                entry.url
+                                    .newBuilder()
+                                    .apply {
+                                        if (!entry.url.encodedPath.endsWith('/')) addPathSegment("")
+                                    }
+                                    .build(),
+                            )
                     }
-                }
-                pending = nextLevel
-            }
+                },
+            )
             files.distinctBy { it.uri }
         }
 
@@ -280,44 +278,7 @@ class WebDavClient(private val http: OkHttpClient) {
         val request = authorize(Request.Builder().url(url), source, password).build()
         http.newCall(request).execute().use { response ->
             if (!response.isSuccessful) throw IOException("文件读取失败（${response.code}）")
-            val stream = response.body.byteStream()
-            return boundedRead(stream, limit)
-        }
-    }
-
-    fun range(
-        url: String,
-        source: SourceEntity,
-        password: String,
-        offset: Long,
-        length: Int,
-    ): ByteArray {
-        val root = (source.root.trimEnd('/') + "/").toHttpUrl()
-        require(insideRoot(url.toHttpUrl(), root))
-        val request =
-            authorize(
-                    Request.Builder()
-                        .url(url)
-                        .header("Range", "bytes=$offset-${offset + length - 1}"),
-                    source,
-                    password,
-                )
-                .build()
-        http.newCall(request).execute().use { response ->
-            require(response.code == 206 || response.code == 200 && offset == 0L) { "服务器不支持分段读取" }
-            if (response.code == 206)
-                require(response.header("Content-Range")?.startsWith("bytes $offset-") == true) {
-                    "分段响应不正确"
-                }
-            val stream = response.body.byteStream()
-            val output = java.io.ByteArrayOutputStream()
-            val buffer = ByteArray(minOf(8192, length))
-            while (output.size() < length) {
-                val count = stream.read(buffer, 0, minOf(buffer.size, length - output.size()))
-                if (count < 0) break
-                output.write(buffer, 0, count)
-            }
-            return output.toByteArray()
+            return boundedRead(response.body.byteStream(), limit)
         }
     }
 }

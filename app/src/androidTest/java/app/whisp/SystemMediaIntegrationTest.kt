@@ -34,8 +34,8 @@ class SystemMediaIntegrationTest {
     private val context
         get() = instrumentation.targetContext
 
-    private val repo
-        get() = (context.applicationContext as WhispApp).repository
+    private val graph
+        get() = (context.applicationContext as WhispApp).graph
 
     private fun <T> main(block: () -> T): T {
         var result: T? = null
@@ -55,19 +55,24 @@ class SystemMediaIntegrationTest {
 
     private fun seed(remote: Boolean): List<TrackEntity> {
         assertTrue(context.packageName.endsWith(".smoketest"))
+        val wave = silentWave(context.filesDir)
         val tracks =
             (1..2).map {
+                val relativePath = "audio/$it.wav"
                 TrackEntity(
                     "system-$it",
                     "system-work",
                     "Track $it",
                     "$it.wav",
-                    "audio/$it.wav",
+                    relativePath,
                     it,
                     40000,
+                    uri =
+                        if (remote) SmbAddress.assetUri("system-source", relativePath)
+                        else wave.toURI().toString(),
+                    size = wave.length(),
                 )
             }
-        val wave = silentWave(context.filesDir)
         val cover =
             File(context.filesDir, "custom-artwork/system-cover").apply { parentFile!!.mkdirs() }
         Bitmap.createBitmap(48, 48, Bitmap.Config.ARGB_8888).also { bitmap ->
@@ -76,20 +81,10 @@ class SystemMediaIntegrationTest {
             bitmap.recycle()
         }
         runBlocking {
-            repo.setSettings(hide = false, hideRecents = false, touchFeedback = true)
-            repo.dao.putWorks(
-                listOf(
-                    WorkEntity(
-                        "system-work",
-                        null,
-                        "System test",
-                        "System test",
-                        coverId = "system-cover",
-                    ),
-                ),
-            )
-            repo.dao.putTracks(tracks)
-            repo.dao.putSource(
+            graph.settings.update {
+                it.copy(hideArtwork = false, hideRecents = false, touchFeedback = true)
+            }
+            graph.library.dao.putSource(
                 SourceEntity(
                     "system-source",
                     "System",
@@ -97,19 +92,20 @@ class SystemMediaIntegrationTest {
                     if (remote) "smb://203.0.113.1/data/" else wave.parentFile!!.toURI().toString(),
                 ),
             )
-            repo.dao.putLocations(
-                tracks.map {
-                    LocationEntity(
-                        "system-location-${it.id}",
-                        it.id,
-                        "system-source",
-                        if (remote) SmbAddress.assetUri("system-source", it.relativePath)
-                        else wave.toURI().toString(),
-                        wave.length(),
-                    )
-                },
+            graph.library.dao.putWorks(
+                listOf(
+                    WorkEntity(
+                        "system-work",
+                        null,
+                        "System test",
+                        "System test",
+                        coverId = "system-cover",
+                        sourceId = "system-source",
+                    ),
+                ),
             )
-            repo.dao.saveProgress(ProgressEntity("system-work", tracks[1].id, 12345))
+            graph.library.dao.putTracks(tracks)
+            graph.library.dao.saveProgress(ProgressEntity("system-work", tracks[1].id, 12345))
         }
         return tracks
     }
@@ -200,10 +196,8 @@ class SystemMediaIntegrationTest {
                     "SystemUI must receive readable artwork",
                     legacyItem.description.iconBitmap,
                 )
-                // Platform MediaBrowser does not register Media3 subscriptions. A new load
-                // reads the updated preference; the OS controls when a historical card reloads.
                 main { legacy.unsubscribe(rootId) }
-                runBlocking { repo.setSettings(hide = true) }
+                runBlocking { graph.settings.update { it.copy(hideArtwork = true) } }
                 main {
                     legacy.subscribe(
                         rootId,
@@ -233,7 +227,7 @@ class SystemMediaIntegrationTest {
                 main { legacy.disconnect() }
             }
 
-            runBlocking { repo.setSettings(hide = true) }
+            runBlocking { graph.settings.update { it.copy(hideArtwork = true) } }
             val hidden =
                 main { browser.getChildren(root.value!!.mediaId, 0, 10, params) }
                     .get(10, TimeUnit.SECONDS)
@@ -312,7 +306,7 @@ class SystemMediaIntegrationTest {
             waitFor("Loop must be enabled") {
                 browser.sessionExtras.getLong("loopStart", -1) == 10000L
             }
-            runBlocking { repo.setSettings(hide = true) }
+            runBlocking { graph.settings.update { it.copy(hideArtwork = true) } }
             waitFor("Privacy must update with no Activity") {
                 browser.mediaMetadata.title.toString() == "正在收听"
             }
@@ -323,11 +317,10 @@ class SystemMediaIntegrationTest {
                 assertEquals(2, browser.mediaItemCount)
                 assertNull(browser.mediaMetadata.artworkUri)
             }
-            runBlocking { repo.setSettings(hide = false) }
+            runBlocking { graph.settings.update { it.copy(hideArtwork = false) } }
             waitFor("Visible metadata must be restored") {
                 browser.mediaMetadata.title.toString() == "Track 2"
             }
-            // Library clients can also request a playable item by ID only.
             main {
                 browser.setMediaItem(MediaItem.Builder().setMediaId(tracks[0].id).build())
                 browser.prepare()

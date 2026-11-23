@@ -22,7 +22,6 @@ class LibraryIndexerTest {
                     file("独立视频/01_示例.webm"),
                 ),
                 "source",
-                1,
             )
         assertEquals(2, indexed.works.size)
         assertEquals(4, indexed.tracks.size)
@@ -48,7 +47,7 @@ class LibraryIndexerTest {
                     row.getValue("size").jsonPrimitive.long,
                 )
             }
-        val result = LibraryIndexer.index(entries, "phone", 1)
+        val result = LibraryIndexer.index(entries, "phone")
         assertEquals(1, result.works.size)
         assertEquals(8, result.tracks.size)
         assertEquals((0..7).toList(), result.tracks.map { it.order })
@@ -71,7 +70,6 @@ class LibraryIndexerTest {
                     file("$wrapped/omake/z32_封面.jpg"),
                 ),
                 "nas",
-                1,
             )
         assertEquals(1, result.works.size)
         assertEquals("RJ00000002", result.works.single().rj)
@@ -87,25 +85,25 @@ class LibraryIndexerTest {
     }
 
     @Test
-    fun sameWorkAcrossSourcesKeepsIdentityAndSeparateLocations() {
+    fun sameWorkAcrossSourcesKeepsDistinctSourceOwnershipAndEmbeddedUris() {
         val paths = listOf("RJ00000001 测试作品/mp3/03_测试音轨.mp3", "RJ00000001 测试作品/mp3/03_测试音轨.mp3.vtt")
-        val local = LibraryIndexer.index(paths.map { file(it) }, "phone", 1)
+        val local = LibraryIndexer.index(paths.map { file(it) }, "phone")
         val remote =
             LibraryIndexer.index(
                 paths.map { file(it).copy(uri = "https://nas.example/$it") },
                 "nas",
-                2,
             )
-        assertEquals(local.works.single().id, remote.works.single().id)
-        assertEquals(local.tracks.single().id, remote.tracks.single().id)
-        assertNotEquals(local.locations.first().id, remote.locations.first().id)
+        assertNotEquals(local.works.single().id, remote.works.single().id)
+        assertEquals("phone", local.works.single().sourceId)
+        assertEquals("nas", remote.works.single().sourceId)
+        assertEquals("content://test/${paths.first()}", local.tracks.single().uri)
+        assertEquals("https://nas.example/${paths.first()}", remote.tracks.single().uri)
     }
 
     @Test
     fun differentEditionIsNotMergedJustBecauseRjMatches() {
-        val first = LibraryIndexer.index(listOf(file("RJ00000001 中文/mp3/01_示例音轨.mp3", 100)), "a", 1)
-        val second =
-            LibraryIndexer.index(listOf(file("RJ00000001 日本語/mp3/01_示例音轨.mp3", 200)), "a", 1)
+        val first = LibraryIndexer.index(listOf(file("RJ00000001 中文/mp3/01_示例音轨.mp3", 100)), "a")
+        val second = LibraryIndexer.index(listOf(file("RJ00000001 日本語/mp3/01_示例音轨.mp3", 200)), "a")
         assertNotEquals(first.works.single().id, second.works.single().id)
     }
 
@@ -118,7 +116,6 @@ class LibraryIndexerTest {
                     file("RJ00000001 包/RJ00000002 别的作品/01_正篇.mp3"),
                 ),
                 "a",
-                1,
             )
         assertEquals(2, indexed.works.size)
         assertEquals(setOf("RJ00000001", "RJ00000002"), indexed.works.map { it.rj }.toSet())
@@ -136,7 +133,6 @@ class LibraryIndexerTest {
                     file("RJ00000001 测试作品/附赠1/封面_介绍.jpg"),
                 ),
                 "a",
-                1,
             )
         assertEquals(1, indexed.tracks.size)
         assertTrue(indexed.tracks.single().bonus)
@@ -157,7 +153,6 @@ class LibraryIndexerTest {
                     file("RJ00000001 Example/mp3/01_Intro.lrc"),
                 ),
                 "source",
-                1,
             )
         val captions = indexed.attachments.associateBy { it.id }
         for (track in indexed.tracks) {
@@ -177,7 +172,6 @@ class LibraryIndexerTest {
                     file("RJ00000001 Example/01_INTRO.MP3.VTT"),
                 ),
                 "source",
-                1,
             )
         assertEquals(indexed.attachments.single().id, indexed.tracks.single().subtitleId)
         assertEquals("INTRO", indexed.attachments.single().title)

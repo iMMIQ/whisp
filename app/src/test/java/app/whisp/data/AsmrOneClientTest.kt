@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.data
 
-import androidx.paging.PagingConfig
-import androidx.paging.PagingSource
-import androidx.paging.PagingState
+import app.whisp.ui.AsmrCatalogController
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import mockwebserver3.MockResponse
 import org.junit.Assert.*
 import org.junit.Test
@@ -31,7 +30,7 @@ class AsmrOneClientTest {
             )
             val result =
                 AsmrOneClient(okhttp3.OkHttpClient(), server.url("/"))
-                    .index(AsmrWork(1, "示例作品", "RJ00000001", "", null), "source", 1)
+                    .index(AsmrWork(1, "示例作品", "RJ00000001", "", null), "source")
             assertEquals(2, result.tracks.size)
             val video = result.tracks.first()
             assertTrue(video.isVideo)
@@ -43,7 +42,7 @@ class AsmrOneClientTest {
     }
 
     @Test
-    fun sharedUrlsKeepEachAssetsLocationAcrossWorks() {
+    fun sharedUrlsKeepDistinctTrackIdsAndEmbeddedUrisAcrossWorks() {
         val result =
             LibraryIndexer.index(
                 listOf(
@@ -67,13 +66,9 @@ class AsmrOneClientTest {
                     ),
                 ),
                 "source",
-                1,
             )
-        assertEquals(3, result.locations.map { it.id }.distinct().size)
-        assertEquals(
-            result.tracks.map { it.id }.toSet(),
-            result.locations.map { it.assetId }.toSet(),
-        )
+        assertEquals(3, result.tracks.map { it.id }.distinct().size)
+        assertTrue(result.tracks.all { it.uri == "https://media.example/shared.wav" })
     }
 
     @Test
@@ -126,8 +121,8 @@ class AsmrOneClientTest {
             server.enqueue(response(tree.replace("revision=1", "revision=2")))
             val client = AsmrOneClient(okhttp3.OkHttpClient(), server.url("/"))
             val info = AsmrWork(1, "示例作品", "RJ00000001", "示例声优", "https://media.example/cover.jpg")
-            val first = client.index(info, "source", 1)
-            val refreshed = client.index(info.copy(title = "更新标题"), "source", 2)
+            val first = client.index(info, "source")
+            val refreshed = client.index(info.copy(title = "更新标题"), "source")
             assertEquals(1, first.works.size)
             assertEquals(info.workId, first.works.single().id)
             assertEquals(3, first.tracks.size)
@@ -141,7 +136,7 @@ class AsmrOneClientTest {
                 info.coverId,
                 first.attachments.single { it.relativePath == "_asmr-cover/main.jpg" }.id,
             )
-            assertTrue(refreshed.locations.any { it.uri.endsWith("revision=2") })
+            assertTrue(refreshed.tracks.any { it.uri.endsWith("revision=2") })
         }
     }
 
@@ -159,12 +154,12 @@ class AsmrOneClientTest {
             )
             val result =
                 AsmrOneClient(okhttp3.OkHttpClient(), server.url("/"))
-                    .index(AsmrWork(1, "示例作品", "RJ00000001", "", null), "source", 1)
+                    .index(AsmrWork(1, "示例作品", "RJ00000001", "", null), "source")
             assertEquals(
                 listOf("01. 示例.wav", "02_示例.ver2.mp3", "03_示例.FLAC"),
                 result.tracks.map { it.relativePath },
             )
-            assertEquals(3, result.locations.size)
+            assertEquals(3, result.tracks.count { it.uri.isNotBlank() })
         }
     }
 
@@ -186,30 +181,32 @@ class AsmrOneClientTest {
     }
 
     @Test
-    fun httpErrorsRemainRetryableAndEmptyFinalPagesStopPagination() = runBlocking {
+    fun catalogControllerRetriesErrorsAppendsPagesAndDeduplicates() = runBlocking {
         withMockServer { server ->
             server.enqueue(MockResponse.Builder().code(503).body("unavailable").build())
-            server.enqueue(response("""{"works":[],"pagination":{"totalCount":40}}"""))
+            server.enqueue(response("""{"works":[$work],"pagination":{"totalCount":21}}"""))
+            server.enqueue(
+                response(
+                    """{"works":[${work.replace("\"id\":1", "\"id\":2").replace("RJ00000001", "RJ00000002")}],"pagination":{"totalCount":21}}""",
+                ),
+            )
             val client = AsmrOneClient(okhttp3.OkHttpClient(), server.url("/"))
-            val source = AsmrPagingSource { client.catalog(it) }
-            val params = PagingSource.LoadParams.Refresh<Int>(null, 20, false)
-            assertTrue(source.load(params) is PagingSource.LoadResult.Error)
-            val page = source.load(params) as PagingSource.LoadResult.Page
-            assertNull(page.nextKey)
-            assertTrue(page.data.isEmpty())
+            val controller =
+                AsmrCatalogController(
+                    scope = this,
+                    fetchPage = { _, page -> client.catalog(page) },
+                )
+            controller.submit(AsmrQuery("source"))
+            val failed = controller.state.first { !it.refreshing && it.refreshError != null }
+            assertTrue(failed.items.isEmpty())
+            controller.refresh()
+            val page1 = controller.state.first { !it.refreshing && it.items.size == 1 }
+            assertTrue(page1.hasMore)
+            controller.loadNextPage()
+            val page2 = controller.state.first { !it.appending && it.items.size == 2 }
+            assertFalse(page2.hasMore)
+            assertEquals(listOf(1L, 2L), page2.items.map { it.id })
         }
-    }
-
-    @Test
-    fun pagingKeysRefreshAtTheVisiblePage() = runBlocking {
-        val info = AsmrWork(1, "示例作品", "RJ00000001", "", null)
-        val source = AsmrPagingSource { AsmrPage(listOf(info), it < 3) }
-        val page =
-            source.load(PagingSource.LoadParams.Refresh(2, 20, false))
-                as PagingSource.LoadResult.Page
-        assertEquals(1, page.prevKey)
-        assertEquals(3, page.nextKey)
-        assertEquals(2, source.getRefreshKey(PagingState(listOf(page), 0, PagingConfig(20), 0)))
     }
 
     @Test

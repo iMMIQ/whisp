@@ -46,15 +46,15 @@ class SourceNavigationIntegrationTest {
 
     @Test
     fun openSourceDialogTracksUpdatesAndSurvivesRecreation() {
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         val source =
             SourceEntity("source-ui-probe", "示例来源", "local", "content://example/tree/audio")
-        runBlocking { repo.dao.putSource(source) }
-        ui.waitUntil(5000) { repo.sources.value.any { it.id == source.id } }
+        runBlocking { graph.library.dao.putSource(source) }
+        ui.waitUntil(5000) { graph.library.sourceList.value.any { it.id == source.id } }
         ui.onNodeWithText("来源").performClick()
         ui.onNodeWithText("示例来源").performClick()
-        runBlocking { repo.dao.putSource(source.copy(error = "示例扫描失败")) }
+        runBlocking { graph.library.dao.putSource(source.copy(error = "示例扫描失败")) }
         ui.waitUntil(5000) {
             ui.onAllNodesWithText("示例扫描失败").fetchSemanticsNodes().isNotEmpty()
         }
@@ -63,13 +63,13 @@ class SourceNavigationIntegrationTest {
         ui.onNodeWithText("示例扫描失败").assertIsDisplayed()
         UiDevice.getInstance(InstrumentationRegistry.getInstrumentation()).pressBack()
         ui.onNodeWithText("示例扫描失败").assertDoesNotExist()
-        runBlocking { repo.dao.deleteSource(source.id) }
+        runBlocking { graph.library.dao.deleteSource(source.id) }
     }
 
     @Test
     fun workEditsSurviveMetadataUpdatesAndRecreationAndPreserveOtherFields() {
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         val work =
             WorkEntity(
                 "work-editor-probe",
@@ -79,8 +79,8 @@ class SourceNavigationIntegrationTest {
                 artist = "示例声优",
                 offlineAttachments = true,
             )
-        runBlocking { repo.dao.putWorks(listOf(work)) }
-        ui.waitUntil(5000) { repo.library.value.any { it.work.id == work.id } }
+        runBlocking { graph.library.dao.putWorks(listOf(work)) }
+        ui.waitUntil(5000) { graph.library.works.value.any { it.id == work.id } }
         ui.onNodeWithContentDescription("示例作品").performClick()
         ui.onNodeWithContentDescription("作品信息").performClick()
         ui.onNode(hasSetTextAction() and hasText("示例作品")).performTextReplacement("我的标题")
@@ -93,8 +93,8 @@ class SourceNavigationIntegrationTest {
                 series = "最新系列",
                 originalTitle = "更新后的原始标题",
             )
-        runBlocking { repo.dao.putWorks(listOf(fresh)) }
-        ui.waitUntil(5000) { repo.library.value.any { it.work == fresh } }
+        runBlocking { graph.library.dao.putWorks(listOf(fresh)) }
+        ui.waitUntil(5000) { graph.library.works.value.any { it == fresh } }
         ui.waitForIdle()
         ui.onNode(hasSetTextAction() and hasText("我的标题")).assertExists()
         ui.onNode(hasSetTextAction() and hasText("我的声优")).assertExists()
@@ -102,10 +102,13 @@ class SourceNavigationIntegrationTest {
         ui.onNode(hasSetTextAction() and hasText("我的标题")).assertIsDisplayed()
         ui.onNode(hasSetTextAction() and hasText("我的声优")).assertIsDisplayed()
         ui.onNodeWithText("保存").performClick()
-        ui.waitUntil(5000) { runBlocking { repo.dao.work(work.id)?.title == "我的标题" } }
+        ui.waitUntil(5000) { runBlocking { graph.library.dao.work(work.id)?.title == "我的标题" } }
         runBlocking {
-            assertEquals(fresh.copy(title = "我的标题", artist = "我的声优"), repo.dao.work(work.id))
-            repo.dao.deleteWork(work.id)
+            assertEquals(
+                fresh.copy(title = "我的标题", artist = "我的声优"),
+                graph.library.dao.work(work.id),
+            )
+            graph.library.dao.deleteWork(work.id)
         }
     }
 }

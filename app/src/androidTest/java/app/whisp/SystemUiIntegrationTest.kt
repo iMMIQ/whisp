@@ -40,8 +40,8 @@ class SystemUiIntegrationTest {
 
     @Test
     fun predictiveCancelOutputPickerAndPrivateRecentsSurviveRecreation() {
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         val device = UiDevice.getInstance(instrumentation)
         fun foreground() {
             instrumentation.runOnMainSync {
@@ -49,9 +49,8 @@ class SystemUiIntegrationTest {
                     ui.activity.getSystemService(android.app.ActivityManager::class.java).appTasks
                 tasks.first { it.taskInfo?.taskId == ui.activity.taskId }.moveToFront()
             }
-            assertTrue(device.wait(Until.hasObject(By.pkg(repo.context.packageName)), 5000))
+            assertTrue(device.wait(Until.hasObject(By.pkg(graph.context.packageName)), 5000))
         }
-        // Old isolated test tasks can retain their own thumbnails; remove only those tasks.
         instrumentation.runOnMainSync {
             ui.activity
                 .getSystemService(android.app.ActivityManager::class.java)
@@ -62,40 +61,50 @@ class SystemUiIntegrationTest {
         foreground()
         val green = Color.rgb(24, 228, 71)
         val cover =
-            File(repo.context.filesDir, "custom-artwork/ui-cover").apply { parentFile!!.mkdirs() }
+            File(graph.context.filesDir, "custom-artwork/ui-cover").apply { parentFile!!.mkdirs() }
         Bitmap.createBitmap(48, 48, Bitmap.Config.ARGB_8888).also { bitmap ->
             bitmap.eraseColor(green)
             cover.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
             bitmap.recycle()
         }
-        val wave = SystemMediaIntegrationTest.silentWave(repo.context.filesDir)
-        val work = WorkEntity("ui-work", null, "UI test", "UI test", coverId = "ui-cover")
-        val track = TrackEntity("ui-track", work.id, "UI track", "1.wav", "1.wav", 1, 40000)
-        runBlocking {
-            repo.setSettings(
-                hide = false,
-                hideRecents = false,
-                touchFeedback = true,
-                reduceMotion = false,
+        val wave = SystemMediaIntegrationTest.silentWave(graph.context.filesDir)
+        val work =
+            WorkEntity(
+                "ui-work",
+                null,
+                "UI test",
+                "UI test",
+                coverId = "ui-cover",
+                sourceId = "ui-source",
             )
-            repo.dao.putWorks(listOf(work))
-            repo.dao.putTracks(listOf(track))
-            repo.dao.putSource(
+        val track =
+            TrackEntity(
+                "ui-track",
+                work.id,
+                "UI track",
+                "1.wav",
+                "1.wav",
+                1,
+                40000,
+                uri = wave.toURI().toString(),
+                size = wave.length(),
+            )
+        runBlocking {
+            graph.settings.update {
+                it.copy(
+                    hideArtwork = false,
+                    hideRecents = false,
+                    touchFeedback = true,
+                    reduceMotion = false,
+                )
+            }
+            graph.library.dao.putSource(
                 SourceEntity("ui-source", "UI", "local", wave.parentFile!!.toURI().toString()),
             )
-            repo.dao.putLocations(
-                listOf(
-                    LocationEntity(
-                        "ui-location",
-                        track.id,
-                        "ui-source",
-                        wave.toURI().toString(),
-                        wave.length(),
-                    ),
-                ),
-            )
+            graph.library.dao.putWorks(listOf(work))
+            graph.library.dao.putTracks(listOf(track))
         }
-        ui.waitUntil(15000) { repo.library.value.any { it.work.id == work.id } }
+        ui.waitUntil(15000) { graph.library.works.value.any { it.id == work.id } }
         ui.onNodeWithContentDescription("UI test").performClick()
         val original = ui.onNodeWithContentDescription("UI test").fetchSemanticsNode().boundsInRoot
         instrumentation.runOnMainSync {
@@ -131,23 +140,22 @@ class SystemUiIntegrationTest {
             ui.activity.onBackPressedDispatcher.onBackPressed()
         }
         ui.onNodeWithTag("library-grid").assertIsDisplayed()
-        // At the root no custom handler consumes Android's back-to-home gesture.
         instrumentation.runOnMainSync {
             assertFalse(ui.activity.onBackPressedDispatcher.hasEnabledCallbacks())
         }
 
         val future =
             MediaController.Builder(
-                    repo.context,
+                    graph.context,
                     SessionToken(
-                        repo.context,
-                        ComponentName(repo.context, PlaybackService::class.java),
+                        graph.context,
+                        ComponentName(graph.context, PlaybackService::class.java),
                     ),
                 )
                 .buildAsync()
         val controller = future.get(15, TimeUnit.SECONDS)
         try {
-            val item = runBlocking { repo.mediaItem(track, work) }
+            val item = runBlocking { graph.playback.mediaItem(track, work) }
             instrumentation.runOnMainSync {
                 controller.volume = 0f
                 controller.setMediaItem(item)
@@ -166,8 +174,6 @@ class SystemUiIntegrationTest {
             val testLaunchIntent = Intent(ui.activity.intent)
             instrumentation.runOnMainSync { requireNotNull(controller.sessionActivity).send() }
             ui.onNodeWithTag("subtitle-pane").assertIsDisplayed()
-            // ActivityScenario matches lifecycle by its launch Intent, unlike a real task.
-            // Restore that test-only filter after checking the actual notification PendingIntent.
             instrumentation.runOnMainSync { ui.activity.intent = testLaunchIntent }
             ui.onNodeWithContentDescription("更多播放操作").performClick()
             ui.onNodeWithText("音频输出").performClick()
@@ -193,8 +199,6 @@ class SystemUiIntegrationTest {
                 device.pressRecentApps()
                 device.waitForIdle()
                 Thread.sleep(700)
-                // Samsung initially centers the previous task, leaving the current app at
-                // the right edge. Center this isolated app's card before sampling its image.
                 val cardSelector =
                     By.res("com.sec.android.app.launcher", "taskView").descContains("Whisp")
                 repeat(3) {
@@ -228,7 +232,6 @@ class SystemUiIntegrationTest {
                 val pixels = IntArray(width * height)
                 screenshot.getPixels(pixels, 0, width, bounds.left, bounds.top, width, height)
                 screenshot.recycle()
-                // Recents can dim thumbnails; compare the flat cover's hue rather than exact RGB.
                 val count = pixels.count {
                     Color.green(it) > 100 &&
                         Color.green(it) > 3 * Color.red(it) &&
@@ -252,7 +255,8 @@ class SystemUiIntegrationTest {
             ui.onNodeWithTag("touch-feedback").performScrollTo().performClick()
             ui.onNodeWithTag("recents-privacy").performScrollTo().performClick()
             ui.waitUntil(5000) {
-                !repo.settings.value.touchFeedback && repo.settings.value.hideRecents
+                !graph.settings.settings.value.touchFeedback &&
+                    graph.settings.settings.value.hideRecents
             }
             ui.onNodeWithText("完成").performClick()
             instrumentation.runOnMainSync { ui.activity.recreate() }

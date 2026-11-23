@@ -1,95 +1,54 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.playback
 
-import android.app.AlarmManager
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
-import androidx.core.content.ContextCompat
 import androidx.media3.common.*
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.analytics.AnalyticsListener
-import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.*
 import androidx.media3.session.MediaLibraryService.LibraryParams
 import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import app.whisp.MainActivity
 import app.whisp.WhispApp
+import app.whisp.data.DlsiteLoginRequired
 import app.whisp.data.ProgressEntity
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
-import java.util.UUID
+import com.google.common.util.concurrent.SettableFuture
 import kotlin.math.abs
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
+/** Thin MediaLibraryService owning ExoPlayer lifecycle, SystemUI media session, and progress IO. */
 @androidx.annotation.OptIn(UnstableApi::class)
 class PlaybackService : MediaLibraryService() {
-    private val repository
-        get() = (application as WhispApp).repository
-
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private lateinit var player: ExoPlayer
-    private var session: MediaLibrarySession? = null
-    private var timerEnd = 0L
-    private var timerHandledByAlarm = false
-    private var loopStart = -1L
-    private var loopEnd = -1L
-    private var currentTrackId: String? = null
-    private var checkpointJob: Job? = null
-    private var loopJob: Job? = null
-    private var timerJob: Job? = null
-    private var pendingLoopSeek: Pair<String?, Long>? = null
-    private var automaticLoopSeek = false
-    private var videoController: MediaSession.ControllerInfo? = null
-    private var sleepAlarmRegistered = false
-    // Player callbacks arrive serially on the main thread, so enqueue order
-    // matches event order and the single consumer below preserves it.
-    private val diagnosticTasks = Channel<suspend () -> Unit>(Channel.UNLIMITED)
-    private val decoderCorrelator = DecoderCorrelator(::onCorrelatedDecoder)
-
-    private val sleepTimerAction
-        get() = "$packageName.ACTION_SLEEP_TIMER"
-
-    private val sleepTimerReceiver =
-        object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action != sleepTimerAction) return
-                if (timerEnd > 0L) onSleepTimerExpired()
-            }
-        }
-
     companion object {
         const val TIMER = "whisp.timer"
         const val LOOP = "whisp.loop"
-        const val VIDEO = "whisp.video"
         const val RECENT_ROOT = "whisp.recent"
-        private const val SLEEP_ALARM_REQUEST_CODE = 1702
     }
+
+    private val graph
+        get() = (application as WhispApp).graph
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private lateinit var player: ExoPlayer
+    private lateinit var loop: AbLoopController
+    private lateinit var timer: SleepTimerController
+    private var session: MediaLibrarySession? = null
+    private var currentTrackId: String? = null
+    private var checkpointJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
-        ContextCompat.registerReceiver(
-            this,
-            sleepTimerReceiver,
-            IntentFilter(sleepTimerAction),
-            ContextCompat.RECEIVER_NOT_EXPORTED,
-        )
-        sleepAlarmRegistered = true
         player =
             ExoPlayer.Builder(this)
-                .setMediaSourceFactory(DefaultMediaSourceFactory(repository.playbackFactory))
+                .setMediaSourceFactory(DefaultMediaSourceFactory(graph.media.playbackFactory))
                 .setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(C.USAGE_MEDIA)
@@ -99,113 +58,46 @@ class PlaybackService : MediaLibraryService() {
                 )
                 .setHandleAudioBecomingNoisy(true)
                 .setWakeMode(C.WAKE_MODE_NETWORK)
-                .setSeekBackIncrementMs(10000)
-                .setSeekForwardIncrementMs(10000)
+                .setSeekBackIncrementMs(10_000)
+                .setSeekForwardIncrementMs(10_000)
                 .build()
         setVideoEnabled(false)
-        updateAudioOffload()
-        scope.launch(Dispatchers.IO) {
-            // A single consumer keeps dispatch order. Isolate failures so one
-            // corrupt entry cannot stop all later diagnostics.
-            for (task in diagnosticTasks) {
-                try {
-                    task()
-                } catch (_: Exception) {
-                    android.util.Log.w("WhispPlayback", "Diagnostic write skipped")
-                }
-            }
-        }
-        player.addAnalyticsListener(
-            object : AnalyticsListener {
-                override fun onAudioInputFormatChanged(
-                    eventTime: AnalyticsListener.EventTime,
-                    format: Format,
-                    decoderReuseEvaluation: DecoderReuseEvaluation?,
-                ) {
-                    decoderCorrelator.onFormatChanged(
-                        "audio",
-                        FormatSnapshot(format.sampleMimeType, format.codecs),
-                        formatContinuity(decoderReuseEvaluation),
-                    )
-                }
+        loop = AbLoopController(player, ::publishSessionState)
+        timer =
+            SleepTimerController(
+                context = this,
+                scope = scope,
+                onExpired = {
+                    player.pause()
+                    saveProgress(immediate = true)
+                },
+                onChanged = ::publishSessionState,
+            )
+        timer.register()
+        AudioOffload.apply(player, loop, timer)
+        installPlayerListener()
+        session = buildMediaSession()
+        graph.playback.attach(player, loop, timer, ::setVideoEnabled)
+        observeSettings()
+    }
 
-                override fun onVideoInputFormatChanged(
-                    eventTime: AnalyticsListener.EventTime,
-                    format: Format,
-                    decoderReuseEvaluation: DecoderReuseEvaluation?,
-                ) {
-                    decoderCorrelator.onFormatChanged(
-                        "video",
-                        FormatSnapshot(format.sampleMimeType, format.codecs),
-                        formatContinuity(decoderReuseEvaluation),
-                    )
-                }
-
-                override fun onAudioDecoderInitialized(
-                    eventTime: AnalyticsListener.EventTime,
-                    decoderName: String,
-                    initializedTimestampMs: Long,
-                    initializationDurationMs: Long,
-                ) {
-                    decoderCorrelator.onDecoderInitialized("audio", decoderName)
-                }
-
-                override fun onAudioDecoderReleased(
-                    eventTime: AnalyticsListener.EventTime,
-                    decoderName: String,
-                ) {
-                    decoderCorrelator.onDecoderReleased("audio")
-                }
-
-                override fun onVideoDecoderInitialized(
-                    eventTime: AnalyticsListener.EventTime,
-                    decoderName: String,
-                    initializedTimestampMs: Long,
-                    initializationDurationMs: Long,
-                ) {
-                    decoderCorrelator.onDecoderInitialized("video", decoderName)
-                }
-
-                override fun onVideoDecoderReleased(
-                    eventTime: AnalyticsListener.EventTime,
-                    decoderName: String,
-                ) {
-                    decoderCorrelator.onDecoderReleased("video")
-                }
-            },
-        )
-        player.addAudioOffloadListener(
-            object : ExoPlayer.AudioOffloadListener {
-                override fun onOffloadedPlayback(offloadedPlayback: Boolean) {
-                    diagnosticTasks.trySend {
-                        repository.playbackDiagnostics.record(
-                            DecoderAudit.offloaded(offloadedPlayback)
-                                .copy(id = UUID.randomUUID().toString()),
-                        )
-                    }
-                }
-            },
-        )
+    private fun installPlayerListener() {
         player.addListener(
             object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    if (isPlaying) loop.onReady()
                     saveProgress()
                 }
 
                 override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
                     if (!playWhenReady) {
-                        // ExoPlayer owns the exact EOF boundary; polling can miss it and
-                        // advance to the next item before the A–B coroutine wakes up.
                         if (
                             reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM &&
-                                loopStart >= 0 &&
-                                loopEnd > loopStart
+                                loop.onEndOfMediaItem()
                         ) {
-                            seekLoopStart()
-                            player.play()
                             return
                         }
-                        automaticLoopSeek = false
+                        loop.onPauseRequested()
                         saveProgress()
                     }
                 }
@@ -213,42 +105,33 @@ class PlaybackService : MediaLibraryService() {
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                     if (mediaItem?.mediaId != currentTrackId) {
                         currentTrackId = mediaItem?.mediaId
-                        automaticLoopSeek = false
-                        pendingLoopSeek = null
-                        loopStart = -1
-                        loopEnd = -1
-                        player.setPauseAtEndOfMediaItems(false)
-                        publishExtras()
-                        updateAudioOffload()
+                        loop.onTrackTransition()
                         saveProgress()
                     }
                 }
 
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     if (playbackState == Player.STATE_ENDED && player.playWhenReady) player.pause()
+                    if (playbackState == Player.STATE_READY) loop.onReady()
                     val id = player.currentMediaItem?.mediaId ?: return
                     val duration = player.duration
-                    // Duration settles when content is ready; later buffering flips need no
-                    // rewrite.
                     if (
                         duration > 0 &&
                             (playbackState == Player.STATE_READY ||
                                 playbackState == Player.STATE_ENDED)
-                    )
-                        repository.scope.launch { repository.dao.updateDuration(id, duration) }
+                    ) {
+                        graph.scope.launch { graph.library.dao.updateDuration(id, duration) }
+                    }
                     saveProgress()
                 }
 
                 override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
-                    loopJob?.cancel()
-                    loopJob = null
-                    reconcilePlaybackJobs()
-                    updateAudioOffload()
+                    AudioOffload.apply(player, loop, timer)
                 }
 
                 override fun onEvents(player: Player, events: Player.Events) {
-                    if (player.isPlaying && pendingLoopSeek == null) automaticLoopSeek = false
-                    reconcilePlaybackJobs()
+                    loop.onEvents()
+                    reconcileCheckpoint()
                 }
 
                 override fun onPositionDiscontinuity(
@@ -256,30 +139,9 @@ class PlaybackService : MediaLibraryService() {
                     newPosition: Player.PositionInfo,
                     reason: Int,
                 ) {
-                    val loopSeek =
-                        reason == Player.DISCONTINUITY_REASON_SEEK &&
-                            pendingLoopSeek ==
-                                (newPosition.mediaItem?.mediaId to newPosition.positionMs)
-                    pendingLoopSeek = null
-                    if (!loopSeek) {
-                        automaticLoopSeek = false
-                        loopJob?.cancel()
-                        loopJob = null
-                    }
-                    // Save the departing work before the next work replaces the active item.
-                    if (oldPosition.mediaItem?.mediaId != newPosition.mediaItem?.mediaId)
+                    val loopSeek = loop.onPositionDiscontinuity(oldPosition, newPosition, reason)
+                    if (oldPosition.mediaItem?.mediaId != newPosition.mediaItem?.mediaId) {
                         savePosition(oldPosition.mediaItem, oldPosition.positionMs)
-                    // Check the resulting position, including relative seeks from media controls.
-                    if (
-                        loopStart >= 0 &&
-                            (oldPosition.mediaItem?.mediaId != newPosition.mediaItem?.mediaId ||
-                                newPosition.positionMs !in loopStart..loopEnd)
-                    ) {
-                        loopStart = -1
-                        loopEnd = -1
-                        player.setPauseAtEndOfMediaItems(false)
-                        publishExtras()
-                        updateAudioOffload()
                     }
                     if (!loopSeek) saveProgress()
                 }
@@ -287,14 +149,17 @@ class PlaybackService : MediaLibraryService() {
                 override fun onPlayerError(error: PlaybackException) {
                     val expired =
                         generateSequence<Throwable>(error) { it.cause }
-                            .any { it is app.whisp.data.DlsiteLoginRequired }
-                    repository.messages.tryEmit(
+                            .any { it is DlsiteLoginRequired }
+                    graph.messages.tryEmit(
                         if (expired) "DLsite 登录已过期，请在来源页重新登录" else "播放失败，请检查文件授权或网络连接",
                     )
                     saveProgress()
                 }
             },
         )
+    }
+
+    private fun buildMediaSession(): MediaLibrarySession {
         val sessionPlayer =
             object : ForwardingSimpleBasePlayer(player) {
                 override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
@@ -311,8 +176,6 @@ class PlaybackService : MediaLibraryService() {
                     positionMs: Long,
                     seekCommand: Int,
                 ): ListenableFuture<*> {
-                    // MediaSession seeks to the current item's default position before a play
-                    // request at EOF. Treat that implicit replay as restarting the queue.
                     if (
                         player.playbackState == Player.STATE_ENDED &&
                             seekCommand == Player.COMMAND_SEEK_TO_DEFAULT_POSITION
@@ -322,217 +185,154 @@ class PlaybackService : MediaLibraryService() {
                     return super.handleSeek(mediaItemIndex, positionMs, seekCommand)
                 }
             }
-        val catalog = ResumeCatalog(repository)
-        session =
-            MediaLibrarySession.Builder(
-                    this,
-                    sessionPlayer,
-                    object : MediaLibrarySession.Callback {
-                        override fun onConnect(
-                            session: MediaSession,
-                            controller: MediaSession.ControllerInfo,
-                        ): MediaSession.ConnectionResult {
-                            if (!controller.isTrusted && controller.packageName != packageName)
-                                return MediaSession.ConnectionResult.reject()
-                            val commands =
-                                MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
-                                    .buildUpon()
-                                    .add(SessionCommand(TIMER, Bundle.EMPTY))
-                                    .add(SessionCommand(LOOP, Bundle.EMPTY))
-                                    .build()
-                            val available =
-                                if (controller.packageName == packageName)
-                                    commands
-                                        .buildUpon()
-                                        .add(SessionCommand(VIDEO, Bundle.EMPTY))
-                                        .build()
-                                else commands
-                            return MediaSession.ConnectionResult.AcceptedResultBuilder(
-                                    session,
-                                    controller,
-                                )
-                                .setAvailableSessionCommands(available)
+        val catalog = ResumeCatalog(graph.library, graph.settings, graph.playback)
+        return MediaLibrarySession.Builder(
+                this,
+                sessionPlayer,
+                object : MediaLibrarySession.Callback {
+                    override fun onConnect(
+                        session: MediaSession,
+                        controller: MediaSession.ControllerInfo,
+                    ): MediaSession.ConnectionResult {
+                        if (!controller.isTrusted && controller.packageName != packageName)
+                            return MediaSession.ConnectionResult.reject()
+                        val commands =
+                            MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
+                                .buildUpon()
+                                .add(SessionCommand(TIMER, Bundle.EMPTY))
+                                .add(SessionCommand(LOOP, Bundle.EMPTY))
                                 .build()
-                        }
+                        return MediaSession.ConnectionResult.AcceptedResultBuilder(
+                                session,
+                                controller,
+                            )
+                            .setAvailableSessionCommands(commands)
+                            .build()
+                    }
 
-                        override fun onDisconnected(
-                            session: MediaSession,
-                            controller: MediaSession.ControllerInfo,
-                        ) {
-                            if (videoController == controller) {
-                                videoController = null
-                                setVideoEnabled(false)
-                            }
-                        }
+                    override fun onGetLibraryRoot(
+                        session: MediaLibrarySession,
+                        browser: MediaSession.ControllerInfo,
+                        params: LibraryParams?,
+                    ): ListenableFuture<LibraryResult<MediaItem>> =
+                        Futures.immediateFuture(LibraryResult.ofItem(recentRoot(), params))
 
-                        override fun onGetLibraryRoot(
-                            session: MediaLibrarySession,
-                            browser: MediaSession.ControllerInfo,
-                            params: LibraryParams?,
-                        ): ListenableFuture<LibraryResult<MediaItem>> {
-                            // Legacy browser root queries can block the main thread, so this result
-                            // is immediate.
+                    override fun onGetChildren(
+                        session: MediaLibrarySession,
+                        browser: MediaSession.ControllerInfo,
+                        parentId: String,
+                        page: Int,
+                        pageSize: Int,
+                        params: LibraryParams?,
+                    ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+                        if (parentId != RECENT_ROOT)
                             return Futures.immediateFuture(
-                                LibraryResult.ofItem(recentRoot(), params),
+                                LibraryResult.ofError(SessionError.ERROR_BAD_VALUE),
+                            )
+                        return scope.ioResult {
+                            val snapshot = if (page == 0) catalog.snapshot() else null
+                            LibraryResult.ofItemList(
+                                if (snapshot == null) emptyList()
+                                else listOf(catalog.recentItem(snapshot)),
+                                params,
                             )
                         }
+                    }
 
-                        override fun onGetChildren(
-                            session: MediaLibrarySession,
-                            browser: MediaSession.ControllerInfo,
-                            parentId: String,
-                            page: Int,
-                            pageSize: Int,
-                            params: LibraryParams?,
-                        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-                            if (parentId != RECENT_ROOT)
-                                return Futures.immediateFuture(
-                                    LibraryResult.ofError(SessionError.ERROR_BAD_VALUE),
-                                )
-                            return scope.ioResult {
-                                val snapshot = if (page == 0) catalog.snapshot() else null
-                                LibraryResult.ofItemList(
-                                    if (snapshot == null) emptyList()
-                                    else listOf(catalog.recentItem(snapshot)),
-                                    params,
-                                )
-                            }
-                        }
-
-                        override fun onGetItem(
-                            session: MediaLibrarySession,
-                            browser: MediaSession.ControllerInfo,
-                            mediaId: String,
-                        ): ListenableFuture<LibraryResult<MediaItem>> =
-                            if (mediaId == RECENT_ROOT) {
-                                Futures.immediateFuture(LibraryResult.ofItem(recentRoot(), null))
-                            } else
-                                scope.ioResult {
-                                    val snapshot = catalog.snapshot()
-                                    if (
-                                        snapshot == null ||
-                                            snapshot.tracks[snapshot.position.index].id != mediaId
-                                    )
-                                        LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
-                                    else LibraryResult.ofItem(catalog.recentItem(snapshot), null)
-                                }
-
-                        override fun onAddMediaItems(
-                            session: MediaSession,
-                            controller: MediaSession.ControllerInfo,
-                            mediaItems: List<MediaItem>,
-                        ): ListenableFuture<List<MediaItem>> = scope.ioResult {
-                            mediaItems.map { item ->
-                                val track = repository.dao.track(item.mediaId) ?: error("音轨不可用")
-                                val work = repository.dao.work(track.workId) ?: error("作品不可用")
-                                repository.mediaItem(track, work)
-                            }
-                        }
-
-                        override fun onCustomCommand(
-                            session: MediaSession,
-                            controller: MediaSession.ControllerInfo,
-                            customCommand: SessionCommand,
-                            args: Bundle,
-                        ): ListenableFuture<SessionResult> {
-                            when (customCommand.customAction) {
-                                VIDEO -> {
-                                    if (controller.packageName != packageName)
-                                        return Futures.immediateFuture(
-                                            SessionResult(SessionError.ERROR_PERMISSION_DENIED),
-                                        )
-                                    val visible = args.getBoolean("visible")
-                                    if (visible) videoController = controller
-                                    if (videoController == controller) {
-                                        setVideoEnabled(visible)
-                                        if (!visible) videoController = null
-                                    }
-                                    return Futures.immediateFuture(
-                                        SessionResult(SessionResult.RESULT_SUCCESS),
-                                    )
-                                }
-                                TIMER -> {
-                                    timerEnd =
-                                        SleepTimer.deadlineMs(
-                                            SystemClock.elapsedRealtime(),
-                                            args.getInt("minutes", 0),
-                                        )
-                                    scheduleTimer()
-                                    updateAudioOffload()
-                                }
-                                LOOP -> {
-                                    val segment =
-                                        LoopState.validate(
-                                            args.getLong("start", -1),
-                                            args.getLong("end", -1),
-                                            player.duration.takeIf { it > 0 },
-                                            player.currentMediaItem != null,
-                                        )
-                                    loopStart = segment?.startMs ?: -1
-                                    loopEnd = segment?.endMs ?: -1
-                                    player.setPauseAtEndOfMediaItems(loopStart >= 0)
-                                    loopJob?.cancel()
-                                    loopJob = null
-                                    pendingLoopSeek = null
-                                    automaticLoopSeek = false
-                                    reconcilePlaybackJobs()
-                                    updateAudioOffload()
-                                }
-                                else ->
-                                    return Futures.immediateFuture(
-                                        SessionResult(SessionError.ERROR_NOT_SUPPORTED),
-                                    )
-                            }
-                            publishExtras()
-                            return Futures.immediateFuture(
-                                SessionResult(SessionResult.RESULT_SUCCESS),
-                            )
-                        }
-
-                        override fun onPlaybackResumption(
-                            session: MediaSession,
-                            controller: MediaSession.ControllerInfo,
-                            isForPlayback: Boolean,
-                        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
+                    override fun onGetItem(
+                        session: MediaLibrarySession,
+                        browser: MediaSession.ControllerInfo,
+                        mediaId: String,
+                    ): ListenableFuture<LibraryResult<MediaItem>> =
+                        if (mediaId == RECENT_ROOT) {
+                            Futures.immediateFuture(LibraryResult.ofItem(recentRoot(), null))
+                        } else {
                             scope.ioResult {
-                                val snapshot = catalog.snapshot() ?: error("暂无播放记录")
-                                if (isForPlayback) {
-                                    val items =
-                                        snapshot.tracks.map {
-                                            repository.mediaItem(it, snapshot.work)
-                                        }
-                                    MediaSession.MediaItemsWithStartPosition(
-                                        items,
-                                        snapshot.position.index,
-                                        snapshot.position.positionMs,
-                                    )
+                                val snapshot = catalog.snapshot()
+                                if (
+                                    snapshot == null ||
+                                        snapshot.tracks[snapshot.position.index].id != mediaId
+                                ) {
+                                    LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
                                 } else {
-                                    // Boot-time requests must not resolve audio or connect to a
-                                    // remote source.
-                                    MediaSession.MediaItemsWithStartPosition(
-                                        listOf(catalog.recentItem(snapshot)),
-                                        0,
-                                        snapshot.position.positionMs,
-                                    )
+                                    LibraryResult.ofItem(catalog.recentItem(snapshot), null)
                                 }
                             }
-                    },
-                )
-                .setSessionActivity(
-                    PendingIntent.getActivity(
-                        this,
-                        0,
-                        Intent(this, MainActivity::class.java)
-                            .setAction(MainActivity.OPEN_PLAYER)
-                            .addFlags(
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP,
-                            ),
-                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-                    ),
-                )
-                .build()
+                        }
+
+                    override fun onAddMediaItems(
+                        session: MediaSession,
+                        controller: MediaSession.ControllerInfo,
+                        mediaItems: List<MediaItem>,
+                    ): ListenableFuture<List<MediaItem>> = scope.ioResult {
+                        mediaItems.map { item ->
+                            val track = graph.library.dao.track(item.mediaId) ?: error("音轨不可用")
+                            val work = graph.library.dao.work(track.workId) ?: error("作品不可用")
+                            graph.playback.mediaItem(track, work)
+                        }
+                    }
+
+                    override fun onCustomCommand(
+                        session: MediaSession,
+                        controller: MediaSession.ControllerInfo,
+                        customCommand: SessionCommand,
+                        args: Bundle,
+                    ): ListenableFuture<SessionResult> {
+                        when (customCommand.customAction) {
+                            TIMER -> timer.setMinutes(args.getInt("minutes", 0))
+                            LOOP -> loop.set(args.getLong("start", -1), args.getLong("end", -1))
+                            else ->
+                                return Futures.immediateFuture(
+                                    SessionResult(SessionError.ERROR_NOT_SUPPORTED),
+                                )
+                        }
+                        return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+                    }
+
+                    override fun onPlaybackResumption(
+                        session: MediaSession,
+                        controller: MediaSession.ControllerInfo,
+                        isForPlayback: Boolean,
+                    ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.ioResult {
+                        val snapshot = catalog.snapshot() ?: error("暂无播放记录")
+                        if (isForPlayback) {
+                            val items =
+                                snapshot.tracks.map {
+                                    graph.playback.mediaItem(it, snapshot.work)
+                                }
+                            MediaSession.MediaItemsWithStartPosition(
+                                items,
+                                snapshot.position.index,
+                                snapshot.position.positionMs,
+                            )
+                        } else {
+                            MediaSession.MediaItemsWithStartPosition(
+                                listOf(catalog.recentItem(snapshot)),
+                                0,
+                                snapshot.position.positionMs,
+                            )
+                        }
+                    }
+                },
+            )
+            .setSessionActivity(
+                PendingIntent.getActivity(
+                    this,
+                    0,
+                    Intent(this, MainActivity::class.java)
+                        .setAction(MainActivity.OPEN_PLAYER)
+                        .addFlags(
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP,
+                        ),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                ),
+            )
+            .build()
+    }
+
+    private fun observeSettings() {
         scope.launch {
-            repository.settingsUpdates
+            graph.settings.settingsUpdates
                 .map { it.playbackSpeed }
                 .distinctUntilChanged()
                 .collect { speed ->
@@ -542,29 +342,29 @@ class PlaybackService : MediaLibraryService() {
                 }
         }
         scope.launch {
-            repository.settingsUpdates
+            graph.settings.settingsUpdates
                 .map { it.hideArtwork }
                 .distinctUntilChanged()
                 .collect { hide ->
-                    // Service ownership makes privacy work with no Activity or ViewModel alive.
                     val items = (0 until player.mediaItemCount).map { player.getMediaItemAt(it) }
                     if (items.isNotEmpty()) {
                         val metadataByTrack =
                             withContext(Dispatchers.IO) {
                                 val ids = items.map { it.mediaId }.distinct()
                                 val tracks =
-                                    ids.chunked(500).flatMap { repository.dao.tracksByIds(it) }
+                                    ids.chunked(500).flatMap { graph.library.dao.tracksByIds(it) }
                                 val works =
                                     tracks
                                         .map { it.workId }
                                         .distinct()
                                         .chunked(500)
-                                        .flatMap { repository.dao.worksByIds(it) }
+                                        .flatMap { graph.library.dao.worksByIds(it) }
                                         .associateBy { it.id }
                                 tracks
                                     .mapNotNull { track ->
                                         works[track.workId]?.let { work ->
-                                            track.id to repository.mediaMetadata(track, work, hide)
+                                            track.id to
+                                                graph.playback.mediaMetadata(track, work, hide)
                                         }
                                     }
                                     .toMap()
@@ -584,7 +384,7 @@ class PlaybackService : MediaLibraryService() {
                         }
                     }
                     val hasRecent =
-                        withContext(Dispatchers.IO) { repository.dao.latestProgress() != null }
+                        withContext(Dispatchers.IO) { graph.library.dao.latestProgress() != null }
                     session?.notifyChildrenChanged(RECENT_ROOT, if (hasRecent) 1 else 0, null)
                 }
         }
@@ -598,98 +398,57 @@ class PlaybackService : MediaLibraryService() {
                 .build()
     }
 
-    private fun reconcilePlaybackJobs() {
-        val state = player.playbackState
+    private fun publishSessionState() {
+        session?.setSessionExtras(
+            Bundle().apply {
+                putLong("timerEnd", timer.deadlineMs)
+                putLong("loopStart", loop.startMs)
+                putLong("loopEnd", loop.endMs)
+            },
+        )
+        AudioOffload.apply(player, loop, timer)
+        graph.playback.onControllerStateChanged()
+    }
+
+    private fun reconcileCheckpoint() {
+        val playbackState = player.playbackState
         if (
-            player.playWhenReady && (state == Player.STATE_READY || state == Player.STATE_BUFFERING)
+            player.playWhenReady &&
+                (playbackState == Player.STATE_READY || playbackState == Player.STATE_BUFFERING)
         ) {
-            if (checkpointJob?.isActive != true)
+            if (checkpointJob?.isActive != true) {
                 checkpointJob = scope.launch {
-                    // Rebuffering and automatic loop seeks must not restart the deadline.
                     while (isActive) {
                         delay(15_000)
                         if (player.isPlaying) saveProgress()
                     }
                 }
+            }
         } else {
             checkpointJob?.cancel()
             checkpointJob = null
         }
-        if (player.isPlaying && loopStart >= 0 && loopEnd > loopStart) {
-            if (loopJob?.isActive != true)
-                loopJob = scope.launch {
-                    while (isActive && player.isPlaying && loopStart >= 0 && loopEnd > loopStart) {
-                        var remaining = loopEnd - player.currentPosition
-                        if (remaining <= 0) {
-                            seekLoopStart()
-                            remaining = loopEnd - loopStart
-                        }
-                        delay(LoopSchedule.delayMs(remaining, player.playbackParameters.speed))
-                    }
-                }
-        } else {
-            loopJob?.cancel()
-            loopJob = null
+    }
+
+    private fun saveProgress(immediate: Boolean = false) {
+        if (
+            !immediate &&
+                loop.suppressAutoProgress &&
+                player.playWhenReady &&
+                player.playbackState != Player.STATE_ENDED &&
+                player.playerError == null
+        ) {
+            return
         }
+        savePosition(player.currentMediaItem, player.currentPosition, immediate)
     }
 
-    private fun seekLoopStart() {
-        automaticLoopSeek = true
-        pendingLoopSeek = player.currentMediaItem?.mediaId to loopStart
-        player.seekTo(loopStart)
-    }
-
-    private fun sleepTimerPendingIntent(): PendingIntent =
-        PendingIntent.getBroadcast(
-            this,
-            SLEEP_ALARM_REQUEST_CODE,
-            Intent(sleepTimerAction).setPackage(packageName),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-
-    private fun cancelSleepAlarm() {
-        getSystemService(AlarmManager::class.java)?.cancel(sleepTimerPendingIntent())
-        timerHandledByAlarm = false
-    }
-
-    private fun onSleepTimerExpired() {
-        timerJob?.cancel()
-        timerJob = null
-        cancelSleepAlarm()
-        timerEnd = 0
-        player.pause()
-        publishExtras()
-        updateAudioOffload()
-        saveProgress(immediate = true)
-    }
-
-    private fun scheduleTimer() {
-        timerJob?.cancel()
-        timerJob = null
-        cancelSleepAlarm()
-        if (timerEnd <= 0) return
-        val alarmManager = getSystemService(AlarmManager::class.java)
-        val scheduledWithAlarm =
-            alarmManager != null &&
-                runCatching {
-                    val pending = sleepTimerPendingIntent()
-                    alarmManager.setAndAllowWhileIdle(
-                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                        timerEnd,
-                        pending,
-                    )
-                }
-                    .isSuccess
-        timerHandledByAlarm = scheduledWithAlarm
-        if (!scheduledWithAlarm) {
-            timerJob = scope.launch {
-                // elapsedRealtime keeps the deadline independent of wall-clock changes.
-                while (isActive && timerEnd > SystemClock.elapsedRealtime()) delay(
-                    timerEnd - SystemClock.elapsedRealtime(),
-                )
-                onSleepTimerExpired()
-            }
-        }
+    private fun savePosition(item: MediaItem?, position: Long, immediate: Boolean = false) {
+        val id = item?.mediaId ?: return
+        val workId = item.mediaMetadata.extras?.getString("workId") ?: return
+        val entity = ProgressEntity(workId, id, position.coerceAtLeast(0))
+        if (immediate) graph.library.savePlaybackProgressImmediate(entity)
+        else graph.library.savePlaybackProgress(entity)
     }
 
     private fun recentRoot(): MediaItem =
@@ -705,88 +464,6 @@ class PlaybackService : MediaLibraryService() {
             )
             .build()
 
-    private fun publishExtras() {
-        session?.setSessionExtras(
-            Bundle().apply {
-                putLong("timerEnd", timerEnd)
-                putLong("loopStart", loopStart)
-                putLong("loopEnd", loopEnd)
-            },
-        )
-    }
-
-    private fun updateAudioOffload() {
-        if (!AudioOffload.supported(Build.VERSION.SDK_INT)) return
-        // AlarmManager-backed sleep timers wake the AP independently, allowing DSP audio offload
-        // to stay enabled overnight. Only A–B loops or fallback Handler timers disable offload.
-        val handlerTimer = if (timerHandledByAlarm) 0L else timerEnd
-        val speedChanged = abs(player.playbackParameters.speed - 1f) > 0.01f
-        player.trackSelectionParameters =
-            player.trackSelectionParameters
-                .buildUpon()
-                .setAudioOffloadPreferences(
-                    AudioOffload.preferences(
-                        enabled =
-                            !AudioOffload.needsPreciseDeadline(loopStart, loopEnd, handlerTimer),
-                        speedChangeRequired = speedChanged,
-                    ),
-                )
-                .build()
-    }
-
-    private fun onCorrelatedDecoder(
-        kind: String,
-        snapshot: FormatSnapshot?,
-        decoder: String?,
-        id: String,
-        replaceProvisional: Boolean,
-    ) {
-        // A single consumer keeps dispatch order: launch() alone does not
-        // guarantee that coroutines start in call order.
-        diagnosticTasks.trySend {
-            val candidates = runCatching {
-                val mime = snapshot?.mime ?: return@runCatching emptyList<CodecCandidate>()
-                MediaCodecUtil.getDecoderInfos(mime, false, false).map {
-                    CodecCandidate(it.name, it.hardwareAccelerated)
-                }
-            }
-                .getOrDefault(emptyList())
-            val event =
-                DecoderAudit.resolve(
-                        kind,
-                        snapshot?.mime,
-                        snapshot?.codecs,
-                        decoder,
-                        candidates,
-                    )
-                    .copy(id = id)
-            if (replaceProvisional) repository.playbackDiagnostics.replaceById(id, event)
-            else repository.playbackDiagnostics.record(event)
-        }
-    }
-
-    private fun saveProgress(immediate: Boolean = false) {
-        // Automatic A–B seeks can also generate buffering/ready callbacks. The
-        // checkpoint records these loops; pause/error/end still flush immediately.
-        if (
-            !immediate &&
-                automaticLoopSeek &&
-                player.playWhenReady &&
-                player.playbackState != Player.STATE_ENDED &&
-                player.playerError == null
-        )
-            return
-        savePosition(player.currentMediaItem, player.currentPosition, immediate)
-    }
-
-    private fun savePosition(item: MediaItem?, position: Long, immediate: Boolean = false) {
-        val id = item?.mediaId ?: return
-        val workId = item.mediaMetadata.extras?.getString("workId") ?: return
-        val entity = ProgressEntity(workId, id, position.coerceAtLeast(0))
-        if (immediate) repository.savePlaybackProgressImmediate(entity)
-        else repository.savePlaybackProgress(entity)
-    }
-
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? =
         session
 
@@ -797,15 +474,29 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onDestroy() {
         saveProgress(immediate = true)
-        cancelSleepAlarm()
-        if (sleepAlarmRegistered) {
-            runCatching { unregisterReceiver(sleepTimerReceiver) }
-            sleepAlarmRegistered = false
-        }
+        graph.playback.detach(player)
+        loop.release()
+        timer.release()
         scope.cancel()
         session?.release()
         player.release()
         session = null
         super.onDestroy()
     }
+}
+
+internal fun <T> CoroutineScope.ioResult(block: suspend () -> T): ListenableFuture<T> {
+    val future = SettableFuture.create<T>()
+    val job =
+        launch(Dispatchers.IO) {
+            try {
+                future.set(block())
+            } catch (e: CancellationException) {
+                future.cancel(false)
+            } catch (e: Throwable) {
+                future.setException(e)
+            }
+        }
+    future.addListener({ if (future.isCancelled) job.cancel() }, Runnable::run)
+    return future
 }

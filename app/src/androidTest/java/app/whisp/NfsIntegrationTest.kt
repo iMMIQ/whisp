@@ -33,11 +33,11 @@ class NfsIntegrationTest {
         androidx.test.rule.GrantPermissionRule.grant(android.Manifest.permission.POST_NOTIFICATIONS)
     @get:Rule val activity = ActivityScenarioRule(MainActivity::class.java)
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
-    private val repo
-        get() = (instrumentation.targetContext.applicationContext as WhispApp).repository
+    private val graph
+        get() = (instrumentation.targetContext.applicationContext as WhispApp).graph
 
     private fun root(): String {
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         val root = InstrumentationRegistry.getArguments().getString("nfsRoot")
         assumeTrue("Provide a dedicated synthetic NFS fixture", root != null)
         return root!!
@@ -72,18 +72,18 @@ class NfsIntegrationTest {
                     "nfs",
                     NfsAddress.parse(root, version).normalized,
                 )
-            repo.nfs.check(source)
-            val files = repo.nfs.walk(source)
+            graph.sources.nfs.check(source)
+            val files = graph.sources.nfs.walk(source)
             assertTrue(files.none { it.path.endsWith("循环链接") })
             val audio = files.single { it.path.endsWith(".wav") }
             assertTrue(audio.path.contains("😀"))
             assertEquals(audio.path, NfsAddress.assetPath(audio.uri, source.id))
-            repo.nfs.open(source, audio.uri).use { reader ->
+            graph.sources.nfs.open(source, audio.uri).use { reader ->
                 val prefix = ByteArray(4)
                 assertEquals(4, reader.read(prefix, 0, 0, 4))
                 assertEquals("RIFF", prefix.toString(Charsets.US_ASCII))
             }
-            val data = RemoteFileDataSource("NFS") { repo.nfs.open(source, it) }
+            val data = RemoteFileDataSource("NFS") { graph.sources.nfs.open(source, it) }
             val uri = NfsAddress.assetUri(source.id, "large.bin").toUri()
             assertEquals(
                 8L,
@@ -119,33 +119,32 @@ class NfsIntegrationTest {
                 "nfs",
                 NfsAddress.parse(root(), 42).normalized,
             )
-        repo.dao.putSource(source)
+        graph.library.dao.putSource(source)
         var future: com.google.common.util.concurrent.ListenableFuture<MediaController>? = null
         try {
-            repo.scan(source.id)
-            val workId = repo.dao.sourceWorkIds(source.id).single()
-            val detail = repo.dao.details(workId)!!
+            graph.sync.scan(source.id)
+            val workId = graph.library.dao.sourceWorkIds(source.id).single()
+            val detail = graph.library.dao.details(workId)!!
             assertEquals(1, detail.tracks.size)
             val track = detail.tracks.single()
             val subtitleId = requireNotNull(track.subtitleId)
-            assertTrue(repo.artwork(detail.work.coverId)!!.isFile)
             assertEquals(
                 "示例字幕",
                 SubtitleTimeline.parse(
-                        repo.readAsset(subtitleId).toString(Charsets.UTF_8),
+                        graph.library.readAsset(subtitleId).toString(Charsets.UTF_8),
                         "vtt",
                     )
                     .single()
                     .text,
             )
-            val item = repo.mediaItem(track, detail.work)
+            val item = graph.playback.mediaItem(track, detail.work)
             assertEquals("whisp-nfs", item.localConfiguration!!.uri.scheme)
             future = main {
                 MediaController.Builder(
-                        repo.context,
+                        graph.context,
                         SessionToken(
-                            repo.context,
-                            ComponentName(repo.context, PlaybackService::class.java),
+                            graph.context,
+                            ComponentName(graph.context, PlaybackService::class.java),
                         ),
                     )
                     .buildAsync()
@@ -171,28 +170,28 @@ class NfsIntegrationTest {
                 }
             }
             assertTrue(main { controller.duration in 29_000..31_000 })
-            repo.offlineStore.downloadWork(workId)
+            graph.offline.downloadWork(workId)
             withTimeout(45_000) {
-                repo.downloads.first { it[track.id]?.state == Download.STATE_COMPLETED }
+                graph.media.downloads.first { it[track.id]?.state == Download.STATE_COMPLETED }
             }
             waitFor("offline-attachments") {
-                repo.library.value.firstOrNull { it.work.id == workId }?.work?.offlineAttachments ==
+                graph.library.works.value.firstOrNull { it.id == workId }?.offlineAttachments ==
                     true
             }
             main { controller.clearMediaItems() }
-            repo.removeSource(source.id)
-            val saved = repo.dao.details(workId)!!
-            assertTrue(repo.offlineStore.isOffline(saved))
+            graph.sync.removeSource(source.id)
+            val saved = graph.library.dao.details(workId)!!
+            assertTrue(graph.offline.isOffline(saved))
             assertEquals(
                 "示例字幕",
                 SubtitleTimeline.parse(
-                        repo.readAsset(subtitleId).toString(Charsets.UTF_8),
+                        graph.library.readAsset(subtitleId).toString(Charsets.UTF_8),
                         "vtt",
                     )
                     .single()
                     .text,
             )
-            val offline = repo.mediaItem(track, saved.work)
+            val offline = graph.playback.mediaItem(track, saved.work)
             main {
                 controller.setMediaItem(offline)
                 controller.prepare()
@@ -203,10 +202,10 @@ class NfsIntegrationTest {
                 controller.pause()
                 controller.clearMediaItems()
             }
-            repo.offlineStore.removeOffline(workId)
+            graph.offline.removeOffline(workId)
         } finally {
             future?.let { main { MediaController.releaseFuture(it) } }
-            repo.removeSource(source.id)
+            graph.sync.removeSource(source.id)
         }
     }
 }

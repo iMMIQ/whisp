@@ -24,8 +24,8 @@ class DlsiteLibraryIntegrationTest {
 
     @Test
     fun purchasedCatalogSearchOpeningDeletionAndAccountRemovalShareTheLibrary() {
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         val source = "dlsite-catalog-test"
         val examples =
             listOf(
@@ -34,17 +34,17 @@ class DlsiteLibraryIntegrationTest {
                 DlsiteOwnedWork("RJ00000003", "午后的约定", "示例声优丙", "日光社团", purchasedAt = 100),
             )
         runBlocking {
-            repo.dao.putSource(
+            graph.library.dao.putSource(
                 SourceEntity(
                     source,
                     "DLsite",
                     "dlsite",
                     "https://play.dlsite.com/",
-                    secret = repo.secrets.encrypt("[]"),
+                    secret = graph.secrets.encrypt("[]"),
                     lastScan = System.currentTimeMillis(),
                 ),
             )
-            repo.dao.putDlsitePurchases(
+            graph.library.dao.putDlsitePurchases(
                 examples.map {
                     DlsitePurchaseEntity(source, it.workno, it.purchasedAt, it.encode())
                 },
@@ -60,21 +60,12 @@ class DlsiteLibraryIntegrationTest {
                         "本編/01.mp3",
                         1,
                         60000,
+                        uri = "dlsite-resource://${example.workno}/optimized/example.mp3",
+                        size = 100,
                     )
-                repo.dao.putWorks(listOf(work))
-                repo.dao.putTracks(listOf(track))
-                repo.dao.putLocations(
-                    listOf(
-                        LocationEntity(
-                            stableId(track.id),
-                            track.id,
-                            source,
-                            "dlsite-resource://${example.workno}/optimized/example.mp3",
-                            100,
-                        ),
-                    ),
-                )
-                repo.saveDlsiteDetails(
+                graph.library.dao.putWorks(listOf(work))
+                graph.library.dao.putTracks(listOf(track))
+                graph.library.saveDlsiteDetails(
                     work.id,
                     DlsiteDetails(example.workno, productFetchedAt = System.currentTimeMillis()),
                 )
@@ -96,7 +87,7 @@ class DlsiteLibraryIntegrationTest {
             )
         ui.waitForIdle()
         InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()?.let { image ->
-            File(repo.context.getExternalFilesDir(null), "dlsite-owned-library.png")
+            File(graph.context.getExternalFilesDir(null), "dlsite-owned-library.png")
                 .outputStream()
                 .use { image.compress(Bitmap.CompressFormat.PNG, 100, it) }
             image.recycle()
@@ -111,23 +102,23 @@ class DlsiteLibraryIntegrationTest {
         ui.waitUntil(10_000) {
             ui.onAllNodesWithTag("dlsite-library").fetchSemanticsNodes().isNotEmpty()
         }
-        runBlocking { assertNull(repo.dao.work(examples.first().entity(source).id)) }
+        runBlocking { assertNull(graph.library.dao.work(examples.first().entity(source).id)) }
         ui.onNodeWithTag("dlsite-search").performTextInput("示例声优乙")
         ui.onNodeWithText("海边夜话").assertExists()
         ui.onNodeWithContentDescription("管理 DLsite 账号").performClick()
         ui.onNodeWithText("退出账号").performClick()
-        ui.waitUntil(10_000) { runBlocking { repo.dao.source(source) == null } }
-        runBlocking { assertTrue(repo.dlsitePurchases(source).first().isEmpty()) }
+        ui.waitUntil(10_000) { runBlocking { graph.library.dao.source(source) == null } }
+        runBlocking { assertTrue(graph.library.dlsitePurchases(source).first().isEmpty()) }
     }
 
     @Test
     fun diagnosticExportContainsOnlyFixedRequestFieldsAndStaysBounded() {
-        val repo = (ui.activity.application as WhispApp).repository
-        repo.dlsiteDiagnostics.clear()
+        val graph = (ui.activity.application as WhispApp).graph
+        graph.dlsiteDiagnostics.clear()
         repeat(80) {
-            repo.dlsiteDiagnostics.record(DlsiteRequestEvent(DlsitePhase.MEDIA, 206, it.toLong()))
+            graph.dlsiteDiagnostics.record(DlsiteRequestEvent(DlsitePhase.MEDIA, 206, it.toLong()))
         }
-        val intent = repo.dlsiteDiagnostics.shareIntent()
+        val intent = graph.dlsiteDiagnostics.shareIntent()
         val uri =
             androidx.core.content.IntentCompat.getParcelableExtra(
                 intent,
@@ -135,7 +126,7 @@ class DlsiteLibraryIntegrationTest {
                 android.net.Uri::class.java,
             )!!
         val report =
-            repo.context.contentResolver.openInputStream(uri)!!.bufferedReader().use {
+            graph.context.contentResolver.openInputStream(uri)!!.bufferedReader().use {
                 it.readText()
             }
         val json = kotlinx.serialization.json.Json.parseToJsonElement(report)
@@ -149,6 +140,6 @@ class DlsiteLibraryIntegrationTest {
         assertFalse(report.contains("http"))
         assertFalse(report.contains("Cookie"))
         assertFalse(report.contains("RJ"))
-        repo.dlsiteDiagnostics.clear()
+        graph.dlsiteDiagnostics.clear()
     }
 }

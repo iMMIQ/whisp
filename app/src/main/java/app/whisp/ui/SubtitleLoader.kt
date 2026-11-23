@@ -3,16 +3,22 @@ package app.whisp.ui
 
 import android.util.LruCache
 import app.whisp.data.Cue
-import app.whisp.data.LibraryRepository
+import app.whisp.data.LibraryStore
+import app.whisp.data.SettingsStore
 import app.whisp.data.SubtitleTimeline
 import app.whisp.data.TextEncoding
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
-/** Subtitle loading, encoding-aware decoding, and bounded LRU caching owned by the ViewModel. */
-internal class SubtitleLoader(
+/**
+ * Subtitle loading, encoding-aware decoding, and bounded LRU caching owned by PlaybackCoordinator.
+ */
+class SubtitleLoader(
     private val scope: CoroutineScope,
-    private val repository: LibraryRepository,
+    private val library: LibraryStore,
+    settings: SettingsStore,
 ) {
     val cues = MutableStateFlow<List<Cue>>(emptyList())
     val loading = MutableStateFlow(false)
@@ -23,7 +29,16 @@ internal class SubtitleLoader(
 
     private val cache = LruCache<String, List<Cue>>(16)
     private var job: Job? = null
-    private var encoding: String = repository.settings.value.textEncoding
+    private var encoding: String = settings.settings.value.textEncoding
+
+    init {
+        scope.launch {
+            settings.settingsUpdates
+                .map { it.textEncoding }
+                .distinctUntilChanged()
+                .collect(::onEncodingChanged)
+        }
+    }
 
     fun onEncodingChanged(newEncoding: String) {
         if (encoding == newEncoding) return
@@ -50,13 +65,11 @@ internal class SubtitleLoader(
         val nextJob =
             scope.launch(start = CoroutineStart.LAZY) {
                 try {
-                    val track = repository.track(id) ?: return@launch
+                    val track = library.track(id) ?: return@launch
                     val attachmentId = track.subtitleId ?: return@launch
                     loading.value = true
-                    val detail = repository.workDetails(track.workId) ?: return@launch
-                    val attachment =
-                        detail.attachments.firstOrNull { it.id == attachmentId } ?: return@launch
-                    val bytes = repository.readAsset(attachment.id)
+                    val attachment = library.dao.attachment(attachmentId) ?: return@launch
+                    val bytes = library.readAsset(attachment.id)
                     val parsed =
                         withContext(Dispatchers.Default) {
                             SubtitleTimeline.parse(

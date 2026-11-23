@@ -12,6 +12,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -19,6 +20,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import app.whisp.AppGraph
+import app.whisp.R
 import app.whisp.data.StorageUsage
 import java.util.Locale
 import kotlinx.coroutines.*
@@ -35,21 +38,22 @@ private fun storageSize(bytes: Long): String =
 
 @OptIn(FlowPreview::class)
 @Composable
-internal fun StoragePage(model: AppViewModel, back: () -> Unit) {
-    val settings by model.settings.collectAsStateWithLifecycle()
+internal fun StoragePage(graph: AppGraph, back: () -> Unit) {
+    val settings by graph.settings.settings.collectAsStateWithLifecycle()
     var usage by remember { mutableStateOf<StorageUsage?>(null) }
     var clearing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
-    LaunchedEffect(model, lifecycleOwner) {
+    LaunchedEffect(graph, lifecycleOwner) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             merge(
-                    model.repository.storageChanges.map { Unit },
-                    model.downloads.map { Unit },
-                    model.settings.map { it.streamingCacheMiB }.distinctUntilChanged().map { Unit },
+                    flowOf(Unit),
+                    graph.storageChanges,
+                    graph.media.downloads.map { Unit },
+                    graph.settings.streamingCacheMiBUpdates.map { Unit },
                 )
                 .debounce(300)
-                .collect { usage = model.repository.storageUsage() }
+                .collect { usage = graph.images.storageUsage() }
         }
     }
     LazyColumn(
@@ -61,12 +65,12 @@ internal fun StoragePage(model: AppViewModel, back: () -> Unit) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconAction(
                     Icons.AutoMirrored.Outlined.ArrowBack,
-                    androidx.compose.ui.res.stringResource(app.whisp.R.string.action_back_sources),
+                    stringResource(R.string.action_back_sources),
                     Muted,
-                    back,
+                    action = back,
                 )
                 Text(
-                    androidx.compose.ui.res.stringResource(app.whisp.R.string.title_storage),
+                    stringResource(R.string.title_storage),
                     fontFamily = FontFamily.Serif,
                     fontSize = 30.sp,
                     modifier = Modifier.padding(start = 10.dp),
@@ -89,8 +93,7 @@ internal fun StoragePage(model: AppViewModel, back: () -> Unit) {
                     )
                 }
                 StorageRow("在线播放", usage?.streaming)
-                StorageRow("作品封面", usage?.artwork)
-                StorageRow("图片预览", usage?.previews)
+                StorageRow("图片缓存", usage?.images)
                 FilledTonalButton(
                     enabled = usage != null && !clearing,
                     modifier = Modifier.fillMaxWidth().testTag("clear-cache"),
@@ -98,12 +101,12 @@ internal fun StoragePage(model: AppViewModel, back: () -> Unit) {
                         clearing = true
                         scope.launch {
                             try {
-                                model.repository.clearTemporaryCache()
-                                usage = model.repository.storageUsage()
+                                graph.images.clearCaches(graph.media::clearStreamingCache)
+                                usage = graph.images.storageUsage()
                             } catch (e: CancellationException) {
                                 throw e
                             } catch (e: Exception) {
-                                model.error.value = e.message ?: "清理失败"
+                                graph.messages.tryEmit(e.message ?: "清理失败")
                             } finally {
                                 clearing = false
                             }
@@ -122,8 +125,8 @@ internal fun StoragePage(model: AppViewModel, back: () -> Unit) {
                         FilterChip(
                             selected = settings.streamingCacheMiB == limit,
                             onClick = {
-                                model.action {
-                                    model.repository.setSettings(streamingCacheMiB = limit)
+                                scope.launch {
+                                    graph.settings.update { it.copy(streamingCacheMiB = limit) }
                                 }
                             },
                             label = { Text("$limit", fontSize = 14.sp, maxLines = 1) },

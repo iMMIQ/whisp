@@ -2,11 +2,16 @@
 package app.whisp.data
 
 import java.io.IOException
-import kotlinx.serialization.json.*
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 
 class DlsiteLoginRequired : IOException("请重新登录 DLsite")
+
+@Serializable private data class SavedCookie(val origin: String, val cookie: String)
+
+private val sessionJson = Json { ignoreUnknownKeys = true }
 
 /** Session cookies are kept separate from public metadata and other sources. */
 class DlsiteSession(snapshot: String = "", private val changed: (String) -> Unit = {}) : CookieJar {
@@ -22,7 +27,7 @@ class DlsiteSession(snapshot: String = "", private val changed: (String) -> Unit
         fun trusted(url: HttpUrl) = url.scheme == "https" && url.host in hosts && url.port == 443
 
         fun fromBrowser(headers: Map<String, String>): String {
-            val entries = buildJsonArray {
+            val entries = buildList {
                 headers.forEach { (origin, header) ->
                     val url = origin.toHttpUrl()
                     require(trusted(url))
@@ -37,18 +42,13 @@ class DlsiteSession(snapshot: String = "", private val changed: (String) -> Unit
                         ) {
                             Cookie.parse(url, "$name=$value; Path=/; Secure; HttpOnly")?.let {
                                 cookie ->
-                                add(
-                                    buildJsonObject {
-                                        put("origin", origin)
-                                        put("cookie", cookie.toString())
-                                    },
-                                )
+                                add(SavedCookie(origin, cookie.toString()))
                             }
                         }
                     }
                 }
             }
-            return entries.toString()
+            return sessionJson.encodeToString(entries)
         }
     }
 
@@ -57,13 +57,12 @@ class DlsiteSession(snapshot: String = "", private val changed: (String) -> Unit
 
     init {
         if (snapshot.isNotBlank()) {
-            val entries = Json.parseToJsonElement(snapshot).jsonArray
+            val entries = sessionJson.decodeFromString<List<SavedCookie>>(snapshot)
             require(entries.size <= 200) { "登录会话过大" }
             entries.forEach { entry ->
-                val item = entry.jsonObject
-                val origin = item.getValue("origin").jsonPrimitive.content.toHttpUrl()
+                val origin = entry.origin.toHttpUrl()
                 require(trusted(origin))
-                Cookie.parse(origin, item.getValue("cookie").jsonPrimitive.content)?.let {
+                Cookie.parse(origin, entry.cookie)?.let {
                     if (matchesOrigin(it, origin)) cookies += origin to it
                 }
             }
@@ -114,17 +113,10 @@ class DlsiteSession(snapshot: String = "", private val changed: (String) -> Unit
     }
 
     @Synchronized
-    fun encode(): String = buildJsonArray {
-        cookies.forEach { (origin, cookie) ->
-            add(
-                buildJsonObject {
-                    put("origin", origin.toString())
-                    put("cookie", cookie.toString())
-                },
-            )
-        }
-    }
-        .toString()
+    fun encode(): String =
+        sessionJson.encodeToString(
+            cookies.map { (origin, cookie) -> SavedCookie(origin.toString(), cookie.toString()) },
+        )
 
     @Synchronized
     fun clear() {

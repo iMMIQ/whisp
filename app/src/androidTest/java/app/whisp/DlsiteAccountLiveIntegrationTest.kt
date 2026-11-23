@@ -33,23 +33,23 @@ class DlsiteAccountLiveIntegrationTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         assertTrue(context.packageName.endsWith(".smoketest"))
-        val repo = (context.applicationContext as WhispApp).repository
-        val source = repo.dao.sources().firstOrNull { it.kind == "dlsite" }
+        val graph = (context.applicationContext as WhispApp).graph
+        val source = graph.library.dao.sources().firstOrNull { it.kind == "dlsite" }
         assertNotNull("Complete official login before running the account probe", source)
-        repo.syncDlsitePurchases(source!!.id, full = true)
-        val owned = repo.dlsitePurchases(source.id).first()
+        graph.sync.syncDlsitePurchases(source!!.id, full = true)
+        val owned = graph.library.dlsitePurchases(source.id).first()
         assertTrue(owned.isNotEmpty())
         var selected: app.whisp.data.WorkDetails? = null
         var fallback: app.whisp.data.WorkDetails? = null
         for (candidate in owned.sortedByDescending { it.workno.startsWith("VJ") }) {
             val detail =
                 try {
-                    repo.importDlsiteWork(source.id, candidate.workno)
+                    graph.sync.importDlsiteWork(source.id, candidate.workno)
                 } catch (e: IllegalArgumentException) {
-                    val latest = repo.dao.source(source.id)!!
+                    val latest = graph.library.dao.source(source.id)!!
                     val client =
                         app.whisp.data.DlsiteAccountClient(
-                            app.whisp.data.DlsiteSession(repo.secrets.decrypt(latest.secret)),
+                            app.whisp.data.DlsiteSession(graph.secrets.decrypt(latest.secret)),
                         )
                     val tree =
                         kotlinx.serialization.json.Json.parseToJsonElement(
@@ -83,12 +83,12 @@ class DlsiteAccountLiveIntegrationTest {
         var cueCount = 0
         track.subtitleId?.let { id ->
             val attachment = detail.attachments.first { it.id == id }
-            val text = repo.readAsset(id).toString(Charsets.UTF_8)
+            val text = graph.library.readAsset(id).toString(Charsets.UTF_8)
             cueCount =
                 SubtitleTimeline.parse(text, attachment.fileName.substringAfterLast('.')).size
             assertTrue("Caption association returned no timed cues", cueCount > 0)
         }
-        val item = repo.mediaItem(track, detail.work)
+        val item = graph.playback.mediaItem(track, detail.work)
         var player: ExoPlayer? = null
         fun onMain(action: (ExoPlayer) -> Unit) {
             instrumentation.runOnMainSync { action(player!!) }
@@ -109,7 +109,9 @@ class DlsiteAccountLiveIntegrationTest {
             instrumentation.runOnMainSync {
                 player =
                     ExoPlayer.Builder(context)
-                        .setMediaSourceFactory(DefaultMediaSourceFactory(repo.playbackFactory))
+                        .setMediaSourceFactory(
+                            DefaultMediaSourceFactory(graph.media.playbackFactory),
+                        )
                         .build()
                         .apply {
                             volume = 0f
@@ -136,23 +138,23 @@ class DlsiteAccountLiveIntegrationTest {
                 it.playbackState == Player.STATE_READY && it.currentPosition > target + 1200
             }
             onMain { it.stop() }
-            repo.offlineStore.downloadAttachments(detail.work.id)
+            graph.offline.downloadAttachments(detail.work.id)
             val request =
                 DownloadRequest.Builder(track.id, item.localConfiguration!!.uri)
                     .setCustomCacheKey(track.id)
                     .build()
             DownloadService.sendAddDownload(context, OfflineService::class.java, request, false)
             withTimeout(90_000) {
-                repo.downloads.first { states ->
+                graph.media.downloads.first { states ->
                     states[track.id]?.state in
                         setOf(Download.STATE_COMPLETED, Download.STATE_FAILED)
                 }
             }
-            assertEquals(Download.STATE_COMPLETED, repo.downloads.value[track.id]!!.state)
-            repo.removeSource(source.id)
-            assertTrue(repo.dlsitePurchases(source.id).first().isEmpty())
-            assertNull(repo.dao.source(source.id))
-            val offlineItem = repo.mediaItem(track, detail.work)
+            assertEquals(Download.STATE_COMPLETED, graph.media.downloads.value[track.id]!!.state)
+            graph.sync.removeSource(source.id)
+            assertTrue(graph.library.dlsitePurchases(source.id).first().isEmpty())
+            assertNull(graph.library.dao.source(source.id))
+            val offlineItem = graph.playback.mediaItem(track, detail.work)
             onMain {
                 it.setMediaItem(offlineItem)
                 it.prepare()
@@ -165,8 +167,8 @@ class DlsiteAccountLiveIntegrationTest {
             )
         } finally {
             instrumentation.runOnMainSync { player?.release() }
-            repo.offlineStore.removeOffline(detail.work.id)
-            repo.removeAsmrWork(detail.work.id)
+            graph.offline.removeOffline(detail.work.id)
+            graph.sync.removeOnlineWork(detail.work.id)
         }
     }
 }

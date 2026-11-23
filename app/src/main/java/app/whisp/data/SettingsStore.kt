@@ -6,10 +6,14 @@ import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.*
-import kotlinx.serialization.json.*
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 
 private val Context.preferences by preferencesDataStore("settings")
 
+private val settingsJson = Json { ignoreUnknownKeys = true }
+
+@Serializable
 data class Settings(
     val subtitleSize: Int = 21,
     val subtitleOffsetMs: Long = 0,
@@ -20,83 +24,72 @@ data class Settings(
     val touchFeedback: Boolean = true,
     val textEncoding: String = TextEncoding.AUTO,
     val playbackSpeed: Float = 1f,
-)
+    val legacyImagesMigrated: Boolean = false,
+) {
+    fun normalized(): Settings =
+        copy(
+            subtitleSize = subtitleSize.coerceIn(16, 30),
+            subtitleOffsetMs = subtitleOffsetMs.coerceIn(-10_000, 10_000),
+            streamingCacheMiB = streamingCacheMiB.takeIf { it in listOf(64, 128, 256, 512) } ?: 128,
+            textEncoding =
+                textEncoding.takeIf { it in TextEncoding.supported } ?: TextEncoding.AUTO,
+            playbackSpeed = playbackSpeed.coerceIn(0.5f, 2.0f),
+        )
+}
 
-internal class SettingsStore(private val context: Context, scope: CoroutineScope) {
-    private val sizeKey = intPreferencesKey("subtitle-size")
-    private val offsetKey = longPreferencesKey("subtitle-offset")
-    private val privateKey = booleanPreferencesKey("hide-artwork")
-    private val motionKey = booleanPreferencesKey("reduce-motion")
-    private val cacheKey = intPreferencesKey("streaming-cache-mib")
-    private val recentsKey = booleanPreferencesKey("hide-recents")
-    private val feedbackKey = booleanPreferencesKey("touch-feedback")
-    private val encodingKey = stringPreferencesKey("text-encoding")
-    private val speedKey = floatPreferencesKey("playback-speed")
+class SettingsStore(private val context: Context, scope: CoroutineScope) {
+    private val settingsKey = stringPreferencesKey("settings-json")
     private val searchHistoryKey = stringPreferencesKey("asmr-search-history")
 
-    // This flow has no placeholder value: background resumption must read real privacy preferences.
-    val settingsUpdates: Flow<Settings> =
-        context.preferences.data.map {
-            Settings(
-                it[sizeKey] ?: 21,
-                it[offsetKey] ?: 0,
-                it[privateKey] ?: false,
-                it[motionKey] ?: false,
-                it[cacheKey] ?: 128,
-                it[recentsKey] ?: false,
-                it[feedbackKey] ?: true,
-                it[encodingKey]?.takeIf { enc -> enc in TextEncoding.supported }
-                    ?: TextEncoding.AUTO,
-                (it[speedKey] ?: 1f).coerceIn(0.5f, 2.0f),
-            )
+    private fun decode(prefs: Preferences): Settings {
+        prefs[settingsKey]?.let { raw ->
+            runCatching { settingsJson.decodeFromString<Settings>(raw).normalized() }
+                .getOrNull()
+                ?.let {
+                    return it
+                }
         }
+        // Seamless one-way read of legacy individual keys from pre-v0.5 installs.
+        return Settings(
+                subtitleSize = prefs[intPreferencesKey("subtitle-size")] ?: 21,
+                subtitleOffsetMs = prefs[longPreferencesKey("subtitle-offset")] ?: 0,
+                hideArtwork = prefs[booleanPreferencesKey("hide-artwork")] ?: false,
+                reduceMotion = prefs[booleanPreferencesKey("reduce-motion")] ?: false,
+                streamingCacheMiB = prefs[intPreferencesKey("streaming-cache-mib")] ?: 128,
+                hideRecents = prefs[booleanPreferencesKey("hide-recents")] ?: false,
+                touchFeedback = prefs[booleanPreferencesKey("touch-feedback")] ?: true,
+                textEncoding = prefs[stringPreferencesKey("text-encoding")] ?: TextEncoding.AUTO,
+                playbackSpeed = prefs[floatPreferencesKey("playback-speed")] ?: 1f,
+            )
+            .normalized()
+    }
+
+    // No placeholder value: background resumption and privacy hooks read persisted preferences.
+    val settingsUpdates: Flow<Settings> =
+        context.preferences.data.map(::decode).distinctUntilChanged()
 
     val settings: StateFlow<Settings> =
         settingsUpdates.stateIn(scope, SharingStarted.Eagerly, Settings())
 
     val streamingCacheMiBUpdates: Flow<Int> =
-        context.preferences.data.map { it[cacheKey] ?: 128 }.distinctUntilChanged()
+        settingsUpdates.map { it.streamingCacheMiB }.distinctUntilChanged()
 
     val asmrSearchHistory: StateFlow<List<String>> =
         context.preferences.data
             .map { prefs ->
                 runCatching {
-                        Json.parseToJsonElement(prefs[searchHistoryKey] ?: "[]")
-                            .jsonArray
-                            .map { it.jsonPrimitive.content }
+                        settingsJson
+                            .decodeFromString<List<String>>(prefs[searchHistoryKey] ?: "[]")
                             .take(20)
                     }
                     .getOrDefault(emptyList())
             }
             .stateIn(scope, SharingStarted.Eagerly, emptyList())
 
-    suspend fun setSettings(
-        size: Int? = null,
-        offset: Long? = null,
-        hide: Boolean? = null,
-        reduceMotion: Boolean? = null,
-        streamingCacheMiB: Int? = null,
-        hideRecents: Boolean? = null,
-        touchFeedback: Boolean? = null,
-        textEncoding: String? = null,
-        playbackSpeed: Float? = null,
-    ) {
+    suspend fun update(transform: (Settings) -> Settings) {
         context.preferences.edit { prefs ->
-            size?.let { prefs[sizeKey] = it.coerceIn(16, 30) }
-            offset?.let { prefs[offsetKey] = it.coerceIn(-10000, 10000) }
-            hide?.let { prefs[privateKey] = it }
-            reduceMotion?.let { prefs[motionKey] = it }
-            hideRecents?.let { prefs[recentsKey] = it }
-            touchFeedback?.let { prefs[feedbackKey] = it }
-            streamingCacheMiB?.let {
-                require(it in listOf(64, 128, 256, 512))
-                prefs[cacheKey] = it
-            }
-            textEncoding?.let {
-                require(it in TextEncoding.supported)
-                prefs[encodingKey] = it
-            }
-            playbackSpeed?.let { prefs[speedKey] = it.coerceIn(0.5f, 2.0f) }
+            val updated = transform(decode(prefs)).normalized()
+            prefs[settingsKey] = settingsJson.encodeToString(updated)
         }
     }
 
@@ -105,14 +98,11 @@ internal class SettingsStore(private val context: Context, scope: CoroutineScope
         if (clean.isBlank()) return
         context.preferences.edit { prefs ->
             val previous = runCatching {
-                Json.parseToJsonElement(prefs[searchHistoryKey] ?: "[]").jsonArray.map {
-                    it.jsonPrimitive.content
-                }
+                settingsJson.decodeFromString<List<String>>(prefs[searchHistoryKey] ?: "[]")
             }
                 .getOrDefault(emptyList())
-            prefs[searchHistoryKey] =
-                JsonArray((listOf(clean) + previous).distinct().take(20).map(::JsonPrimitive))
-                    .toString()
+            val next = (listOf(clean) + previous).distinct().take(20)
+            prefs[searchHistoryKey] = settingsJson.encodeToString(next)
         }
     }
 

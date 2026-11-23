@@ -13,12 +13,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.viewmodel.initializer
-import androidx.lifecycle.viewmodel.viewModelFactory
-import app.whisp.ui.AppViewModel
 import app.whisp.ui.WhispRoot
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -52,13 +47,13 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
-        val repository = (application as WhispApp).repository
+        val graph = (application as WhispApp).graph
         if (Build.VERSION.SDK_INT >= 33) {
             // Keep cold-start previews private until the persisted preference is available.
             setRecentsScreenshotEnabled(false)
             updateBackgroundProtection()
             lifecycleScope.launch {
-                repository.settingsUpdates
+                graph.settings.settingsUpdates
                     .map { it.hideRecents }
                     .distinctUntilChanged()
                     .collect {
@@ -68,14 +63,7 @@ class MainActivity : ComponentActivity() {
                     }
             }
         }
-        val model =
-            ViewModelProvider(
-                this,
-                viewModelFactory {
-                    initializer { AppViewModel(repository, createSavedStateHandle()) }
-                },
-            )[AppViewModel::class.java]
-        setContent { WhispRoot(model, playerRequest) }
+        setContent { WhispRoot(graph, playerRequest) }
         if (Build.VERSION.SDK_INT >= 33)
             notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
     }

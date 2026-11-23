@@ -39,7 +39,8 @@ data class DlsiteOwnedWork(
             originalArtist = artist,
             coverId = coverUrl?.let { stableId("dlsite-cover|$it") },
             coverUrl = coverUrl,
-            origin = "dlsite",
+            origin = SourceKind.DLSITE.raw,
+            sourceId = sourceId,
         )
 
     fun encode() = Json.encodeToString(this)
@@ -53,6 +54,8 @@ internal fun decodeOwnedWork(snapshot: String): DlsiteOwnedWork? = runCatching {
 data class DlsiteAccount(val id: String)
 
 data class DlsitePurchaseSync(val works: List<DlsiteOwnedWork>, val completedAt: Long)
+
+@Serializable private data class WorknosRequest(val worknos: List<String>)
 
 class DlsiteAccountClient(
     val session: DlsiteSession,
@@ -131,7 +134,7 @@ class DlsiteAccountClient(
         http.dispatcher.executorService.shutdown()
     }
 
-    private suspend fun json(path: String, body: JsonElement? = null): JsonElement {
+    private suspend fun json(path: String, body: String? = null): JsonElement {
         val url = root.resolve(path) ?: error("DLsite 地址无效")
         val request =
             Request.Builder()
@@ -145,7 +148,7 @@ class DlsiteAccountClient(
                 ?.let {
                     request.header("X-XSRF-TOKEN", java.net.URLDecoder.decode(it.value, "UTF-8"))
                 }
-            request.post(body.toString().toRequestBody("application/json".toMediaType()))
+            request.post(body.toRequestBody("application/json".toMediaType()))
         }
         return try {
             Json.parseToJsonElement(
@@ -191,10 +194,7 @@ class DlsiteAccountClient(
         val result = mutableListOf<DlsiteOwnedWork>()
         for (ids in dates.keys.chunked(pageSize)) {
             val works =
-                json(
-                        "api/v4/content/works",
-                        buildJsonObject { put("worknos", JsonArray(ids.map(::JsonPrimitive))) },
-                    )
+                json("api/v4/content/works", Json.encodeToString(WorknosRequest(ids)))
                     .jsonObject["works"]
                     ?.jsonArray ?: throw IOException("DLsite 购买库格式错误")
             works.forEach { parseOwned(it.jsonObject, dates)?.let(result::add) }
@@ -207,8 +207,6 @@ class DlsiteAccountClient(
                     as? JsonArray ?: throw IOException("DLsite 购买库格式错误")
             works.forEach { parseOwned(it.jsonObject, dates)?.let(result::add) }
         }
-        // Guard against a fast device clock skipping newly bought works on the next incremental
-        // sync.
         val serverTime = latestServerDateMs.get()
         val completedAt = if (serverTime > 0) minOf(started, serverTime) else started
         return DlsitePurchaseSync(result.distinctBy { it.workno }, completedAt)
@@ -223,12 +221,11 @@ class DlsiteAccountClient(
         return parseOwned(item, emptyMap()) ?: throw DlsiteNoPlayableAudioException("作品暂无可播放音声")
     }
 
-    suspend fun index(work: DlsiteOwnedWork, sourceId: String, generation: Long): IndexedLibrary {
+    suspend fun index(work: DlsiteOwnedWork, sourceId: String): IndexedLibrary {
         val tree = resourceBytes(work.workno, "ziptree.json", 8 * 1024 * 1024)
         return DlsiteFileTree.index(
             work,
             sourceId,
-            generation,
             Json.parseToJsonElement(tree.toString(Charsets.UTF_8)).jsonObject,
         )
     }

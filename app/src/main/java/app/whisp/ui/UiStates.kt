@@ -2,22 +2,12 @@
 package app.whisp.ui
 
 import androidx.media3.common.Player
-import app.whisp.data.AsmrPreview
-import app.whisp.data.AsmrWork
 import app.whisp.data.DlsiteDetails
 
 data class DlsiteUiState(
     val details: DlsiteDetails? = null,
     val loading: Set<String> = emptySet(),
     val errors: Map<String, String> = emptyMap(),
-)
-
-data class AsmrPreviewState(
-    val sourceId: String = "",
-    val seed: AsmrWork? = null,
-    val preview: AsmrPreview? = null,
-    val loading: Boolean = false,
-    val error: String? = null,
 )
 
 data class PlaybackState(

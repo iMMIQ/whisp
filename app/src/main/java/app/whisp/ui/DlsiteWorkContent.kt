@@ -16,38 +16,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.whisp.data.*
 import java.util.Locale
-
-@Composable
-internal fun rememberDlsiteWork(
-    model: AppViewModel,
-    workId: String,
-    rj: String?,
-    tab: String,
-    seed: DlsiteDetails? = null,
-): DlsiteUiState {
-    val states by model.dlsiteStates.collectAsStateWithLifecycle()
-    val stored by
-        remember(workId) { model.repository.dlsiteDetails(workId) }
-            .collectAsStateWithLifecycle(initialValue = null)
-    LaunchedEffect(workId, stored) { stored?.let { model.acceptDlsiteDetails(workId, it) } }
-    LaunchedEffect(workId, rj, seed) {
-        if (rj != null) model.loadDlsiteDetails(workId, rj, seed = seed)
-    }
-    LaunchedEffect(workId, rj, tab) {
-        if (rj != null && tab == "介绍") model.loadDlsiteDetails(workId, rj, "description", seed)
-        if (rj != null && tab == "资料") model.loadDlsiteDetails(workId, rj, "statistics", seed)
-    }
-    return states[workId] ?: DlsiteUiState(seed)
-}
 
 @Composable
 internal fun OfficialCircle(details: DlsiteDetails?, filter: ((AsmrFacet) -> Unit)? = null) {
@@ -86,9 +63,8 @@ internal fun WorkContentTabs(tab: String, select: (String) -> Unit) {
 internal fun LazyListScope.dlsiteContent(
     tab: String,
     state: DlsiteUiState,
-    model: AppViewModel,
-    workId: String,
     rj: String?,
+    onLoad: (part: String, force: Boolean) -> Unit,
     seed: DlsiteDetails? = null,
     filter: ((AsmrFacet) -> Unit)? = null,
 ) {
@@ -96,35 +72,31 @@ internal fun LazyListScope.dlsiteContent(
     val part = if (tab == "介绍") "description" else "statistics"
     item(key = "dlsite-status:$tab") {
         Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp)) {
-            if (rj != null)
+            if (rj != null) {
                 Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
                     IconAction(
                         Icons.Outlined.Refresh,
                         if (tab == "介绍") "刷新作品介绍" else "刷新作品资料",
                         Muted,
                     ) {
-                        model.loadDlsiteDetails(workId, rj, "product", seed, force = true)
-                        model.loadDlsiteDetails(workId, rj, part, seed, force = true)
+                        onLoad("product", true)
+                        onLoad(part, true)
                     }
                 }
+            }
             for (section in listOf("product", part)) {
-                if (section in state.loading)
+                if (section in state.loading) {
                     Box(
                         Modifier.fillMaxWidth().padding(16.dp),
                         contentAlignment = Alignment.Center,
                     ) {
                         CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
                     }
+                }
                 state.errors[section]?.let { error ->
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text(error, Modifier.weight(1f), color = Muted, fontSize = 15.sp)
-                        TextButton(
-                            onClick = {
-                                rj?.let {
-                                    model.loadDlsiteDetails(workId, it, section, seed, force = true)
-                                }
-                            },
-                        ) {
+                        TextButton(onClick = { if (rj != null) onLoad(section, true) }) {
                             Text("重试")
                         }
                     }
@@ -133,11 +105,11 @@ internal fun LazyListScope.dlsiteContent(
         }
     }
     if (tab == "介绍") {
-        if (details?.description?.isNotEmpty() == true)
+        if (details?.description?.isNotEmpty() == true) {
             items(details.description.size, key = { "description:$it" }) { index ->
                 val block = details.description[index]
                 when (block.kind) {
-                    "image" -> block.url?.let { OfficialImage(model, it, block.text) }
+                    "image" -> block.url?.let { OfficialImage(it, block.text) }
                     "heading" ->
                         Text(
                             block.text,
@@ -155,20 +127,21 @@ internal fun LazyListScope.dlsiteContent(
                         )
                 }
             }
-        else {
+        } else {
             details?.summary?.takeIf(String::isNotBlank)?.let { summary ->
                 item {
                     Text(summary, Modifier.padding(24.dp), fontSize = 16.sp, lineHeight = 27.sp)
                 }
             }
             details?.images.orEmpty().forEachIndexed { index, url ->
-                item(key = "sample:$index") { OfficialImage(model, url, "作品预览图") }
+                item(key = "sample:$index") { OfficialImage(url, "作品预览图") }
             }
             if (
                 details?.descriptionFetchedAt?.let { it > 0 } == true &&
                     details.description.isEmpty()
-            )
+            ) {
                 item { Text("暂无介绍", Modifier.padding(24.dp), color = Muted) }
+            }
         }
     } else if (details != null) {
         item {
@@ -227,7 +200,7 @@ internal fun LazyListScope.dlsiteContent(
                 }
                 val uri = LocalUriHandler.current
                 TextButton(
-                    onClick = { uri.openUri(officialWorkUrl(details.rj)) },
+                    onClick = { uri.openUri(dlsiteWorkUrl(details.rj)) },
                     Modifier.align(Alignment.End),
                 ) {
                     Text("DLsite")
@@ -236,7 +209,7 @@ internal fun LazyListScope.dlsiteContent(
                 }
             }
         }
-        if (details.genres.isNotEmpty())
+        if (details.genres.isNotEmpty()) {
             item {
                 LazyRow(
                     contentPadding = PaddingValues(horizontal = 24.dp),
@@ -256,6 +229,7 @@ internal fun LazyListScope.dlsiteContent(
                     }
                 }
             }
+        }
         details.originalRj?.let { id -> item { RelatedLink("原作", DlsiteRelatedWork(id)) } }
         details.translationParentRj
             ?.takeUnless { it == details.originalRj }
@@ -267,8 +241,6 @@ internal fun LazyListScope.dlsiteContent(
         if (details.seriesWorks.isNotEmpty()) item { RelatedWorks("同系列", details.seriesWorks) }
     }
 }
-
-private fun officialWorkUrl(rj: String) = app.whisp.data.dlsiteWorkUrl(rj)
 
 @Composable
 private fun MetadataField(label: String, value: String, click: (() -> Unit)? = null) {
@@ -285,32 +257,31 @@ private fun MetadataField(label: String, value: String, click: (() -> Unit)? = n
 }
 
 @Composable
-private fun OfficialImage(model: AppViewModel, url: String, label: String) {
+private fun OfficialImage(url: String, label: String) {
     var enlarged by remember { mutableStateOf(false) }
+    val image = remember(url) { WhispImage.Official(stableId("dlsite-image|$url"), url) }
     Artwork(
-        model,
-        stableId("dlsite-image|$url"),
-        label.ifBlank { "作品介绍图" },
-        Modifier.fillMaxWidth()
-            .padding(horizontal = 24.dp, vertical = 10.dp)
-            .heightIn(min = 180.dp)
-            .aspectRatio(1.4f)
-            .clip(RoundedCornerShape(14.dp))
-            .clickable { enlarged = true },
-        scale = androidx.compose.ui.layout.ContentScale.Fit,
-        officialUrl = url,
+        image = image,
+        description = label.ifBlank { "作品介绍图" },
+        modifier =
+            Modifier.fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 10.dp)
+                .heightIn(min = 180.dp)
+                .aspectRatio(1.4f)
+                .clip(RoundedCornerShape(14.dp))
+                .clickable { enlarged = true },
+        scale = ContentScale.Fit,
     )
-    if (enlarged)
+    if (enlarged) {
         WhispSheet({ enlarged = false }) { _ ->
             Artwork(
-                model,
-                stableId("dlsite-image|$url"),
-                label.ifBlank { "作品介绍图" },
-                Modifier.fillMaxWidth().heightIn(min = 300.dp, max = 620.dp),
-                scale = androidx.compose.ui.layout.ContentScale.Fit,
-                officialUrl = url,
+                image = image,
+                description = label.ifBlank { "作品介绍图" },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 300.dp, max = 620.dp),
+                scale = ContentScale.Fit,
             )
         }
+    }
 }
 
 @Composable
@@ -324,13 +295,14 @@ private fun RelatedWorks(label: String, works: List<DlsiteRelatedWork>) {
             fontSize = 22.sp,
         )
         works.take(if (expanded) 100 else 4).forEach { RelatedLink(null, it) }
-        if (works.size > 4)
+        if (works.size > 4) {
             TextButton(
                 onClick = { expanded = !expanded },
                 Modifier.align(Alignment.End).padding(end = 16.dp),
             ) {
                 Text(if (expanded) "收起" else "查看全部")
             }
+        }
     }
 }
 
@@ -339,19 +311,20 @@ private fun RelatedLink(label: String?, work: DlsiteRelatedWork) {
     val uri = LocalUriHandler.current
     Row(
         Modifier.fillMaxWidth()
-            .clickable { uri.openUri(officialWorkUrl(work.rj)) }
+            .clickable { uri.openUri(dlsiteWorkUrl(work.rj)) }
             .padding(horizontal = 24.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
             if (label != null) Text(label, color = Muted, fontSize = 15.sp)
             Text(work.title.ifBlank { work.rj }, fontSize = 16.sp, lineHeight = 24.sp)
-            if (work.languages.isNotEmpty())
+            if (work.languages.isNotEmpty()) {
                 Text(
                     work.languages.joinToString(" / ", transform = ::dlsiteLanguage),
                     color = Muted,
                     fontSize = 14.sp,
                 )
+            }
         }
         Icon(
             Icons.AutoMirrored.Outlined.OpenInNew,

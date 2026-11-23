@@ -2,7 +2,6 @@
 package app.whisp.data
 
 import java.net.URI
-import java.net.URLDecoder
 
 data class NfsAddress(
     val host: String,
@@ -70,7 +69,7 @@ data class NfsAddress(
             return NfsAddress(
                 uri.host.lowercase(),
                 if (uri.port == -1) 2049 else uri.port,
-                "/" + decodeSegments(uri.rawPath.orEmpty()).joinToString("/"),
+                "/" + RemoteAssetUri.decodeSegments(uri.rawPath.orEmpty()).joinToString("/"),
                 protocol,
                 number("uid", uid),
                 number("gid", gid),
@@ -78,44 +77,13 @@ data class NfsAddress(
             )
         }
 
-        fun assetUri(sourceId: String, relative: String): String {
-            require(sourceId.matches(Regex("[A-Za-z0-9_-]+")))
-            return URI("whisp-nfs", sourceId, "/" + safeSegments(relative).joinToString("/"), null)
-                .toASCIIString()
-        }
+        fun assetUri(sourceId: String, relative: String): String =
+            RemoteAssetUri.encode("whisp-nfs", sourceId, relative, forbidBackslash = false)
 
-        fun assetPath(value: String, sourceId: String): String {
-            val uri = URI(value)
-            require(
-                uri.scheme == "whisp-nfs" &&
-                    uri.rawAuthority == sourceId &&
-                    uri.query == null &&
-                    uri.fragment == null,
-            ) {
-                "来源未关联"
-            }
-            return decodeSegments(uri.rawPath.orEmpty()).joinToString("/")
-        }
+        fun assetPath(value: String, sourceId: String): String =
+            RemoteAssetUri.decode(value, "whisp-nfs", sourceId, forbidBackslash = false)
 
         fun safeSegments(path: String): List<String> =
-            path.split('/').filter { it.isNotEmpty() }.onEach(::validateSegment)
-
-        private fun decodeSegments(path: String): List<String> =
-            path
-                .split('/')
-                .filter { it.isNotEmpty() }
-                .map {
-                    URLDecoder.decode(it.replace("+", "%2B"), "UTF-8").also(::validateSegment)
-                }
-
-        private fun validateSegment(segment: String) {
-            require(
-                segment != "." &&
-                    segment != ".." &&
-                    segment.none { it == '/' || it.code < 32 || it.code == 127 },
-            ) {
-                "目录包含无效字符"
-            }
-        }
+            RemoteAssetUri.safeSegments(path, forbidBackslash = false)
     }
 }

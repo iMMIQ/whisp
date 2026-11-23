@@ -38,29 +38,46 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
+import app.whisp.AppGraph
 import app.whisp.R
 import app.whisp.data.*
+import app.whisp.playback.PlaybackCoordinator
+import java.util.UUID
+import kotlin.math.abs
+import kotlinx.coroutines.launch
+
+/** Subtitle auto-scroll policy: animate only single-step transitions while visible. */
+internal object SubtitleFollow {
+    fun animate(previous: Int, current: Int, visible: Boolean, reducedMotion: Boolean): Boolean =
+        !reducedMotion &&
+            visible &&
+            previous >= 0 &&
+            previous != current &&
+            abs(current - previous) <= 1
+}
 
 @Composable
 internal fun PlayerPage(
     detail: WorkDetails?,
     track: TrackEntity?,
-    model: AppViewModel,
+    graph: AppGraph,
     back: () -> Unit,
 ) {
-    val state by model.player.collectAsStateWithLifecycle()
-    val cues by model.cues.collectAsStateWithLifecycle()
-    val loading by model.subtitleLoading.collectAsStateWithLifecycle()
-    val subtitleError by model.subtitleError.collectAsStateWithLifecycle()
-    val queueTracks by model.queueTracks.collectAsStateWithLifecycle()
-    val opening by model.openingTrackId.collectAsStateWithLifecycle()
-    val settings by model.settings.collectAsStateWithLifecycle()
-    val audioOnly by model.audioOnly.collectAsStateWithLifecycle()
-    val embeddedSubtitle by model.embeddedSubtitle.collectAsStateWithLifecycle()
+    val playback = graph.playback
+    val state by playback.state.collectAsStateWithLifecycle()
+    val cues by playback.subtitles.cues.collectAsStateWithLifecycle()
+    val loading by playback.subtitles.loading.collectAsStateWithLifecycle()
+    val subtitleError by playback.subtitles.error.collectAsStateWithLifecycle()
+    val queueTracks by playback.queueTracks.collectAsStateWithLifecycle()
+    val opening by playback.openingTrackId.collectAsStateWithLifecycle()
+    val settings by graph.settings.settings.collectAsStateWithLifecycle()
+    val audioOnly by playback.audioOnly.collectAsStateWithLifecycle()
+    val embeddedSubtitle by playback.embeddedSubtitle.collectAsStateWithLifecycle()
+    val markA by playback.loopDraftStart.collectAsStateWithLifecycle()
+    val bookmarks by graph.library.bookmarks.collectAsStateWithLifecycle()
+    val history by graph.library.progress.collectAsStateWithLifecycle()
+
     var fullscreen by rememberSaveable { mutableStateOf(false) }
-    val context = LocalContext.current
-    val haptics = rememberWhispHaptics()
-    val bookmarks by model.bookmarks.collectAsStateWithLifecycle()
     var queue by rememberSaveable { mutableStateOf(false) }
     var fragments by rememberSaveable { mutableStateOf(false) }
     var timer by rememberSaveable { mutableStateOf(false) }
@@ -69,14 +86,17 @@ internal fun PlayerPage(
     var subtitleAction by remember(track?.id) { mutableStateOf<Cue?>(null) }
     var more by rememberSaveable { mutableStateOf(false) }
     var precise by rememberSaveable { mutableStateOf(false) }
-    val markA by model.loopDraftStart.collectAsStateWithLifecycle()
-    val history by model.progress.collectAsStateWithLifecycle()
+
+    val context = LocalContext.current
+    val haptics = rememberWhispHaptics()
+    val scope = rememberCoroutineScope()
+
     val fallbackPosition =
         remember(history, track?.id) {
             history.firstOrNull { it.trackId == track?.id }?.positionMs ?: 0L
         }
     LaunchedEffect(track?.id, state.trackId) {
-        if (state.trackId == null) model.loadSubtitles(track?.id)
+        if (state.trackId == null) playback.subtitles.load(track?.id)
     }
     val shownTrack = track?.takeIf { it.id == state.trackId && opening == null }
     if (detail == null || track == null) {
@@ -90,8 +110,9 @@ internal fun PlayerPage(
     val showVideo = video && !audioOnly && (shownTrack != null || opening != null)
     LaunchedEffect(showVideo) { if (!showVideo) fullscreen = false }
     BackHandler(fullscreen && showVideo) { fullscreen = false }
+
     if (fullscreen && showVideo) {
-        val timeline = model.position.collectAsStateWithLifecycle()
+        val timeline = playback.positionMs.collectAsStateWithLifecycle()
         val caption by
             remember(
                 cues,
@@ -113,13 +134,13 @@ internal fun PlayerPage(
                 }
             }
         FullScreenVideo(
-            model,
-            track.id,
-            track.title,
-            state,
-            shownTrack != null,
-            caption,
-            settings.subtitleSize,
+            playback = playback,
+            trackId = track.id,
+            title = track.title,
+            state = state,
+            active = shownTrack != null,
+            caption = caption,
+            subtitleSize = settings.subtitleSize,
             exit = { fullscreen = false },
             timeline = {
                 PlayerTimeline(
@@ -128,115 +149,91 @@ internal fun PlayerPage(
                     shownTrack = shownTrack,
                     markA = markA,
                     fallbackPosition = fallbackPosition,
-                    model = model,
+                    playback = playback,
                 )
             },
         )
-    } else
+    } else {
         BoxWithConstraints(Modifier.fillMaxSize().navigationBarsPadding()) {
             val width = maxWidth
             val height = maxHeight
-            if (width > height)
+            val cover: @Composable (Modifier) -> Unit = { mod ->
+                PlayerCover(
+                    detail = detail,
+                    track = track,
+                    state = state,
+                    shownTrack = shownTrack,
+                    video = video,
+                    showVideo = showVideo,
+                    audioOnly = audioOnly,
+                    playback = playback,
+                    onToggleFavorite = {
+                        scope.launch { graph.library.toggleFavorite(detail.work.id) }
+                    },
+                    back = back,
+                    onFullscreen = { fullscreen = true },
+                    modifier = mod,
+                )
+            }
+            val controls: @Composable (Modifier) -> Unit = { mod ->
+                PlayerControls(
+                    track = track,
+                    state = state,
+                    shownTrack = shownTrack,
+                    opening = opening,
+                    cues = cues,
+                    loading = loading,
+                    subtitleError = subtitleError,
+                    embeddedSubtitle = embeddedSubtitle,
+                    settings = settings,
+                    markA = markA,
+                    fallbackPosition = fallbackPosition,
+                    hasQueue = queueTracks.isNotEmpty(),
+                    playback = playback,
+                    onSelectSubtitle = { subtitleAction = it },
+                    onBookmarkCue = { cue ->
+                        bookmark = BookmarkDraft.fromCue(track.id, cue, settings.subtitleOffsetMs)
+                    },
+                    onOpenQueue = { queue = true },
+                    onOpenFragments = { fragments = true },
+                    onOpenTimer = { timer = true },
+                    onOpenMore = { more = true },
+                    modifier = mod,
+                )
+            }
+            if (width > height) {
                 Row(Modifier.fillMaxSize()) {
-                    PlayerCover(
-                        detail = detail,
-                        track = track,
-                        state = state,
-                        shownTrack = shownTrack,
-                        video = video,
-                        showVideo = showVideo,
-                        audioOnly = audioOnly,
-                        model = model,
-                        back = back,
-                        onFullscreen = { fullscreen = true },
-                        modifier =
-                            Modifier.fillMaxHeight().width(width * if (showVideo) .55f else .38f),
-                    )
-                    PlayerControls(
-                        track = track,
-                        state = state,
-                        shownTrack = shownTrack,
-                        opening = opening,
-                        cues = cues,
-                        loading = loading,
-                        subtitleError = subtitleError,
-                        embeddedSubtitle = embeddedSubtitle,
-                        settings = settings,
-                        markA = markA,
-                        fallbackPosition = fallbackPosition,
-                        hasQueue = queueTracks.isNotEmpty(),
-                        model = model,
-                        onSelectSubtitle = { subtitleAction = it },
-                        onBookmarkCue = { cue ->
-                            bookmark =
-                                BookmarkDraft.fromCue(track.id, cue, settings.subtitleOffsetMs)
-                        },
-                        onOpenQueue = { queue = true },
-                        onOpenFragments = { fragments = true },
-                        onOpenTimer = { timer = true },
-                        onOpenMore = { more = true },
-                        modifier = Modifier.weight(1f).fillMaxHeight(),
-                    )
+                    cover(Modifier.fillMaxHeight().width(width * if (showVideo) .55f else .38f))
+                    controls(Modifier.weight(1f).fillMaxHeight())
                 }
-            else
+            } else {
                 Column(Modifier.fillMaxSize()) {
-                    PlayerCover(
-                        detail = detail,
-                        track = track,
-                        state = state,
-                        shownTrack = shownTrack,
-                        video = video,
-                        showVideo = showVideo,
-                        audioOnly = audioOnly,
-                        model = model,
-                        back = back,
-                        onFullscreen = { fullscreen = true },
-                        modifier =
-                            Modifier.fillMaxWidth()
-                                .height(
-                                    if (showVideo)
-                                        minOf(
-                                            width / state.videoAspectRatio.coerceIn(.5f, 3f),
-                                            height * .43f,
-                                        )
-                                    else height * .29f,
-                                ),
+                    cover(
+                        Modifier.fillMaxWidth()
+                            .height(
+                                if (showVideo)
+                                    minOf(
+                                        width / state.videoAspectRatio.coerceIn(.5f, 3f),
+                                        height * .43f,
+                                    )
+                                else height * .29f,
+                            ),
                     )
-                    PlayerControls(
-                        track = track,
-                        state = state,
-                        shownTrack = shownTrack,
-                        opening = opening,
-                        cues = cues,
-                        loading = loading,
-                        subtitleError = subtitleError,
-                        embeddedSubtitle = embeddedSubtitle,
-                        settings = settings,
-                        markA = markA,
-                        fallbackPosition = fallbackPosition,
-                        hasQueue = queueTracks.isNotEmpty(),
-                        model = model,
-                        onSelectSubtitle = { subtitleAction = it },
-                        onBookmarkCue = { cue ->
-                            bookmark =
-                                BookmarkDraft.fromCue(track.id, cue, settings.subtitleOffsetMs)
-                        },
-                        onOpenQueue = { queue = true },
-                        onOpenFragments = { fragments = true },
-                        onOpenTimer = { timer = true },
-                        onOpenMore = { more = true },
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
-                    )
+                    controls(Modifier.weight(1f).fillMaxWidth())
                 }
+            }
         }
-    if (queue)
+    }
+
+    if (queue) {
         PlayerQueueSheet(
             queueTracks = queueTracks,
             activeTrackId = state.trackId,
-            onSelect = model::selectQueuedTrack,
+            onSelect = playback::selectQueuedTrack,
             onDismiss = { queue = false },
         )
-    if (fragments)
+    }
+    if (fragments) {
         PlayerFragmentsSheet(
             detail = detail,
             track = track,
@@ -246,24 +243,38 @@ internal fun PlayerPage(
             cues = cues,
             settings = settings,
             bookmarks = bookmarks,
-            model = model,
+            playback = playback,
+            onDeleteBookmark = { id -> scope.launch { graph.library.deleteBookmark(id) } },
             haptics = haptics,
             onCreateBookmark = { bookmark = it },
             onDismiss = { fragments = false },
         )
-    if (timer)
+    }
+    if (timer) {
         SleepTimerDialog(
             timerEnd = state.timerEnd,
             haptics = haptics,
-            onSelectMinutes = model::timer,
+            onSelectMinutes = playback::setTimer,
             onDismiss = { timer = false },
         )
+    }
     bookmark?.let { draft ->
         SaveBookmarkDialog(
             draft = draft,
             haptics = haptics,
             onSave = { title ->
-                model.saveBookmark(title, draft.end, draft.position, draft.trackId)
+                scope.launch {
+                    graph.library.saveBookmark(
+                        BookmarkEntity(
+                            id = UUID.randomUUID().toString(),
+                            workId = detail.work.id,
+                            trackId = draft.trackId,
+                            positionMs = draft.position,
+                            title = title.ifBlank { clock(draft.position) },
+                            endMs = draft.end,
+                        ),
+                    )
+                }
             },
             onDismiss = { bookmark = null },
         )
@@ -274,7 +285,7 @@ internal fun PlayerPage(
             subtitleSize = settings.subtitleSize,
             canSeek = shownTrack != null,
             onPlayFromHere = {
-                model.playWork(
+                playback.playWork(
                     detail,
                     track.id,
                     startPosition = cue.startMs + settings.subtitleOffsetMs,
@@ -286,33 +297,35 @@ internal fun PlayerPage(
             onDismiss = { subtitleAction = null },
         )
     }
-    if (more)
+    if (more) {
         PlayerMoreSheet(
             context = context,
             onPreciseSeek = { precise = true },
             onPreferences = { preferences = true },
-            onRestart = { model.playWork(detail, restart = true) },
-            onExportDiagnostics = model::exportPlaybackDiagnostics,
+            onRestart = { playback.playWork(detail, restart = true) },
             onDismiss = { more = false },
         )
+    }
     if (precise) {
         val duration = state.durationMs.takeIf { it > 0 } ?: track.durationMs
         PreciseSeekDialog(
             trackId = track.id,
             duration = duration,
             canSeek = shownTrack != null,
-            initialPosition = model::currentPosition,
-            onSeek = model::seek,
+            initialPosition = playback::currentPosition,
+            onSeek = playback::seek,
             onDismiss = { precise = false },
         )
     }
-    if (preferences)
+    if (preferences) {
         PlaybackPreferencesDialog(
             settings = settings,
             currentSpeed = state.speed,
-            model = model,
+            onSpeedChange = playback::setPlaybackSpeed,
+            onUpdateSettings = { transform -> scope.launch { graph.settings.update(transform) } },
             onDismiss = { preferences = false },
         )
+    }
 }
 
 @Composable
@@ -324,28 +337,29 @@ private fun PlayerCover(
     video: Boolean,
     showVideo: Boolean,
     audioOnly: Boolean,
-    model: AppViewModel,
+    playback: PlaybackCoordinator,
+    onToggleFavorite: () -> Unit,
     back: () -> Unit,
     onFullscreen: () -> Unit,
     modifier: Modifier,
 ) {
     Box(modifier.background(Surface)) {
-        if (showVideo)
+        if (showVideo) {
             VideoOutput(
-                model,
-                track.id,
-                shownTrack != null,
-                state.playing,
-                Modifier.matchParentSize(),
+                playback = playback,
+                trackId = track.id,
+                active = shownTrack != null,
+                playing = state.playing,
+                modifier = Modifier.matchParentSize(),
             )
-        else
+        } else {
             Artwork(
-                model,
-                detail.work.coverId,
-                detail.work.title,
-                Modifier.matchParentSize(),
+                image = detail.work.coverId?.let { WhispImage.Asset(it) },
+                description = detail.work.title,
+                modifier = Modifier.matchParentSize(),
                 sharedKey = detail.work.id.takeUnless { video },
             )
+        }
         Box(
             Modifier.matchParentSize()
                 .background(
@@ -363,13 +377,14 @@ private fun PlayerCover(
                     action = back,
                 )
                 Row {
-                    if (video)
+                    if (video) {
                         IconAction(
                             if (audioOnly) Icons.Outlined.Videocam else Icons.Outlined.Headphones,
                             if (audioOnly) "显示画面" else "只听声音",
                         ) {
-                            model.setAudioOnly(!audioOnly)
+                            playback.setAudioOnly(!audioOnly)
                         }
+                    }
                     IconAction(
                         if (detail.work.favorite) Icons.Outlined.Favorite
                         else Icons.Outlined.FavoriteBorder,
@@ -377,9 +392,8 @@ private fun PlayerCover(
                         if (detail.work.favorite) Rose else Cream,
                         enabled = true,
                         feedback = true,
-                    ) {
-                        model.favorite(detail.work.id)
-                    }
+                        action = onToggleFavorite,
+                    )
                 }
             }
         }
@@ -399,12 +413,13 @@ private fun PlayerCover(
                         bottom = 12.dp,
                     ),
         )
-        if (showVideo)
+        if (showVideo) {
             Box(Modifier.align(Alignment.BottomEnd).padding(8.dp)) {
                 IconAction(Icons.Outlined.Fullscreen, "全屏", enabled = shownTrack != null) {
                     onFullscreen()
                 }
             }
+        }
     }
 }
 
@@ -418,7 +433,7 @@ private fun PlayerSubtitles(
     embeddedSubtitle: String,
     settings: Settings,
     fallbackPosition: Long,
-    model: AppViewModel,
+    playback: PlaybackCoordinator,
     onSelect: (Cue) -> Unit,
     onBookmark: (Cue) -> Unit,
     modifier: Modifier,
@@ -438,9 +453,8 @@ private fun PlayerSubtitles(
         }
         return
     }
-    // Collecting model.position inside PlayerSubtitles isolates 200ms ticks from the rest of
-    // PlayerPage.
-    val timeline = model.position.collectAsStateWithLifecycle()
+    // Collecting positionMs inside PlayerSubtitles isolates timeline ticks from PlayerPage.
+    val timeline = playback.positionMs.collectAsStateWithLifecycle()
     key(track.id) {
         val cueState by
             remember(cues, track.id, activeTrackId, fallbackPosition, settings.subtitleOffsetMs) {
@@ -452,15 +466,15 @@ private fun PlayerSubtitles(
                 }
             }
         SubtitlePane(
-            cues,
-            loading,
-            subtitleError,
-            cueState.first,
-            cueState.second,
-            settings.subtitleSize,
-            modifier,
+            cues = cues,
+            loading = loading,
+            error = subtitleError,
+            anchor = cueState.first,
+            active = cueState.second,
+            size = settings.subtitleSize,
+            modifier = modifier,
             onSelect = onSelect,
-            onRetry = { model.retrySubtitles(track.id) },
+            onRetry = { playback.subtitles.retry(track.id) },
             onBookmark = onBookmark,
         )
     }
@@ -473,9 +487,9 @@ private fun PlayerTimeline(
     shownTrack: TrackEntity?,
     markA: Long,
     fallbackPosition: Long,
-    model: AppViewModel,
+    playback: PlaybackCoordinator,
 ) {
-    val timeline = model.position.collectAsStateWithLifecycle()
+    val timeline = playback.positionMs.collectAsStateWithLifecycle()
     var dragging by remember(track.id) { mutableStateOf<Long?>(null) }
     val duration =
         state.durationMs.takeIf { state.trackId == track.id && it > 0 } ?: track.durationMs
@@ -491,7 +505,7 @@ private fun PlayerTimeline(
                 loopStart = state.loopStart.takeIf { it >= 0 } ?: markA,
                 loopEnd = state.loopEnd,
                 onPreview = { dragging = it },
-                onSeek = model::seek,
+                onSeek = playback::seek,
             )
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -515,7 +529,7 @@ private fun PlayerControls(
     markA: Long,
     fallbackPosition: Long,
     hasQueue: Boolean,
-    model: AppViewModel,
+    playback: PlaybackCoordinator,
     onSelectSubtitle: (Cue) -> Unit,
     onBookmarkCue: (Cue) -> Unit,
     onOpenQueue: () -> Unit,
@@ -550,7 +564,7 @@ private fun PlayerControls(
             embeddedSubtitle = embeddedSubtitle,
             settings = settings,
             fallbackPosition = fallbackPosition,
-            model = model,
+            playback = playback,
             onSelect = onSelectSubtitle,
             onBookmark = onBookmarkCue,
             modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -561,7 +575,7 @@ private fun PlayerControls(
             shownTrack = shownTrack,
             markA = markA,
             fallbackPosition = fallbackPosition,
-            model = model,
+            playback = playback,
         )
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 7.dp),
@@ -572,14 +586,14 @@ private fun PlayerControls(
                 Icons.Outlined.SkipPrevious,
                 stringResource(R.string.action_previous_track),
                 enabled = opening == null && state.hasPrevious,
-                action = model::previous,
+                action = playback::previous,
             )
             IconAction(
                 Icons.Outlined.Replay10,
                 stringResource(R.string.action_rewind_10),
                 enabled = shownTrack != null,
             ) {
-                model.skip(-10000)
+                playback.skip(-10_000)
             }
             Box(contentAlignment = Alignment.Center) {
                 val interaction = remember { MutableInteractionSource() }
@@ -592,7 +606,7 @@ private fun PlayerControls(
                         label = "play-press",
                     )
                 FilledIconButton(
-                    onClick = model::togglePlay,
+                    onClick = playback::togglePlay,
                     modifier = Modifier.size(62.dp),
                     shape = CircleShape,
                     interactionSource = interaction,
@@ -606,25 +620,26 @@ private fun PlayerControls(
                         },
                     )
                 }
-                if (state.buffering)
+                if (state.buffering) {
                     CircularProgressIndicator(
                         Modifier.size(66.dp),
                         color = Rose,
                         strokeWidth = 1.dp,
                     )
+                }
             }
             IconAction(
                 Icons.Outlined.Forward10,
                 stringResource(R.string.action_forward_10),
                 enabled = shownTrack != null,
             ) {
-                model.skip(10000)
+                playback.skip(10_000)
             }
             IconAction(
                 Icons.Outlined.SkipNext,
                 stringResource(R.string.action_next_track),
                 enabled = opening == null && state.hasNext,
-                action = model::next,
+                action = playback::next,
             )
         }
         Row(
@@ -644,7 +659,7 @@ private fun PlayerControls(
                 repeatLabel,
                 if (state.repeatMode != Player.REPEAT_MODE_OFF) Rose else Muted,
                 enabled = shownTrack != null,
-                action = model::cycleRepeatMode,
+                action = playback::cycleRepeatMode,
             )
             IconAction(
                 Icons.Outlined.Bookmarks,
@@ -698,19 +713,21 @@ private fun SubtitlePane(
             val item = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == anchor }
             val animate = SubtitleFollow.animate(previousAnchor, anchor, item != null, reduced)
             previousAnchor = anchor
-            if (animate && item != null)
+            if (animate && item != null) {
                 list.animateScrollBy(
                     item.offset.toFloat(),
                     tween(180, easing = FastOutSlowInEasing),
                 )
-            else list.scrollToItem(anchor)
+            } else {
+                list.scrollToItem(anchor)
+            }
         }
         if (cues.isEmpty()) {
             if (loading)
                 CircularProgressIndicator(Modifier.size(24.dp), color = Rose, strokeWidth = 2.dp)
             else if (error != null) TextButton(onClick = onRetry) { Text("重试字幕", fontSize = 17.sp) }
             else Text("暂无字幕", color = Muted, fontSize = 17.sp)
-        } else
+        } else {
             LazyColumn(
                 Modifier.fillMaxSize(),
                 state = list,
@@ -750,9 +767,11 @@ private fun SubtitlePane(
                     )
                 }
             }
-        if (!following)
+        }
+        if (!following) {
             Box(Modifier.align(Alignment.BottomEnd).padding(4.dp)) {
                 IconAction(Icons.Outlined.MyLocation, "跟随字幕", Rose) { following = true }
             }
+        }
     }
 }

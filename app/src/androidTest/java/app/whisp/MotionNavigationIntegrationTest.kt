@@ -26,8 +26,8 @@ class MotionNavigationIntegrationTest {
 
     @Test
     fun libraryScrollSurvivesCoverNavigationAndReducedMotion() {
-        val repo = (ui.activity.application as WhispApp).repository
-        assertTrue(repo.context.packageName.endsWith(".smoketest"))
+        val graph = (ui.activity.application as WhispApp).graph
+        assertTrue(graph.context.packageName.endsWith(".smoketest"))
         fun foreground() {
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 ui.activity
@@ -38,12 +38,12 @@ class MotionNavigationIntegrationTest {
             }
             assertTrue(
                 UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
-                    .wait(Until.hasObject(By.pkg(repo.context.packageName)), 5000),
+                    .wait(Until.hasObject(By.pkg(graph.context.packageName)), 5000),
             )
         }
         foreground()
         runBlocking {
-            repo.dao.putWorks(
+            graph.library.dao.putWorks(
                 (1..24).map {
                     WorkEntity(
                         "motion-$it",
@@ -56,7 +56,7 @@ class MotionNavigationIntegrationTest {
                 },
             )
         }
-        ui.waitUntil(15000) { repo.library.value.size == 24 }
+        ui.waitUntil(15000) { graph.library.works.value.size == 24 }
         ui.onNodeWithTag("library-grid").performScrollToNode(hasContentDescription("Motion 06"))
         val original =
             ui.onNodeWithContentDescription("Motion 06").fetchSemanticsNode().boundsInRoot
@@ -74,7 +74,6 @@ class MotionNavigationIntegrationTest {
             ui.onNodeWithContentDescription("Motion 06").fetchSemanticsNode().boundsInRoot,
         )
 
-        // A back action during the transition must leave the original library in place.
         ui.onNodeWithContentDescription("Motion 06").performClick()
         foreground()
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
@@ -90,8 +89,8 @@ class MotionNavigationIntegrationTest {
             ui.onNodeWithContentDescription("Motion 06").fetchSemanticsNode().boundsInRoot,
         )
 
-        runBlocking { repo.setSettings(reduceMotion = true) }
-        ui.waitUntil(5000) { repo.settings.value.reduceMotion }
+        runBlocking { graph.settings.update { it.copy(reduceMotion = true) } }
+        ui.waitUntil(5000) { graph.settings.settings.value.reduceMotion }
         ui.onNodeWithContentDescription("Motion 06").performClick()
         ui.onNodeWithContentDescription("返回作品库").performClick()
         assertEquals(
@@ -109,17 +108,15 @@ class MotionNavigationIntegrationTest {
                 .value(),
             0f,
         )
-        // System insets can change while recreating a window. Verify the saved
-        // scroll offset and the card's position inside its grid, not screen chrome.
         val restored =
             ui.onNodeWithContentDescription("Motion 06").fetchSemanticsNode().boundsInRoot
         assertEquals(
             original.translate(-gridBoundsBefore.left, -gridBoundsBefore.top),
             restored.translate(-gridAfter.boundsInRoot.left, -gridAfter.boundsInRoot.top),
         )
-        assertTrue(repo.settings.value.reduceMotion)
+        assertTrue(graph.settings.settings.value.reduceMotion)
         InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()?.let { bitmap ->
-            File(repo.context.getExternalFilesDir(null), "motion-library.png").outputStream().use {
+            File(graph.context.getExternalFilesDir(null), "motion-library.png").outputStream().use {
                 bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
             }
             bitmap.recycle()

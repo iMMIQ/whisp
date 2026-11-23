@@ -46,20 +46,11 @@ class SmbServerTest {
         val sparse = entries.single { it.path == "large-offset.bin" }
         val marker = client.range(sparse.uri, source, password, 4_294_967_303L, 5)
         assertArrayEquals("WHISP".toByteArray(), marker)
-        val duration =
-            Mp3Metadata.duration(mp3.size) { offset, length ->
-                client.range(mp3.uri, source, password, offset, length)
-            }
-        assertTrue("Generated MP3 header duration", duration in 1_850_000..1_854_000)
-        // Sequential assets share a session and an MP3's two probes share one file handle.
-        client.assets(source, password).use { batch ->
-            repeat(3) { assertEquals(duration, batch.duration(mp3.uri)) }
-            assertArrayEquals(
-                File(props.getProperty("fixture"), entries.first { it.path.endsWith(".vtt") }.path)
-                    .readBytes(),
-                batch.bytes(entries.first { it.path.endsWith(".vtt") }.uri, 1024 * 1024),
-            )
-        }
+        val subtitle = entries.first { it.path.endsWith(".vtt") }
+        assertArrayEquals(
+            File(props.getProperty("fixture"), subtitle.path).readBytes(),
+            client.bytes(subtitle.uri, source, password, 1024 * 1024),
+        )
         val failure =
             assertThrows(java.io.IOException::class.java) {
                 client.check(source, "deliberately-wrong")

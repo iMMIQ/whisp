@@ -25,10 +25,34 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.whisp.R
 import app.whisp.data.*
+import app.whisp.playback.PlaybackCoordinator
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 private val playbackSpeeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+
+internal data class BookmarkDraft(
+    val trackId: String,
+    val position: Long,
+    val end: Long?,
+    val title: String,
+) {
+    companion object {
+        fun fromCue(trackId: String, cue: Cue, offsetMs: Long): BookmarkDraft =
+            BookmarkDraft(
+                trackId = trackId,
+                position = (cue.startMs + offsetMs).coerceAtLeast(0L),
+                end =
+                    cue.endMs
+                        .takeIf { it < Long.MAX_VALUE }
+                        ?.let { (it + offsetMs).coerceAtLeast(0L) },
+                title = cue.text,
+            )
+
+        fun atPosition(trackId: String, position: Long, title: String): BookmarkDraft =
+            BookmarkDraft(trackId, position.coerceAtLeast(0L), null, title)
+    }
+}
 
 @Composable
 internal fun PlayerQueueSheet(
@@ -65,7 +89,8 @@ internal fun PlayerFragmentsSheet(
     cues: List<Cue>,
     settings: Settings,
     bookmarks: List<BookmarkEntity>,
-    model: AppViewModel,
+    playback: PlaybackCoordinator,
+    onDeleteBookmark: (String) -> Unit,
     haptics: WhispHaptics,
     onCreateBookmark: (BookmarkDraft) -> Unit,
     onDismiss: () -> Unit,
@@ -85,7 +110,7 @@ internal fun PlayerFragmentsSheet(
                     Modifier.padding(horizontal = 24.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    if (state.loopStart >= 0 || markA >= 0)
+                    if (state.loopStart >= 0 || markA >= 0) {
                         Text(
                             if (state.loopStart >= 0)
                                 "${clock(state.loopStart)} — ${clock(state.loopEnd)}"
@@ -93,13 +118,14 @@ internal fun PlayerFragmentsSheet(
                             color = Rose,
                             fontSize = 18.sp,
                         )
+                    }
                     Row(
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         OutlinedButton(
                             onClick = {
-                                model.markLoopStart()
+                                playback.markLoopStart()
                                 haptics.tick()
                             },
                             enabled = shownTrack != null,
@@ -108,18 +134,19 @@ internal fun PlayerFragmentsSheet(
                             Text("设起点")
                         }
                         OutlinedButton(
-                            onClick = { if (model.markLoopEnd()) haptics.confirm() },
+                            onClick = { if (playback.markLoopEnd()) haptics.confirm() },
                             enabled = shownTrack != null && markA >= 0,
                             modifier = Modifier.weight(1f),
                         ) {
                             Text("设终点")
                         }
                     }
-                    if (state.loopStart >= 0 || markA >= 0)
-                        TextButton(onClick = model::clearLoop) { Text("取消循环") }
+                    if (state.loopStart >= 0 || markA >= 0) {
+                        TextButton(onClick = playback::clearLoop) { Text("取消循环") }
+                    }
                     FilledTonalButton(
                         onClick = {
-                            val position = model.currentPosition()
+                            val position = playback.currentPosition()
                             val cueIndex =
                                 SubtitleTimeline.anchor(
                                     cues,
@@ -142,15 +169,16 @@ internal fun PlayerFragmentsSheet(
                     Spacer(Modifier.height(8.dp))
                 }
             }
-            if (saved.isEmpty())
+            if (saved.isEmpty()) {
                 item(key = "empty-fragments") {
                     Text("暂无片段", color = Muted, modifier = Modifier.padding(24.dp))
                 }
+            }
             items(saved, key = { it.id }) { item ->
                 Row(
                     Modifier.fillMaxWidth()
                         .clickable {
-                            model.playBookmark(detail, item)
+                            playback.playBookmark(detail, item)
                             dismiss()
                         }
                         .padding(horizontal = 24.dp, vertical = 12.dp),
@@ -163,13 +191,14 @@ internal fun PlayerFragmentsSheet(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (item.endMs != null)
+                    if (item.endMs != null) {
                         IconAction(Icons.Outlined.Repeat, "循环播放片段", Muted) {
-                            model.playBookmark(detail, item, repeat = true)
+                            playback.playBookmark(detail, item, repeat = true)
                             dismiss()
                         }
+                    }
                     IconAction(Icons.Outlined.Close, "删除片段", Muted) {
-                        model.deleteBookmark(item.id)
+                        onDeleteBookmark(item.id)
                     }
                 }
             }
@@ -202,7 +231,7 @@ internal fun SleepTimerDialog(
                         Text("$minutes 分钟")
                     }
                 }
-                if (timerEnd > 0)
+                if (timerEnd > 0) {
                     TextButton(
                         onClick = {
                             onSelectMinutes(0)
@@ -211,6 +240,7 @@ internal fun SleepTimerDialog(
                     ) {
                         Text("取消定时")
                     }
+                }
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
@@ -293,7 +323,6 @@ internal fun PlayerMoreSheet(
     onPreciseSeek: () -> Unit,
     onPreferences: () -> Unit,
     onRestart: () -> Unit,
-    onExportDiagnostics: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
@@ -302,7 +331,6 @@ internal fun PlayerMoreSheet(
                 "音频输出" to { openAudioOutput(context) },
                 stringResource(R.string.label_playback_settings) to onPreferences,
                 "从头播放" to onRestart,
-                "导出播放诊断" to onExportDiagnostics,
             )
             .forEach { (label, action) ->
                 TextButton(
@@ -374,7 +402,8 @@ internal fun PreciseSeekDialog(
 internal fun PlaybackPreferencesDialog(
     settings: Settings,
     currentSpeed: Float,
-    model: AppViewModel,
+    onSpeedChange: (Float) -> Unit,
+    onUpdateSettings: ((Settings) -> Settings) -> Unit,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -393,7 +422,7 @@ internal fun PlaybackPreferencesDialog(
                             if (speed == 1.0f) "1x" else if (speed == 2.0f) "2x" else "${speed}x"
                         FilterChip(
                             selected = abs(currentSpeed - speed) < 0.01f,
-                            onClick = { model.setPlaybackSpeed(speed) },
+                            onClick = { onSpeedChange(speed) },
                             label = { Text(label, fontSize = 13.sp) },
                         )
                     }
@@ -403,8 +432,8 @@ internal fun PlaybackPreferencesDialog(
                     settings.subtitleSize.toFloat(),
                     16f..30f,
                     steps = 13,
-                    onValueChange = {
-                        model.action { model.repository.setSettings(size = it.roundToInt()) }
+                    onValueChange = { value ->
+                        onUpdateSettings { it.copy(subtitleSize = value.roundToInt()) }
                     },
                 )
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -414,10 +443,8 @@ internal fun PlaybackPreferencesDialog(
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     OutlinedButton(
                         onClick = {
-                            model.action {
-                                model.repository.setSettings(
-                                    offset = settings.subtitleOffsetMs - 250,
-                                )
+                            onUpdateSettings {
+                                it.copy(subtitleOffsetMs = it.subtitleOffsetMs - 250)
                             }
                         },
                     ) {
@@ -425,10 +452,8 @@ internal fun PlaybackPreferencesDialog(
                     }
                     OutlinedButton(
                         onClick = {
-                            model.action {
-                                model.repository.setSettings(
-                                    offset = settings.subtitleOffsetMs + 250,
-                                )
+                            onUpdateSettings {
+                                it.copy(subtitleOffsetMs = it.subtitleOffsetMs + 250)
                             }
                         },
                     ) {
@@ -436,69 +461,41 @@ internal fun PlaybackPreferencesDialog(
                     }
                 }
                 Text(stringResource(R.string.label_text_encoding))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(TextEncoding.supported, key = { it }) { encoding ->
-                        FilterChip(
-                            selected = settings.textEncoding == encoding,
-                            onClick = {
-                                model.action {
-                                    model.repository.setSettings(textEncoding = encoding)
-                                }
-                            },
-                            label = {
-                                Text(
-                                    if (encoding == TextEncoding.AUTO)
-                                        stringResource(R.string.label_encoding_auto)
-                                    else encoding,
-                                    fontSize = 13.sp,
-                                )
-                            },
-                        )
+                EncodingChips(
+                    selected = settings.textEncoding,
+                    onSelect = { encoding ->
+                        onUpdateSettings { it.copy(textEncoding = encoding) }
+                    },
+                )
+                SettingToggleRow("隐藏通知封面与标题", settings.hideArtwork, "notification-privacy") {
+                    onUpdateSettings { current -> current.copy(hideArtwork = it) }
+                }
+                if (Build.VERSION.SDK_INT >= 33) {
+                    SettingToggleRow("隐藏最近任务预览", settings.hideRecents, "recents-privacy") {
+                        onUpdateSettings { current -> current.copy(hideRecents = it) }
                     }
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("隐藏通知封面与标题", Modifier.weight(1f))
-                    Switch(
-                        settings.hideArtwork,
-                        modifier = Modifier.testTag("notification-privacy"),
-                        onCheckedChange = {
-                            model.action { model.repository.setSettings(hide = it) }
-                        },
-                    )
+                SettingToggleRow("触觉反馈", settings.touchFeedback, "touch-feedback") {
+                    onUpdateSettings { current -> current.copy(touchFeedback = it) }
                 }
-                if (Build.VERSION.SDK_INT >= 33)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("隐藏最近任务预览", Modifier.weight(1f))
-                        Switch(
-                            settings.hideRecents,
-                            modifier = Modifier.testTag("recents-privacy"),
-                            onCheckedChange = {
-                                model.action { model.repository.setSettings(hideRecents = it) }
-                            },
-                        )
-                    }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("触觉反馈", Modifier.weight(1f))
-                    Switch(
-                        settings.touchFeedback,
-                        modifier = Modifier.testTag("touch-feedback"),
-                        onCheckedChange = {
-                            model.action { model.repository.setSettings(touchFeedback = it) }
-                        },
-                    )
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("减少动态效果", Modifier.weight(1f))
-                    Switch(
-                        settings.reduceMotion,
-                        modifier = Modifier.testTag("reduce-motion"),
-                        onCheckedChange = {
-                            model.action { model.repository.setSettings(reduceMotion = it) }
-                        },
-                    )
+                SettingToggleRow("减少动态效果", settings.reduceMotion, "reduce-motion") {
+                    onUpdateSettings { current -> current.copy(reduceMotion = it) }
                 }
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
     )
+}
+
+@Composable
+private fun SettingToggleRow(
+    label: String,
+    checked: Boolean,
+    tag: String,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f))
+        Switch(checked, onCheckedChange = onCheckedChange, modifier = Modifier.testTag(tag))
+    }
 }
