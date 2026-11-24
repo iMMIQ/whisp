@@ -17,6 +17,7 @@ data class PlaybackState(
     val durationMs: Long = 0,
     val buffering: Boolean = false,
     val timerEnd: Long = 0,
+    val timerStopAfterTrack: Boolean = false,
     val loopStart: Long = -1,
     val loopEnd: Long = -1,
     val playWhenReady: Boolean = false,

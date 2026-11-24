@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -10,12 +16,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.InsertDriveFile
+import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.*
@@ -34,6 +42,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
@@ -182,9 +191,13 @@ sealed interface WorkDetailTarget {
     data class Library(val workId: String) : WorkDetailTarget
 
     data class AsmrPreview(val sourceId: String, val asmrId: Long) : WorkDetailTarget
+
+    data class DlsiteOwned(val sourceId: String, val workno: String) : WorkDetailTarget
 }
 
-/** Unified detail screen handling both indexed library works and unsaved ASMR.ONE previews. */
+/**
+ * Unified detail screen handling library works, ASMR.ONE previews, and non-blocking DLsite loads.
+ */
 @OptIn(ExperimentalFoundationApi::class)
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -196,36 +209,60 @@ internal fun WorkDetailScreen(
     filter: ((AsmrFacet) -> Unit)? = null,
 ) {
     val bg = MaterialTheme.colorScheme.background
+    val reduced = LocalReducedMotion.current
+    val haptics = rememberWhispHaptics()
     val isPreview = target is WorkDetailTarget.AsmrPreview
+    val isDlsiteOwned = target is WorkDetailTarget.DlsiteOwned
     val libraryWorkId =
         when (target) {
             is WorkDetailTarget.Library -> target.workId
             is WorkDetailTarget.AsmrPreview -> stableId("asmr.one|work|${target.asmrId}")
+            is WorkDetailTarget.DlsiteOwned ->
+                stableId("dlsite|${target.sourceId}|${target.workno}")
         }
     val storedDetail by
         remember(libraryWorkId) { graph.library.observeDetails(libraryWorkId) }
             .collectAsStateWithLifecycle(initialValue = null)
 
     var preview by remember(target) { mutableStateOf<AsmrPreview?>(null) }
-    var previewLoading by remember(target) { mutableStateOf(isPreview) }
+    var previewLoading by remember(target) { mutableStateOf(isPreview || isDlsiteOwned) }
     var previewError by remember(target) { mutableStateOf<String?>(null) }
+    var officialPlayerWorkno by remember(target) { mutableStateOf<String?>(null) }
     var savingPreview by remember(target) { mutableStateOf(false) }
     var previewReload by remember(target) { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(target, previewReload) {
-        if (target is WorkDetailTarget.AsmrPreview) {
-            previewLoading = true
-            previewError = null
-            try {
-                preview = graph.sync.previewAsmrWork(target.sourceId, target.asmrId)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                previewError = e.message ?: "读取作品失败"
-            } finally {
-                previewLoading = false
+        when (target) {
+            is WorkDetailTarget.AsmrPreview -> {
+                previewLoading = true
+                previewError = null
+                try {
+                    preview = graph.sync.previewAsmrWork(target.sourceId, target.asmrId)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    previewError = e.message ?: "读取作品失败"
+                } finally {
+                    previewLoading = false
+                }
             }
+            is WorkDetailTarget.DlsiteOwned -> {
+                previewLoading = true
+                previewError = null
+                try {
+                    graph.sync.importDlsiteWork(target.sourceId, target.workno)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: DlsiteNoPlayableAudioException) {
+                    officialPlayerWorkno = target.workno
+                } catch (e: Exception) {
+                    previewError = e.message ?: "作品读取失败"
+                } finally {
+                    previewLoading = false
+                }
+            }
+            is WorkDetailTarget.Library -> Unit
         }
     }
 
@@ -254,7 +291,42 @@ internal fun WorkDetailScreen(
                 )
             }
             when {
-                previewLoading -> CircularProgressIndicator(color = Rose)
+                officialPlayerWorkno != null ->
+                    WhispEmptyState(
+                        icon = Icons.AutoMirrored.Outlined.OpenInNew,
+                        title = "使用官方播放器",
+                        subtitle = "该作品可在 DLsite Play 中播放。",
+                    ) {
+                        FilledTonalButton(
+                            onClick = {
+                                if (graph.playback.state.value.playWhenReady) {
+                                    graph.playback.togglePlay()
+                                }
+                                graph.context.startActivity(
+                                    Intent(
+                                            Intent.ACTION_VIEW,
+                                            "https://play.dlsite.com/work/${officialPlayerWorkno}"
+                                                .toUri(),
+                                        )
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            },
+                        ) {
+                            Text("打开 DLsite Play")
+                        }
+                    }
+                previewLoading ->
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        CircularProgressIndicator(color = Rose)
+                        Text(
+                            if (isDlsiteOwned) "正在读取曲目目录" else "正在加载作品",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Muted,
+                        )
+                    }
                 previewError != null ->
                     WhispEmptyState(
                         icon = Icons.Outlined.CloudOff,
@@ -272,6 +344,8 @@ internal fun WorkDetailScreen(
     val inLibrary = storedDetail != null
     var tab by rememberSaveable(detail.work.id) { mutableStateOf("曲目") }
     var information by rememberSaveable(detail.work.id) { mutableStateOf(false) }
+    var downloadManage by rememberSaveable(detail.work.id) { mutableStateOf(false) }
+    var confirmRemoveOffline by rememberSaveable(detail.work.id) { mutableStateOf(false) }
     var attachment by remember { mutableStateOf<AttachmentEntity?>(null) }
 
     val dlsiteStates by graph.dlsiteLoader.states.collectAsStateWithLifecycle()
@@ -296,16 +370,37 @@ internal fun WorkDetailScreen(
 
     val playback by graph.playback.state.collectAsStateWithLifecycle()
     val history by graph.library.progress.collectAsStateWithLifecycle()
-    val offline by
+    val downloadSnapshot by
         remember(detail.work.id, detail.work.offlineAttachments, detail.tracks) {
                 graph.media.downloads
                     .map { states ->
-                        detail.work.offlineAttachments &&
-                            detail.tracks.all { states[it.id]?.state == Download.STATE_COMPLETED }
+                        val trackStates = detail.tracks.mapNotNull { states[it.id] }
+                        val complete =
+                            detail.work.offlineAttachments &&
+                                detail.tracks.isNotEmpty() &&
+                                detail.tracks.all {
+                                    states[it.id]?.state == Download.STATE_COMPLETED
+                                }
+                        val active = trackStates.any {
+                            it.state == Download.STATE_DOWNLOADING ||
+                                it.state == Download.STATE_QUEUED
+                        }
+                        val pct =
+                            if (detail.tracks.isEmpty()) 0f
+                            else
+                                trackStates
+                                    .map { it.percentDownloaded.takeIf { v -> v >= 0f } ?: 0f }
+                                    .sum() / (detail.tracks.size * 100f)
+                        Triple(complete, active, pct.coerceIn(0f, 1f))
                     }
                     .distinctUntilChanged()
             }
-            .collectAsStateWithLifecycle(initialValue = graph.offline.isOffline(detail))
+            .collectAsStateWithLifecycle(
+                initialValue = Triple(graph.offline.isOffline(detail), false, 0f),
+            )
+    val offline = downloadSnapshot.first
+    val downloading = downloadSnapshot.second
+    val downloadProgress = downloadSnapshot.third
 
     val sections = remember(detail.tracks) { TrackSections.groups(detail.tracks) }
     val totalDurationMs =
@@ -369,344 +464,553 @@ internal fun WorkDetailScreen(
         }
     }
 
-    LazyColumn(
-        Modifier.fillMaxSize().then(if (isPreview) Modifier.testTag("asmr-preview") else Modifier),
-    ) {
-        item(key = "detail-header") {
-            Box(
-                Modifier.fillMaxWidth()
-                    .heightIn(min = 260.dp, max = 420.dp)
-                    .aspectRatio(1.16f)
-                    .background(MaterialTheme.colorScheme.surface),
-            ) {
-                Artwork(
-                    image = coverImage,
-                    description = detail.work.title,
-                    modifier = Modifier.matchParentSize(),
-                    sharedKey = detail.work.id,
-                )
+    val listState = rememberLazyListState()
+    val headerCollapsed by remember {
+        derivedStateOf {
+            listState.firstVisibleItemIndex >= 1 || listState.firstVisibleItemScrollOffset > 520
+        }
+    }
+    val stickyClearance by
+        animateDpAsState(
+            targetValue = if (headerCollapsed) 52.dp else 0.dp,
+            animationSpec = tween(if (reduced) 0 else 160),
+            label = "sticky-clearance",
+        )
+
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            modifier =
+                Modifier.fillMaxSize()
+                    .then(if (isPreview) Modifier.testTag("asmr-preview") else Modifier),
+        ) {
+            item(key = "detail-header") {
                 Box(
-                    Modifier.matchParentSize()
-                        .background(
-                            Brush.verticalGradient(
-                                0.0f to bg.copy(alpha = .50f),
-                                0.28f to Color.Transparent,
-                                0.54f to bg.copy(alpha = .52f),
-                                0.84f to bg.copy(alpha = .94f),
-                                1.0f to bg,
+                    Modifier.fillMaxWidth()
+                        .heightIn(min = 260.dp, max = 420.dp)
+                        .aspectRatio(1.16f)
+                        .background(MaterialTheme.colorScheme.surface),
+                ) {
+                    Artwork(
+                        image = coverImage,
+                        description = detail.work.title,
+                        modifier = Modifier.matchParentSize(),
+                        sharedKey = detail.work.id,
+                    )
+                    Box(
+                        Modifier.matchParentSize()
+                            .background(
+                                Brush.verticalGradient(
+                                    0.0f to bg.copy(alpha = .50f),
+                                    0.28f to Color.Transparent,
+                                    0.54f to bg.copy(alpha = .52f),
+                                    0.84f to bg.copy(alpha = .94f),
+                                    1.0f to bg,
+                                ),
                             ),
-                        ),
-                )
-                CompositionLocalProvider(LocalCoverControls provides true) {
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .statusBarsPadding()
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        IconAction(
-                            Icons.AutoMirrored.Outlined.ArrowBack,
-                            if (isPreview) "返回检索" else stringResource(R.string.action_back_library),
-                            action = back,
-                        )
-                        if (inLibrary) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                                IconAction(
-                                    if (detail.work.favorite) Icons.Filled.Favorite
-                                    else Icons.Outlined.FavoriteBorder,
-                                    stringResource(R.string.action_favorite),
-                                    if (detail.work.favorite) Rose else Cream,
-                                    enabled = true,
-                                    feedback = true,
-                                ) {
-                                    scope.launch { graph.library.toggleFavorite(detail.work.id) }
-                                }
-                                IconAction(
-                                    if (offline) Icons.Outlined.DownloadDone
-                                    else Icons.Outlined.Download,
-                                    stringResource(R.string.action_download),
-                                    if (offline) Rose else Cream,
-                                ) {
-                                    scope.launch {
-                                        runCatching { graph.offline.downloadWork(detail.work.id) }
-                                            .onFailure {
-                                                graph.messages.tryEmit(it.message ?: "下载失败")
-                                            }
+                    )
+                    CompositionLocalProvider(LocalCoverControls provides true) {
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .statusBarsPadding()
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            IconAction(
+                                Icons.AutoMirrored.Outlined.ArrowBack,
+                                if (isPreview) "返回检索"
+                                else stringResource(R.string.action_back_library),
+                                action = back,
+                            )
+                            if (inLibrary) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    IconAction(
+                                        if (detail.work.favorite) Icons.Filled.Favorite
+                                        else Icons.Outlined.FavoriteBorder,
+                                        stringResource(R.string.action_favorite),
+                                        if (detail.work.favorite) Rose else Cream,
+                                        enabled = true,
+                                        feedback = true,
+                                    ) {
+                                        scope.launch {
+                                            graph.library.toggleFavorite(detail.work.id)
+                                        }
                                     }
-                                }
-                                IconAction(
-                                    Icons.Outlined.MoreHoriz,
-                                    stringResource(R.string.action_work_info),
-                                ) {
-                                    information = true
+                                    Box(contentAlignment = Alignment.Center) {
+                                        IconAction(
+                                            if (offline) Icons.Outlined.DownloadDone
+                                            else Icons.Outlined.Download,
+                                            stringResource(R.string.action_download),
+                                            if (offline || downloading) Rose else Cream,
+                                            haptic = HapticKind.Tick,
+                                        ) {
+                                            if (offline || downloading) {
+                                                downloadManage = true
+                                            } else {
+                                                scope.launch {
+                                                    runCatching {
+                                                        graph.offline.downloadWork(detail.work.id)
+                                                    }
+                                                        .onSuccess {
+                                                            graph.messages.tryEmit("已开始离线下载")
+                                                        }
+                                                        .onFailure {
+                                                            graph.messages.tryEmit(
+                                                                it.message ?: "下载失败",
+                                                            )
+                                                        }
+                                                }
+                                            }
+                                        }
+                                        if (downloading) {
+                                            CircularProgressIndicator(
+                                                progress = {
+                                                    downloadProgress.coerceAtLeast(0.08f)
+                                                },
+                                                modifier = Modifier.size(34.dp),
+                                                color = Rose,
+                                                trackColor = Rose.copy(alpha = 0.22f),
+                                                strokeWidth = 2.dp,
+                                            )
+                                        }
+                                    }
+                                    IconAction(
+                                        Icons.Outlined.MoreHoriz,
+                                        stringResource(R.string.action_work_info),
+                                        haptic = HapticKind.Tick,
+                                    ) {
+                                        information = true
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                Column(
-                    Modifier.align(Alignment.BottomStart)
-                        .padding(horizontal = 20.dp, vertical = 14.dp),
-                ) {
-                    Text(
-                        detail.work.title,
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = Cream,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    if (detail.work.artist.isNotBlank()) {
+                    Column(
+                        Modifier.align(Alignment.BottomStart)
+                            .padding(horizontal = 20.dp, vertical = 14.dp),
+                    ) {
                         Text(
-                            detail.work.artist,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Cream.copy(alpha = 0.80f),
-                            maxLines = 2,
+                            detail.work.title,
+                            style = MaterialTheme.typography.headlineMedium,
+                            color = Cream,
+                            maxLines = 3,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(top = 6.dp),
                         )
-                    }
-                }
-            }
-            val metaParts =
-                remember(detail.tracks.size, totalDurationMs, detail.work.rj, official.details) {
-                    buildList {
-                        if (detail.tracks.isNotEmpty()) add("${detail.tracks.size} 曲")
-                        if (totalDurationMs > 0L) add(clock(totalDurationMs))
-                        detail.work.rj?.let { add(it) }
-                        official.details?.statistics?.rating?.let {
-                            add("★ " + String.format(Locale.ROOT, "%.2f", it))
+                        if (detail.work.artist.isNotBlank()) {
+                            Text(
+                                detail.work.artist,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Cream.copy(alpha = 0.80f),
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(top = 6.dp),
+                            )
                         }
                     }
                 }
-            if (metaParts.isNotEmpty()) {
-                Text(
-                    metaParts.joinToString(" · "),
-                    style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
-                    color = Muted,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
-                )
-            }
-            OfficialCircle(official.details, filter)
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                if (inLibrary) {
-                    Button(
-                        onClick = {
-                            graph.playback.playWork(detail, restart = finished)
-                            player()
-                        },
-                        modifier = Modifier.weight(1f).height(52.dp),
-                        shape = RoundedCornerShape(16.dp),
+                val metaParts =
+                    remember(
+                        detail.tracks.size,
+                        totalDurationMs,
+                        detail.work.rj,
+                        official.details,
                     ) {
-                        Icon(Icons.Filled.PlayArrow, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            when {
-                                finished -> stringResource(R.string.action_replay_work)
-                                resume -> stringResource(R.string.action_resume_work)
-                                else -> stringResource(R.string.action_play_work)
+                        buildList {
+                            if (detail.tracks.isNotEmpty()) add("${detail.tracks.size} 曲")
+                            if (totalDurationMs > 0L) add(clock(totalDurationMs))
+                            detail.work.rj?.let { add(it) }
+                            official.details?.statistics?.rating?.let {
+                                add("★ " + String.format(Locale.ROOT, "%.2f", it))
+                            }
+                        }
+                    }
+                if (metaParts.isNotEmpty()) {
+                    Text(
+                        metaParts.joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                        color = Muted,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
+                    )
+                }
+                OfficialCircle(official.details, filter)
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    if (inLibrary) {
+                        Button(
+                            onClick = {
+                                haptics.confirm()
+                                graph.playback.playWork(detail, restart = finished)
+                                player()
                             },
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-                    Box(
-                        Modifier.size(52.dp)
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(MaterialTheme.colorScheme.surface)
-                            .border(
-                                0.5.dp,
-                                MaterialTheme.colorScheme.outlineVariant,
-                                RoundedCornerShape(16.dp),
-                            ),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        IconAction(
-                            Icons.Outlined.Shuffle,
-                            stringResource(R.string.action_shuffle),
-                            Cream,
+                            modifier = Modifier.weight(1f).height(52.dp),
+                            shape = RoundedCornerShape(16.dp),
                         ) {
-                            graph.playback.playWork(detail, shuffle = true)
-                            player()
+                            Icon(Icons.Filled.PlayArrow, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                when {
+                                    finished -> stringResource(R.string.action_replay_work)
+                                    resume -> stringResource(R.string.action_resume_work)
+                                    else -> stringResource(R.string.action_play_work)
+                                },
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                            )
                         }
-                    }
-                } else {
-                    Button(
-                        onClick = { commitPreview(playAfter = false) },
-                        enabled = !savingPreview,
-                        modifier = Modifier.weight(1f).height(52.dp),
-                        shape = RoundedCornerShape(16.dp),
-                    ) {
-                        Icon(Icons.Outlined.Add, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            if (savingPreview) "加入中" else "加入作品库",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                        )
+                        Box(
+                            Modifier.size(52.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(MaterialTheme.colorScheme.surface)
+                                .border(
+                                    0.5.dp,
+                                    MaterialTheme.colorScheme.outlineVariant,
+                                    RoundedCornerShape(16.dp),
+                                ),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            IconAction(
+                                Icons.Outlined.Shuffle,
+                                stringResource(R.string.action_shuffle),
+                                Cream,
+                                haptic = HapticKind.Tick,
+                            ) {
+                                graph.playback.playWork(detail, shuffle = true)
+                                player()
+                            }
+                        }
+                    } else {
+                        Button(
+                            onClick = {
+                                haptics.confirm()
+                                commitPreview(playAfter = true)
+                            },
+                            enabled = !savingPreview && detail.tracks.isNotEmpty(),
+                            modifier = Modifier.weight(1f).height(52.dp),
+                            shape = RoundedCornerShape(16.dp),
+                        ) {
+                            Icon(Icons.Filled.PlayArrow, null)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                if (savingPreview) "准备中" else "立即试听",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                        FilledTonalButton(
+                            onClick = {
+                                haptics.confirm()
+                                commitPreview(playAfter = false)
+                            },
+                            enabled = !savingPreview,
+                            modifier = Modifier.height(52.dp),
+                            shape = RoundedCornerShape(16.dp),
+                        ) {
+                            Icon(Icons.Outlined.Add, null)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                if (savingPreview) "加入中" else "加入作品库",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
                     }
                 }
             }
-        }
-        stickyHeader(key = "detail-tabs") {
-            Column(Modifier.fillMaxWidth().background(bg)) {
-                WorkContentTabs(
-                    tab = tab,
-                    select = { tab = it },
-                    onRefresh =
-                        if (tab != "曲目" && detail.work.rj != null) {
-                            {
-                                val rj = detail.work.rj
-                                val part = if (tab == "介绍") "description" else "statistics"
+            stickyHeader(key = "detail-tabs") {
+                Column(
+                    Modifier.fillMaxWidth()
+                        .background(bg)
+                        .then(if (headerCollapsed) Modifier.statusBarsPadding() else Modifier)
+                        .padding(top = stickyClearance),
+                ) {
+                    WorkContentTabs(
+                        tab = tab,
+                        select = {
+                            haptics.tick()
+                            tab = it
+                        },
+                        onRefresh =
+                            if (tab != "曲目" && detail.work.rj != null) {
+                                {
+                                    val rj = detail.work.rj
+                                    val part = if (tab == "介绍") "description" else "statistics"
+                                    graph.dlsiteLoader.load(
+                                        detail.work.id,
+                                        rj,
+                                        "product",
+                                        seedDetails,
+                                        true,
+                                    )
+                                    graph.dlsiteLoader.load(
+                                        detail.work.id,
+                                        rj,
+                                        part,
+                                        seedDetails,
+                                        true,
+                                    )
+                                }
+                            } else null,
+                    )
+                    HorizontalDivider(
+                        thickness = 0.5.dp,
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                    )
+                }
+            }
+            when (tab) {
+                "曲目" ->
+                    sections.forEach { section ->
+                        if (sections.size > 1) {
+                            item(key = "section:${section.key}") {
+                                val sectionDuration =
+                                    remember(section.tracks) {
+                                        section.tracks.sumOf { it.durationMs.coerceAtLeast(0L) }
+                                    }
+                                Row(
+                                    Modifier.fillMaxWidth()
+                                        .padding(
+                                            start = 20.dp,
+                                            end = 12.dp,
+                                            top = 14.dp,
+                                            bottom = 4.dp,
+                                        ),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            section.title,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = Cream,
+                                        )
+                                        val sub =
+                                            if (sectionDuration > 0L)
+                                                "${section.tracks.size} 曲 · ${clock(sectionDuration)}"
+                                            else "${section.tracks.size} 曲"
+                                        Text(
+                                            sub,
+                                            style =
+                                                MaterialTheme.typography.bodySmall.merge(
+                                                    TabularNumeralStyle,
+                                                ),
+                                            color = Muted,
+                                        )
+                                    }
+                                    IconAction(
+                                        Icons.Outlined.PlayArrow,
+                                        "播放${section.title}",
+                                        Rose,
+                                        haptic = HapticKind.Confirm,
+                                    ) {
+                                        if (inLibrary) {
+                                            graph.playback.playWork(
+                                                detail,
+                                                section.tracks.first().id,
+                                                startPosition = 0,
+                                            )
+                                            player()
+                                        } else {
+                                            commitPreview(
+                                                playAfter = true,
+                                                trackId = section.tracks.first().id,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        items(section.tracks, key = { it.id }) { track ->
+                            TrackRow(track, playback.trackId == track.id) {
+                                haptics.tick()
+                                if (inLibrary) {
+                                    graph.playback.playWork(detail, track.id)
+                                    player()
+                                } else {
+                                    commitPreview(playAfter = true, trackId = track.id)
+                                }
+                            }
+                        }
+                    }
+                else -> {
+                    dlsiteContent(
+                        tab = tab,
+                        state = official,
+                        rj = detail.work.rj,
+                        onLoad = { part, force ->
+                            detail.work.rj?.let { rj ->
                                 graph.dlsiteLoader.load(
                                     detail.work.id,
                                     rj,
-                                    "product",
+                                    part,
                                     seedDetails,
-                                    true,
+                                    force,
                                 )
-                                graph.dlsiteLoader.load(detail.work.id, rj, part, seedDetails, true)
                             }
-                        } else null,
-                )
-                HorizontalDivider(
-                    thickness = 0.5.dp,
-                    color = MaterialTheme.colorScheme.outlineVariant,
-                )
-            }
-        }
-        when (tab) {
-            "曲目" ->
-                sections.forEach { section ->
-                    if (sections.size > 1) {
-                        item(key = "section:${section.key}") {
-                            val sectionDuration =
-                                remember(section.tracks) {
-                                    section.tracks.sumOf { it.durationMs.coerceAtLeast(0L) }
-                                }
-                            Row(
-                                Modifier.fillMaxWidth()
-                                    .padding(
-                                        start = 20.dp,
-                                        end = 12.dp,
-                                        top = 14.dp,
-                                        bottom = 4.dp,
-                                    ),
-                                verticalAlignment = Alignment.CenterVertically,
+                        },
+                        seed = seedDetails,
+                        filter = filter,
+                    )
+                    if (tab == "资料" && inLibrary) {
+                        if (scripts.isNotEmpty()) {
+                            item(key = "header-scripts") {
+                                Text(
+                                    "台本",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    color = Cream,
+                                    modifier =
+                                        Modifier.padding(
+                                            start = 20.dp,
+                                            end = 20.dp,
+                                            top = 20.dp,
+                                            bottom = 8.dp,
+                                        ),
+                                )
+                            }
+                        }
+                        items(scripts, key = { it.id }) {
+                            ResourceRow(it.title, Icons.Outlined.Description) { attachment = it }
+                        }
+                        if (extras.isNotEmpty()) {
+                            item(key = "header-extras") {
+                                Text(
+                                    "附赠",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    color = Cream,
+                                    modifier =
+                                        Modifier.padding(
+                                            start = 20.dp,
+                                            end = 20.dp,
+                                            top = 20.dp,
+                                            bottom = 8.dp,
+                                        ),
+                                )
+                            }
+                        }
+                        items(extras, key = { it.id }) {
+                            ResourceRow(
+                                it.title,
+                                if (it.kind == "image") Icons.Outlined.Image
+                                else Icons.AutoMirrored.Outlined.InsertDriveFile,
                             ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        section.title,
-                                        style = MaterialTheme.typography.titleMedium,
-                                        color = Cream,
-                                    )
-                                    val sub =
-                                        if (sectionDuration > 0L)
-                                            "${section.tracks.size} 曲 · ${clock(sectionDuration)}"
-                                        else "${section.tracks.size} 曲"
-                                    Text(
-                                        sub,
-                                        style =
-                                            MaterialTheme.typography.bodySmall.merge(
-                                                TabularNumeralStyle,
-                                            ),
-                                        color = Muted,
-                                    )
-                                }
-                                IconAction(Icons.Outlined.PlayArrow, "播放${section.title}", Rose) {
-                                    if (inLibrary) {
-                                        graph.playback.playWork(
-                                            detail,
-                                            section.tracks.first().id,
-                                            startPosition = 0,
-                                        )
-                                        player()
-                                    } else {
-                                        commitPreview(
-                                            playAfter = true,
-                                            trackId = section.tracks.first().id,
-                                        )
-                                    }
-                                }
+                                attachment = it
                             }
-                        }
-                    }
-                    items(section.tracks, key = { it.id }) { track ->
-                        TrackRow(track, playback.trackId == track.id) {
-                            if (inLibrary) {
-                                graph.playback.playWork(detail, track.id)
-                                player()
-                            } else {
-                                commitPreview(playAfter = true, trackId = track.id)
-                            }
-                        }
-                    }
-                }
-            else -> {
-                dlsiteContent(
-                    tab = tab,
-                    state = official,
-                    rj = detail.work.rj,
-                    onLoad = { part, force ->
-                        detail.work.rj?.let { rj ->
-                            graph.dlsiteLoader.load(detail.work.id, rj, part, seedDetails, force)
-                        }
-                    },
-                    seed = seedDetails,
-                    filter = filter,
-                )
-                if (tab == "资料" && inLibrary) {
-                    if (scripts.isNotEmpty()) {
-                        item(key = "header-scripts") {
-                            Text(
-                                "台本",
-                                style = MaterialTheme.typography.titleLarge,
-                                color = Cream,
-                                modifier =
-                                    Modifier.padding(
-                                        start = 20.dp,
-                                        end = 20.dp,
-                                        top = 20.dp,
-                                        bottom = 8.dp,
-                                    ),
-                            )
-                        }
-                    }
-                    items(scripts, key = { it.id }) {
-                        ResourceRow(it.title, Icons.Outlined.Description) { attachment = it }
-                    }
-                    if (extras.isNotEmpty()) {
-                        item(key = "header-extras") {
-                            Text(
-                                "附赠",
-                                style = MaterialTheme.typography.titleLarge,
-                                color = Cream,
-                                modifier =
-                                    Modifier.padding(
-                                        start = 20.dp,
-                                        end = 20.dp,
-                                        top = 20.dp,
-                                        bottom = 8.dp,
-                                    ),
-                            )
-                        }
-                    }
-                    items(extras, key = { it.id }) {
-                        ResourceRow(
-                            it.title,
-                            if (it.kind == "image") Icons.Outlined.Image
-                            else Icons.AutoMirrored.Outlined.InsertDriveFile,
-                        ) {
-                            attachment = it
                         }
                     }
                 }
             }
+            item(key = "detail-footer") { Spacer(Modifier.height(28.dp)) }
         }
-        item(key = "detail-footer") { Spacer(Modifier.height(28.dp)) }
+        // Pinned top bar appears cleanly once scrolled past cover, keeping navigation & play
+        // reachable.
+        AnimatedVisibility(
+            visible = headerCollapsed,
+            modifier = Modifier.align(Alignment.TopCenter),
+            enter = fadeIn(tween(if (reduced) 0 else 160)),
+            exit = fadeOut(tween(if (reduced) 0 else 120)),
+        ) {
+            Row(
+                Modifier.fillMaxWidth()
+                    .background(bg.copy(alpha = 0.96f))
+                    .statusBarsPadding()
+                    .height(52.dp)
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconAction(
+                    Icons.AutoMirrored.Outlined.ArrowBack,
+                    if (isPreview) "返回检索" else stringResource(R.string.action_back_library),
+                    action = back,
+                )
+                Text(
+                    shortTitle(detail.work.title).ifBlank { detail.work.title },
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Cream,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+                )
+                IconAction(
+                    Icons.Filled.PlayArrow,
+                    stringResource(R.string.action_play_work),
+                    Rose,
+                    haptic = HapticKind.Confirm,
+                ) {
+                    if (inLibrary) {
+                        graph.playback.playWork(detail, restart = finished)
+                        player()
+                    } else {
+                        commitPreview(playAfter = true)
+                    }
+                }
+            }
+        }
+    }
+
+    if (downloadManage && inLibrary) {
+        WhispSheet(onDismissRequest = { downloadManage = false }) { dismiss ->
+            Text(
+                if (offline) "已离线保存" else "离线下载中 · ${(downloadProgress * 100).toInt()}%",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp),
+            )
+            if (downloading) {
+                LinearProgressIndicator(
+                    progress = { downloadProgress },
+                    modifier =
+                        Modifier.fillMaxWidth()
+                            .padding(horizontal = 24.dp, vertical = 4.dp)
+                            .height(5.dp)
+                            .clip(RoundedCornerShape(999.dp)),
+                    color = Rose,
+                    trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                )
+                WhispSheetRow(
+                    icon = Icons.Outlined.Pause,
+                    title = "暂停下载",
+                    onClick = {
+                        graph.offline.pauseDownloads()
+                        dismiss()
+                    },
+                )
+                WhispSheetRow(
+                    icon = Icons.Outlined.PlayArrow,
+                    title = "继续下载",
+                    onClick = {
+                        graph.offline.resumeDownloads()
+                        dismiss()
+                    },
+                )
+            }
+            WhispSheetRow(
+                icon = Icons.Outlined.DeleteOutline,
+                title = "移除离线副本",
+                subtitle = "清理此作品已下载的本地音频与附件",
+                tint = MaterialTheme.colorScheme.error,
+                onClick = {
+                    dismiss()
+                    confirmRemoveOffline = true
+                },
+            )
+            Spacer(Modifier.navigationBarsPadding().height(8.dp))
+        }
+    }
+    if (confirmRemoveOffline) {
+        WhispConfirmDialog(
+            title = "移除离线副本",
+            message = "移除「${shortTitle(detail.work.title).ifBlank { detail.work.title }}」的本地离线文件？",
+            confirmLabel = "移除",
+            onConfirm = {
+                confirmRemoveOffline = false
+                scope.launch {
+                    runCatching { graph.offline.removeOffline(detail.work.id) }
+                        .onFailure { graph.messages.tryEmit(it.message ?: "移除失败") }
+                }
+            },
+            onDismiss = { confirmRemoveOffline = false },
+        )
     }
     if (information && inLibrary) {
         InfoDialog(detail, graph, onRemoved = back) { information = false }
@@ -835,56 +1139,82 @@ private fun InfoDialog(
             }
         }
     if (confirmingRemoval) {
-        AlertDialog(
-            onDismissRequest = { if (!loading) confirmingRemoval = false },
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = { Text("删除作品") },
-            text = { Text("删除该作品及其下载、书签和播放进度。", color = Muted) },
-            confirmButton = {
-                TextButton(
-                    enabled = !loading,
-                    onClick = {
-                        loading = true
-                        scope.launch {
-                            try {
-                                graph.sync.removeOnlineWork(detail.work.id)
-                                dismiss()
-                                onRemoved()
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                graph.messages.tryEmit(e.message ?: "删除失败")
-                            } finally {
-                                loading = false
-                            }
-                        }
-                    },
-                ) {
-                    Text(
-                        if (loading) "删除中" else "删除",
-                        color = MaterialTheme.colorScheme.error,
-                    )
+        WhispConfirmDialog(
+            title = "删除作品",
+            message = "删除该作品及其下载、书签和播放进度。",
+            confirmLabel = if (loading) "删除中" else "删除",
+            busy = loading,
+            onConfirm = {
+                loading = true
+                scope.launch {
+                    try {
+                        graph.sync.removeOnlineWork(detail.work.id)
+                        dismiss()
+                        onRemoved()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        graph.messages.tryEmit(e.message ?: "删除失败")
+                    } finally {
+                        loading = false
+                    }
                 }
             },
-            dismissButton = {
-                TextButton(enabled = !loading, onClick = { confirmingRemoval = false }) {
-                    Text("取消")
-                }
-            },
+            onDismiss = { confirmingRemoval = false },
         )
         return
     }
-    AlertDialog(
-        onDismissRequest = dismiss,
-        title = { Text(stringResource(R.string.action_work_info)) },
-        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(title, { title = it }, label = { Text("作品名") })
-                OutlinedTextField(artist, { artist = it }, label = { Text("声优") })
-                TextButton(onClick = { cover.launch(arrayOf("image/*")) }) { Text("更换封面") }
+    WhispSheet(onDismissRequest = dismiss) { close ->
+        Column(
+            Modifier.fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp)
+                .navigationBarsPadding()
+                .imePadding(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    stringResource(R.string.action_work_info),
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = Cream,
+                    modifier = Modifier.weight(1f),
+                )
+                detail.work.rj?.let {
+                    Text(
+                        it,
+                        color = Muted,
+                        style = MaterialTheme.typography.labelLarge.merge(TabularNumeralStyle),
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = title,
+                onValueChange = { title = it },
+                label = { Text("作品名") },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+            )
+            OutlinedTextField(
+                value = artist,
+                onValueChange = { artist = it },
+                label = { Text("声优") },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+            )
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { cover.launch(arrayOf("image/*")) },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("更换封面")
+                }
                 if (detail.work.rj != null) {
-                    TextButton(
+                    OutlinedButton(
                         enabled = !loading,
                         onClick = {
                             loading = true
@@ -900,42 +1230,53 @@ private fun InfoDialog(
                                 }
                             }
                         },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
                     ) {
-                        Text(if (loading) "读取中" else "更新 DLsite 元数据")
+                        Text(if (loading) "读取中" else "更新 DLsite 元数据", maxLines = 1)
                     }
-                }
-                if (detail.work.isRemovableOnline) {
-                    TextButton(enabled = !loading, onClick = { confirmingRemoval = true }) {
-                        Text("删除作品", color = MaterialTheme.colorScheme.error)
-                    }
-                }
-                detail.work.rj?.let {
-                    Text(
-                        it,
-                        color = Muted,
-                        style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
-                    )
                 }
             }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    scope.launch {
-                        runCatching {
-                            graph.library.editWorkIdentity(
-                                detail.work.id,
-                                title.ifBlank { detail.work.title },
-                                artist,
-                            )
-                        }
-                    }
-                    dismiss()
-                },
+            if (detail.work.isRemovableOnline) {
+                OutlinedButton(
+                    enabled = !loading,
+                    onClick = { confirmingRemoval = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("删除作品", color = MaterialTheme.colorScheme.error)
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text("保存")
+                OutlinedButton(
+                    onClick = close,
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text("取消")
+                }
+                Button(
+                    onClick = {
+                        scope.launch {
+                            runCatching {
+                                graph.library.editWorkIdentity(
+                                    detail.work.id,
+                                    title.ifBlank { detail.work.title },
+                                    artist,
+                                )
+                            }
+                        }
+                        close()
+                    },
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text("保存", fontWeight = FontWeight.SemiBold)
+                }
             }
-        },
-        dismissButton = { TextButton(onClick = dismiss) { Text("取消") } },
-    )
+        }
+    }
 }

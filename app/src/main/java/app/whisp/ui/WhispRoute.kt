@@ -8,9 +8,9 @@ import kotlinx.serialization.Serializable
 sealed interface WhispRoute : NavKey {
     @Serializable data object Library : WhispRoute
 
-    @Serializable data object Favorites : WhispRoute
-
     @Serializable data object Sources : WhispRoute
+
+    @Serializable data object Settings : WhispRoute
 
     @Serializable data object Storage : WhispRoute
 
@@ -19,6 +19,8 @@ sealed interface WhispRoute : NavKey {
     @Serializable data class Detail(val workId: String) : WhispRoute
 
     @Serializable data class Dlsite(val sourceId: String) : WhispRoute
+
+    @Serializable data class DlsiteWork(val sourceId: String, val workno: String) : WhispRoute
 
     @Serializable
     data class AsmrOne(
@@ -31,4 +33,4 @@ sealed interface WhispRoute : NavKey {
 }
 
 internal val WhispRoute.isTopLevelTab: Boolean
-    get() = this is WhispRoute.Library || this is WhispRoute.Favorites || this is WhispRoute.Sources
+    get() = this is WhispRoute.Library || this is WhispRoute.Sources || this is WhispRoute.Settings

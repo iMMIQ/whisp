@@ -279,19 +279,35 @@ internal fun LazyListScope.dlsiteContent(
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     details.genres.forEach { genre ->
-                        SuggestionChip(
-                            onClick = {
-                                if (
-                                    filter != null && genre.name.length <= 160 && '$' !in genre.name
+                        val canFilter =
+                            filter != null && genre.name.length <= 160 && '$' !in genre.name
+                        if (canFilter) {
+                            SuggestionChip(
+                                onClick = { filter(AsmrFacet("tagw", genre.name)) },
+                                enabled = true,
+                                shape = RoundedCornerShape(10.dp),
+                                label = {
+                                    Text(genre.name, style = MaterialTheme.typography.labelMedium)
+                                },
+                            )
+                        } else {
+                            Box(
+                                Modifier.clip(RoundedCornerShape(10.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                    .border(
+                                        0.5.dp,
+                                        MaterialTheme.colorScheme.outlineVariant,
+                                        RoundedCornerShape(10.dp),
+                                    )
+                                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                            ) {
+                                Text(
+                                    genre.name,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Muted,
                                 )
-                                    filter(AsmrFacet("tagw", genre.name))
-                            },
-                            enabled = true,
-                            shape = RoundedCornerShape(10.dp),
-                            label = {
-                                Text(genre.name, style = MaterialTheme.typography.labelMedium)
-                            },
-                        )
+                            }
+                        }
                     }
                 }
             }

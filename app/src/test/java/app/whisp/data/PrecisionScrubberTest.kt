@@ -37,4 +37,20 @@ class PrecisionScrubberTest {
         assertEquals(10_000, drag.rangeEnd)
         assertEquals(10_000, drag.move(400f, 80f))
     }
+
+    @Test
+    fun grabbingNearThumbPreservesInitialPositionWithoutJump() {
+        val drag =
+            PrecisionScrubber(
+                durationMs = 3_600_000,
+                widthPx = 300f,
+                startX = 160f,
+                startY = 30f,
+                fineThresholdPx = 36f,
+                initialPositionMs = 1_800_000,
+            )
+        assertEquals(1_800_000, drag.positionMs)
+        assertEquals(1_800_000, drag.move(160f, 30f))
+        assertEquals(1_920_000, drag.move(170f, 30f))
+    }
 }

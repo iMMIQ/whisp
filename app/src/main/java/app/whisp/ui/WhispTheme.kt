@@ -37,6 +37,8 @@ private val AmoledRaised = Color(0xFF261D31)
 
 internal val LocalReducedMotion = staticCompositionLocalOf { false }
 
+internal val LocalAmoledBlack = staticCompositionLocalOf { false }
+
 internal val TabularNumeralStyle = TextStyle(fontFeatureSettings = "tnum")
 
 private val WhispTypography =
@@ -139,23 +141,24 @@ private val WhispShapes =
         extraLarge = RoundedCornerShape(28.dp),
     )
 
-// Spatial motion has no overshoot; sheet dismissal is faster than expansion.
+// Spatial motion uses critically damped springs for interruptible gesture continuity.
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 private class WhispMotionScheme(private val reduced: Boolean) : MotionScheme {
-    private fun <T> spatial(ms: Int): FiniteAnimationSpec<T> =
-        tween(if (reduced) 0 else ms, easing = FastOutSlowInEasing)
+    private fun <T> spatial(stiffness: Float): FiniteAnimationSpec<T> =
+        if (reduced) snap()
+        else spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = stiffness)
 
-    override fun <T> defaultSpatialSpec() = spatial<T>(260)
+    override fun <T> defaultSpatialSpec() = spatial<T>(450f)
 
-    override fun <T> fastSpatialSpec() = spatial<T>(180)
+    override fun <T> fastSpatialSpec() = spatial<T>(700f)
 
-    override fun <T> slowSpatialSpec() = spatial<T>(280)
+    override fun <T> slowSpatialSpec() = spatial<T>(300f)
 
-    override fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T> = tween(if (reduced) 0 else 100)
+    override fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T> = tween(if (reduced) 0 else 150)
 
-    override fun <T> fastEffectsSpec(): FiniteAnimationSpec<T> = tween(if (reduced) 0 else 180)
+    override fun <T> fastEffectsSpec(): FiniteAnimationSpec<T> = tween(if (reduced) 0 else 100)
 
-    override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = tween(if (reduced) 0 else 160)
+    override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = tween(if (reduced) 0 else 220)
 }
 
 private fun whispColorScheme(amoledBlack: Boolean): ColorScheme {
@@ -210,7 +213,10 @@ fun WhispTheme(
     content: @Composable () -> Unit,
 ) {
     val scheme = remember(amoledBlack) { whispColorScheme(amoledBlack) }
-    CompositionLocalProvider(LocalReducedMotion provides reduceMotion) {
+    CompositionLocalProvider(
+        LocalReducedMotion provides reduceMotion,
+        LocalAmoledBlack provides amoledBlack,
+    ) {
         MaterialTheme(
             colorScheme = scheme,
             typography = WhispTypography,

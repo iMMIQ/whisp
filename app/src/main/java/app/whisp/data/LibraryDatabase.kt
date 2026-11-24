@@ -207,6 +207,13 @@ data class WorkDetails(
 
 data class TrackWorkPair(val id: String, val workId: String)
 
+data class TrackSummary(
+    val id: String,
+    val workId: String,
+    val order: Int,
+    val durationMs: Long,
+)
+
 @Dao
 interface LibraryDao {
     @Query(
@@ -246,6 +253,9 @@ interface LibraryDao {
     @Query("SELECT * FROM works ORDER BY addedAt DESC") fun observeWorks(): Flow<List<WorkEntity>>
 
     @Query("SELECT id, workId FROM tracks") fun observeTrackWorkPairs(): Flow<List<TrackWorkPair>>
+
+    @Query("SELECT id, workId, `order`, durationMs FROM tracks ORDER BY `order`, id")
+    fun observeTrackSummaries(): Flow<List<TrackSummary>>
 
     @Transaction
     @Query("SELECT * FROM works WHERE id = :id")

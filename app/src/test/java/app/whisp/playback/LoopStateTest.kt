@@ -51,4 +51,15 @@ class SleepTimerTest {
         assertEquals(1_000_000 + 180 * 60_000L, SleepTimer.deadlineMs(1_000_000, 999))
         assertEquals(0, SleepTimer.deadlineMs(1_000_000, -5))
     }
+
+    @Test
+    fun remainingMinutesUsesMonotonicClockReference() {
+        val nowElapsed = 2_000_000L
+        val deadline = SleepTimer.deadlineMs(nowElapsed, 15)
+        assertEquals(15, SleepTimer.remainingMinutes(deadline, nowElapsed))
+        assertEquals(15, SleepTimer.remainingMinutes(deadline, nowElapsed + 1_000L))
+        assertEquals(1, SleepTimer.remainingMinutes(deadline, deadline - 1_000L))
+        assertEquals(0, SleepTimer.remainingMinutes(deadline, deadline))
+        assertEquals(0, SleepTimer.remainingMinutes(0L, nowElapsed))
+    }
 }

@@ -11,10 +11,13 @@ class WhispRouteTest {
         val original =
             listOf<WhispRoute>(
                 WhispRoute.Library,
+                WhispRoute.Sources,
+                WhispRoute.Settings,
                 WhispRoute.Detail("work|with|pipes"),
                 WhispRoute.AsmrOne("source|id", "va", "声优"),
                 WhispRoute.AsmrPreview("source|id", 123456L),
                 WhispRoute.Dlsite("dlsite-src"),
+                WhispRoute.DlsiteWork("dlsite-src", "RJ00000001"),
                 WhispRoute.Storage,
                 WhispRoute.Player,
             )

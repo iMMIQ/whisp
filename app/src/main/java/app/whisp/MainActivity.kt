@@ -36,8 +36,25 @@ class MainActivity : ComponentActivity() {
         if (hideRecents && !activityResumed) window.addFlags(flag) else window.clearFlags(flag)
     }
 
+    private var notificationRequested = false
+
     private val notifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+
+    private fun requestNotificationsIfNeeded() {
+        if (Build.VERSION.SDK_INT < 33 || notificationRequested) return
+        if (
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationRequested = true
+            return
+        }
+        notificationRequested = true
+        notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,9 +80,7 @@ class MainActivity : ComponentActivity() {
                     }
             }
         }
-        setContent { WhispRoot(graph, playerRequest) }
-        if (Build.VERSION.SDK_INT >= 33)
-            notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        setContent { WhispRoot(graph, playerRequest, ::requestNotificationsIfNeeded) }
     }
 
     override fun onNewIntent(intent: Intent) {

@@ -30,4 +30,12 @@ class BookmarkDraftTest {
         assertNull(draft.end)
         assertEquals("标题", draft.title)
     }
+
+    @Test
+    fun loopDraftRetainsBothEndpoints() {
+        val draft = BookmarkDraft.forLoop("track", 5_000, 12_000, "循环片段")
+        assertEquals(5_000, draft.position)
+        assertEquals(12_000L, draft.end)
+        assertEquals("循环片段", draft.title)
+    }
 }

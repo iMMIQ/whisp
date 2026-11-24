@@ -72,6 +72,25 @@ class AppGraph(val context: Context) {
     val sync: LibrarySync
     val dlsiteLoader: app.whisp.ui.DlsiteDetailsLoader
     val asmrCatalog: app.whisp.ui.AsmrCatalogController
+    private val scopedAsmrCatalogs =
+        object : LinkedHashMap<String, app.whisp.ui.AsmrCatalogController>(8, 0.75f, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<String, app.whisp.ui.AsmrCatalogController>?,
+            ): Boolean = size > 6
+        }
+
+    fun asmrCatalogFor(scopeKey: String?): app.whisp.ui.AsmrCatalogController {
+        if (scopeKey == null) return asmrCatalog
+        return synchronized(scopedAsmrCatalogs) {
+            scopedAsmrCatalogs.getOrPut(scopeKey) {
+                app.whisp.ui.AsmrCatalogController(
+                    scope = mainScope,
+                    fetchPage = sync::asmrPage,
+                    rememberSearch = settings::rememberAsmrSearch,
+                )
+            }
+        }
+    }
 
     init {
         var libraryRef: LibraryStore? = null

@@ -147,13 +147,17 @@ class PlaybackFlowIntegrationTest {
             waitFor { playback.positionMs.value == 4000L }
             ui.onNodeWithContentDescription("跟随字幕").performClick()
             ui.onNodeWithContentDescription("播放").assertIsDisplayed()
-            ui.onNodeWithTag("subtitle-0").performClick()
+            ui.onNodeWithTag("subtitle-0").performTouchInput { longClick() }
             ui.onNodeWithText("从这里播放").assertIsDisplayed()
             assertFalse(
-                "Reading a subtitle must not start audio",
+                "Inspecting a subtitle menu must not start audio",
                 playback.state.value.playWhenReady,
             )
-            assertEquals("Reading a subtitle must not seek", 4000L, playback.positionMs.value)
+            assertEquals(
+                "Inspecting a subtitle menu must not seek",
+                4000L,
+                playback.positionMs.value,
+            )
             ui.onNodeWithText("从这里播放").performClick()
             waitFor { playback.state.value.playWhenReady && playback.positionMs.value < 3000 }
             ui.onNodeWithContentDescription("暂停").performClick()

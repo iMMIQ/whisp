@@ -134,7 +134,7 @@ class DlsiteLoginActivity : ComponentActivity() {
                         }
                     },
                 ) { padding ->
-                    Column(Modifier.fillMaxSize().padding(padding)) {
+                    Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
                         if (checking) LinearProgressIndicator(Modifier.fillMaxWidth())
                         error?.let {
                             Row(

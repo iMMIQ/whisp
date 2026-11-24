@@ -13,11 +13,17 @@
         android:fullBackupContent="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:networkSecurityConfig="@xml/network_security_config" android:supportsRtl="true">
-        <activity android:name=".DlsiteLoginActivity" android:exported="false" />
+        <activity
+            android:name=".DlsiteLoginActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.diagnostics" android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/diagnostic_paths" />
         </provider>
-        <activity android:name=".MainActivity" android:exported="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

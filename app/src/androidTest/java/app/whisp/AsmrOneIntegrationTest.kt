@@ -335,6 +335,7 @@ class AsmrOneIntegrationTest {
                 }
             }
             try {
+                ui.onNodeWithContentDescription("返回来源").performClick()
                 ui.onNodeWithText("作品", useUnmergedTree = true).performClick()
                 ui.onNodeWithContentDescription("官方示例作品1").performClick()
                 ui.waitUntil(15000) {

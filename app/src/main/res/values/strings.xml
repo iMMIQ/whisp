@@ -1,11 +1,11 @@
 <resources>
     <string name="download_channel">离线保存</string>
     <string name="nav_library">作品</string>
-    <string name="nav_favorites">收藏</string>
     <string name="nav_sources">来源</string>
+    <string name="nav_settings">设置</string>
     <string name="title_library">作品库</string>
-    <string name="title_favorites">收藏</string>
     <string name="title_sources">来源</string>
+    <string name="title_settings">设置</string>
     <string name="title_storage">存储</string>
     <string name="action_add_works">添加作品</string>
     <string name="action_search_works">搜索作品</string>

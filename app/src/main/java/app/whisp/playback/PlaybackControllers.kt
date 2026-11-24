@@ -57,6 +57,14 @@ object AudioOffload {
 object SleepTimer {
     fun deadlineMs(nowMs: Long, minutes: Int): Long =
         if (minutes <= 0) 0 else nowMs + minutes.coerceAtMost(180) * 60_000L
+
+    fun remainingMinutes(
+        deadlineMs: Long,
+        nowElapsedMs: Long = SystemClock.elapsedRealtime(),
+    ): Int =
+        if (deadlineMs > nowElapsedMs)
+            kotlin.math.ceil((deadlineMs - nowElapsedMs) / 60_000.0).toInt()
+        else 0
 }
 
 data class LoopState(val startMs: Long, val endMs: Long) {
@@ -85,12 +93,18 @@ internal class SleepTimerController(
     private val scope: CoroutineScope,
     private val onExpired: () -> Unit,
     private val onChanged: () -> Unit,
+    private val getVolume: () -> Float = { 1f },
+    private val setVolume: (Float) -> Unit = {},
 ) {
     companion object {
         private const val SLEEP_ALARM_REQUEST_CODE = 1702
+        private const val FADE_LEAD_MS = 12_000L
     }
 
     var deadlineMs: Long = 0L
+        private set
+
+    var stopAfterTrack: Boolean = false
         private set
 
     var handledByAlarm: Boolean = false
@@ -100,13 +114,15 @@ internal class SleepTimerController(
         get() = if (handledByAlarm) 0L else deadlineMs
 
     private var timerJob: Job? = null
+    private var fadeJob: Job? = null
+    private var savedVolume: Float? = null
     private var receiverRegistered = false
     private val action = "${context.packageName}.ACTION_SLEEP_TIMER"
 
     private val receiver =
         object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == action && deadlineMs > 0L) expire()
+                if (intent?.action == action && deadlineMs > 0L) onWakeForDeadline()
             }
         }
 
@@ -122,41 +138,120 @@ internal class SleepTimerController(
     }
 
     fun setMinutes(minutes: Int) {
+        cancelFade(restoreVolume = true)
         timerJob?.cancel()
         timerJob = null
         cancelAlarm()
+        stopAfterTrack = false
         deadlineMs = SleepTimer.deadlineMs(SystemClock.elapsedRealtime(), minutes)
-        if (deadlineMs > 0L) {
-            val alarmManager = context.getSystemService(AlarmManager::class.java)
-            val scheduled =
-                alarmManager != null &&
-                    runCatching {
-                        alarmManager.setAndAllowWhileIdle(
-                            AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                            deadlineMs,
-                            pendingIntent(),
-                        )
-                    }
-                        .isSuccess
-            handledByAlarm = scheduled
-            if (!scheduled) {
-                timerJob = scope.launch {
-                    while (isActive && deadlineMs > SystemClock.elapsedRealtime()) {
-                        delay(deadlineMs - SystemClock.elapsedRealtime())
-                    }
-                    expire()
-                }
-            }
-        }
+        if (deadlineMs > 0L) scheduleCurrentDeadline()
         onChanged()
     }
 
-    private fun expire() {
+    fun extendMinutes(deltaMinutes: Int) {
+        if (deltaMinutes <= 0) return
+        val now = SystemClock.elapsedRealtime()
+        val base = if (deadlineMs > now) deadlineMs else now
+        cancelFade(restoreVolume = true)
+        timerJob?.cancel()
+        timerJob = null
+        cancelAlarm()
+        stopAfterTrack = false
+        deadlineMs = (base + deltaMinutes * 60_000L).coerceAtMost(now + 180 * 60_000L)
+        scheduleCurrentDeadline()
+        onChanged()
+    }
+
+    fun setStopAfterTrack(enabled: Boolean) {
+        cancelFade(restoreVolume = true)
         timerJob?.cancel()
         timerJob = null
         cancelAlarm()
         deadlineMs = 0L
+        stopAfterTrack = enabled
+        onChanged()
+    }
+
+    fun consumeStopAfterTrack(): Boolean {
+        if (!stopAfterTrack) return false
+        stopAfterTrack = false
+        onChanged()
+        return true
+    }
+
+    private fun scheduleCurrentDeadline() {
+        val now = SystemClock.elapsedRealtime()
+        val remaining = deadlineMs - now
+        val wakeAt =
+            if (remaining > FADE_LEAD_MS + 3_000L) deadlineMs - FADE_LEAD_MS else deadlineMs
+        val alarmManager = context.getSystemService(AlarmManager::class.java)
+        val scheduled =
+            alarmManager != null &&
+                runCatching {
+                    alarmManager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        wakeAt,
+                        pendingIntent(),
+                    )
+                }
+                    .isSuccess
+        handledByAlarm = scheduled
+        if (!scheduled) {
+            timerJob = scope.launch {
+                val wait = wakeAt - SystemClock.elapsedRealtime()
+                if (wait > 0L) delay(wait)
+                if (isActive && deadlineMs > 0L) onWakeForDeadline()
+            }
+        }
+    }
+
+    private fun onWakeForDeadline() {
+        val target = deadlineMs
+        if (target <= 0L) return
+        val now = SystemClock.elapsedRealtime()
+        val remaining = target - now
+        if (remaining <= 250L) {
+            expire()
+            return
+        }
+        cancelFade(restoreVolume = true)
+        val initialVolume = getVolume().coerceIn(0f, 1f)
+        savedVolume = initialVolume
+        fadeJob = scope.launch {
+            val fadeSpan = remaining.toFloat().coerceAtLeast(1f)
+            while (isActive) {
+                val left = target - SystemClock.elapsedRealtime()
+                if (left <= 0L) break
+                if (initialVolume > 0f) {
+                    val factor = (left / fadeSpan).coerceIn(0f, 1f)
+                    setVolume(initialVolume * factor)
+                }
+                delay(minOf(200L, left))
+            }
+            if (isActive && deadlineMs == target) expire()
+        }
+    }
+
+    private fun cancelFade(restoreVolume: Boolean) {
+        fadeJob?.cancel()
+        fadeJob = null
+        val prev = savedVolume
+        savedVolume = null
+        if (restoreVolume && prev != null) setVolume(prev)
+    }
+
+    private fun expire() {
+        val prev = savedVolume
+        fadeJob?.cancel()
+        fadeJob = null
+        savedVolume = null
+        timerJob?.cancel()
+        timerJob = null
+        cancelAlarm()
+        deadlineMs = 0L
+        stopAfterTrack = false
         onExpired()
+        if (prev != null) setVolume(prev)
         onChanged()
     }
 
@@ -174,9 +269,11 @@ internal class SleepTimerController(
     }
 
     fun release() {
+        cancelFade(restoreVolume = true)
         timerJob?.cancel()
         timerJob = null
         cancelAlarm()
+        stopAfterTrack = false
         if (receiverRegistered) {
             runCatching { context.unregisterReceiver(receiver) }
             receiverRegistered = false
@@ -205,6 +302,9 @@ internal class AbLoopController(
     var suppressAutoProgress: Boolean = false
         private set
 
+    var lastClearedBySeek: LoopState? = null
+        private set
+
     private var endMessage: PlayerMessage? = null
     private var pendingLoopSeekTo: Pair<String?, Long>? = null
 
@@ -219,9 +319,9 @@ internal class AbLoopController(
         cancelMessage()
         pendingLoopSeekTo = null
         suppressAutoProgress = false
+        lastClearedBySeek = null
         startMs = segment?.startMs ?: -1L
         endMs = segment?.endMs ?: -1L
-        player.setPauseAtEndOfMediaItems(active)
         if (active) {
             scheduleMessage()
             if (player.isPlaying && player.currentPosition >= endMs) seekToLoopStart()
@@ -229,25 +329,33 @@ internal class AbLoopController(
         onChanged()
     }
 
-    fun clear() {
+    fun clear(recordAsSeekClear: Boolean = false) {
         if (!active && endMessage == null) return
+        val previous = if (recordAsSeekClear && active) LoopState(startMs, endMs) else null
         cancelMessage()
         pendingLoopSeekTo = null
         suppressAutoProgress = false
         startMs = -1L
         endMs = -1L
-        player.setPauseAtEndOfMediaItems(false)
+        lastClearedBySeek = previous
         onChanged()
+    }
+
+    fun dismissClearedHistory() {
+        if (lastClearedBySeek != null) {
+            lastClearedBySeek = null
+            onChanged()
+        }
     }
 
     fun onTrackTransition() {
         cancelMessage()
         pendingLoopSeekTo = null
         suppressAutoProgress = false
+        lastClearedBySeek = null
         if (active) {
             startMs = -1L
             endMs = -1L
-            player.setPauseAtEndOfMediaItems(false)
             onChanged()
         }
     }
@@ -288,7 +396,10 @@ internal class AbLoopController(
                 (oldPosition.mediaItem?.mediaId != newPosition.mediaItem?.mediaId ||
                     newPosition.positionMs !in startMs..endMs)
         ) {
-            clear()
+            clear(
+                recordAsSeekClear =
+                    oldPosition.mediaItem?.mediaId == newPosition.mediaItem?.mediaId,
+            )
         }
         return loopSeek
     }

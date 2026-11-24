@@ -16,6 +16,12 @@ import androidx.compose.ui.platform.LocalView
 
 internal val LocalTouchFeedback = staticCompositionLocalOf { true }
 
+internal enum class HapticKind {
+    None,
+    Tick,
+    Confirm,
+}
+
 /** Feedback only accompanies explicit actions, never playback or subtitle following. */
 internal class WhispHaptics(private val view: View, private val enabled: Boolean) {
     fun confirm() {
@@ -31,6 +37,14 @@ internal class WhispHaptics(private val view: View, private val enabled: Boolean
             view.performHapticFeedback(
                 if (Build.VERSION.SDK_INT >= 34) HapticFeedbackConstants.SEGMENT_TICK
                 else HapticFeedbackConstants.CLOCK_TICK,
+            )
+    }
+
+    fun reject() {
+        if (enabled)
+            view.performHapticFeedback(
+                if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.REJECT
+                else HapticFeedbackConstants.LONG_PRESS,
             )
     }
 }

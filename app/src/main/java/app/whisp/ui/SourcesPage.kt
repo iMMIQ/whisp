@@ -9,9 +9,11 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Login
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -21,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -32,8 +35,10 @@ import androidx.media3.exoplayer.offline.Download
 import app.whisp.AppGraph
 import app.whisp.DlsiteLoginActivity
 import app.whisp.R
+import app.whisp.data.SourceEntity
 import app.whisp.data.SourceKind
 import app.whisp.data.WhispImage
+import app.whisp.data.WorkEntity
 import app.whisp.data.kindType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -42,7 +47,7 @@ private fun sourceIcon(kind: SourceKind?): ImageVector =
     when (kind) {
         SourceKind.LOCAL -> Icons.Outlined.FolderOpen
         SourceKind.SMB -> Icons.Outlined.Dns
-        SourceKind.NFS -> Icons.Outlined.Storage
+        SourceKind.NFS -> Icons.Outlined.Lan
         SourceKind.WEBDAV -> Icons.Outlined.CloudQueue
         SourceKind.ASMRONE -> Icons.Outlined.Headphones
         SourceKind.DLSITE -> Icons.Outlined.AccountCircle
@@ -64,6 +69,7 @@ private fun sourceLabel(kind: SourceKind?): String =
 @Composable
 internal fun SourcesPage(
     graph: AppGraph,
+    reselectTick: Int = 0,
     online: (String) -> Unit,
     dlsite: (String) -> Unit,
     storage: () -> Unit,
@@ -77,10 +83,17 @@ internal fun SourcesPage(
         remember(graph) { graph.library.dao.observeTrackWorkPairs() }
             .collectAsStateWithLifecycle(emptyList())
     val scope = rememberCoroutineScope()
+    val listState = rememberLazyListState()
 
     var adding by rememberSaveable { mutableStateOf(false) }
     var remoteKind by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmingRemoveSource by remember { mutableStateOf<SourceEntity?>(null) }
+    var confirmingRemoveOffline by remember { mutableStateOf<WorkEntity?>(null) }
+
+    LaunchedEffect(reselectTick) {
+        if (reselectTick > 0) listState.animateScrollToItem(0)
+    }
 
     fun runAction(block: suspend () -> Unit) {
         scope.launch {
@@ -138,11 +151,20 @@ internal fun SourcesPage(
                 color = Cream,
                 modifier = Modifier.weight(1f),
             )
-            IconAction(Icons.Outlined.Storage, "存储管理", Muted, action = storage)
-            IconAction(Icons.Outlined.Add, "添加来源", Cream) { adding = true }
+            IconAction(
+                Icons.Outlined.Storage,
+                "存储管理",
+                Muted,
+                haptic = HapticKind.Tick,
+                action = storage,
+            )
+            IconAction(Icons.Outlined.Add, "添加来源", Cream, haptic = HapticKind.Tick) {
+                adding = true
+            }
         }
         LazyColumn(
-            Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize(),
+            state = listState,
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -215,7 +237,12 @@ internal fun SourcesPage(
                             selectedId = source.id
                         }
                     } else {
-                        IconAction(Icons.Outlined.Refresh, "刷新${source.name}", Muted) {
+                        IconAction(
+                            Icons.Outlined.Refresh,
+                            "刷新${source.name}",
+                            Muted,
+                            haptic = HapticKind.Tick,
+                        ) {
                             graph.sync.scheduleScan(source.id)
                         }
                     }
@@ -249,10 +276,20 @@ internal fun SourcesPage(
                             color = Cream,
                             modifier = Modifier.weight(1f),
                         )
-                        IconAction(Icons.Outlined.PlayArrow, "继续下载", Rose) {
+                        IconAction(
+                            Icons.Outlined.PlayArrow,
+                            "继续下载",
+                            Rose,
+                            haptic = HapticKind.Tick,
+                        ) {
                             graph.offline.resumeDownloads()
                         }
-                        IconAction(Icons.Outlined.Pause, "暂停下载", Muted) {
+                        IconAction(
+                            Icons.Outlined.Pause,
+                            "暂停下载",
+                            Muted,
+                            haptic = HapticKind.Tick,
+                        ) {
                             graph.offline.pauseDownloads()
                         }
                     }
@@ -314,8 +351,9 @@ internal fun SourcesPage(
                             if (complete) Icons.Outlined.DeleteOutline else Icons.Outlined.Refresh,
                             if (complete) "移除离线副本" else "重试下载",
                             Muted,
+                            haptic = HapticKind.Tick,
                         ) {
-                            if (complete) runAction { graph.offline.removeOffline(work.id) }
+                            if (complete) confirmingRemoveOffline = work
                             else runAction { graph.offline.downloadWork(work.id) }
                         }
                     }
@@ -391,7 +429,7 @@ internal fun SourcesPage(
                     },
                 )
                 WhispSheetRow(
-                    icon = Icons.Outlined.Storage,
+                    icon = Icons.Outlined.Lan,
                     title = "NFS",
                     subtitle = "直连 NAS 导出目录（NFS 3 / 4.0 / 4.2）",
                     onClick = {
@@ -407,81 +445,119 @@ internal fun SourcesPage(
     sources
         .firstOrNull { it.id == selectedId }
         ?.let { source ->
-            AlertDialog(
-                onDismissRequest = { selectedId = null },
-                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                title = { Text(source.name) },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        if (source.kindType !in setOf(SourceKind.ASMRONE, SourceKind.DLSITE))
-                            Text(source.root, color = Muted, fontSize = 13.sp)
-                        source.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                        if (source.kindType == SourceKind.ASMRONE) {
-                            TextButton(
-                                onClick = {
-                                    graph.sync.scheduleScan(source.id)
-                                    selectedId = null
-                                },
-                            ) {
-                                Text("更新已加入作品")
-                            }
-                        }
-                        if (source.kindType == SourceKind.DLSITE) {
-                            TextButton(
-                                onClick = {
-                                    selectedId = null
-                                    login.launch(
-                                        Intent(graph.context, DlsiteLoginActivity::class.java)
-                                            .putExtra(DlsiteLoginActivity.SOURCE, source.id),
-                                    )
-                                },
-                            ) {
-                                Text("重新登录")
-                            }
-                            TextButton(
-                                onClick = {
-                                    graph.sync.scheduleScan(source.id)
-                                    selectedId = null
-                                },
-                            ) {
-                                Text("同步已购作品")
-                            }
-                        }
+            WhispSheet(onDismissRequest = { selectedId = null }) { dismiss ->
+                Column(
+                    Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(source.name, style = MaterialTheme.typography.headlineSmall, color = Cream)
+                    if (source.kindType !in setOf(SourceKind.ASMRONE, SourceKind.DLSITE)) {
+                        Text(source.root, color = Muted, fontSize = 13.sp)
                     }
-                },
-                confirmButton = {
-                    TextButton(
+                    source.error?.let {
+                        Text(
+                            it,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+                if (source.kindType in setOf(SourceKind.ASMRONE, SourceKind.DLSITE)) {
+                    WhispSheetRow(
+                        icon = Icons.Outlined.Explore,
+                        title = "浏览",
                         onClick = {
+                            dismiss()
                             when (source.kindType) {
                                 SourceKind.ASMRONE -> online(source.id)
                                 SourceKind.DLSITE -> dlsite(source.id)
-                                else -> graph.sync.scheduleScan(source.id)
+                                else -> Unit
                             }
-                            selectedId = null
                         },
-                    ) {
-                        Text(
-                            if (source.kindType in setOf(SourceKind.ASMRONE, SourceKind.DLSITE))
-                                "浏览"
-                            else "刷新",
-                        )
-                    }
-                },
-                dismissButton = {
-                    TextButton(
+                    )
+                } else {
+                    WhispSheetRow(
+                        icon = Icons.Outlined.Refresh,
+                        title = "刷新",
+                        subtitle = "重新扫描此来源的音频与字幕",
                         onClick = {
-                            runAction { graph.sync.removeSource(source.id) }
-                            selectedId = null
+                            graph.sync.scheduleScan(source.id)
+                            dismiss()
                         },
-                    ) {
-                        Text(
-                            if (source.kindType == SourceKind.DLSITE) "退出账号" else "移除来源",
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                    }
-                },
-            )
+                    )
+                }
+                if (source.kindType == SourceKind.ASMRONE) {
+                    WhispSheetRow(
+                        icon = Icons.Outlined.Refresh,
+                        title = "更新已加入作品",
+                        onClick = {
+                            graph.sync.scheduleScan(source.id)
+                            dismiss()
+                        },
+                    )
+                }
+                if (source.kindType == SourceKind.DLSITE) {
+                    WhispSheetRow(
+                        icon = Icons.Outlined.Refresh,
+                        title = "同步已购作品",
+                        onClick = {
+                            graph.sync.scheduleScan(source.id)
+                            dismiss()
+                        },
+                    )
+                    WhispSheetRow(
+                        icon = Icons.AutoMirrored.Outlined.Login,
+                        title = "重新登录",
+                        onClick = {
+                            dismiss()
+                            login.launch(
+                                Intent(graph.context, DlsiteLoginActivity::class.java)
+                                    .putExtra(DlsiteLoginActivity.SOURCE, source.id),
+                            )
+                        },
+                    )
+                }
+                WhispSheetRow(
+                    icon = Icons.Outlined.DeleteOutline,
+                    title = if (source.kindType == SourceKind.DLSITE) "退出账号" else "移除来源",
+                    tint = MaterialTheme.colorScheme.error,
+                    onClick = {
+                        dismiss()
+                        confirmingRemoveSource = source
+                    },
+                )
+                Spacer(Modifier.navigationBarsPadding().height(8.dp))
+            }
         }
+
+    confirmingRemoveSource?.let { source ->
+        val isDlsite = source.kindType == SourceKind.DLSITE
+        WhispConfirmDialog(
+            title = if (isDlsite) "退出 DLsite 账号" else "移除来源",
+            message =
+                if (isDlsite) "退出账号「${source.name}」并清理已购索引？已离线保存的本地副本会保留。"
+                else "移除来源「${source.name}」？未离线保存的作品索引将一并移除。",
+            confirmLabel = if (isDlsite) "退出账号" else "移除",
+            onConfirm = {
+                confirmingRemoveSource = null
+                runAction { graph.sync.removeSource(source.id) }
+            },
+            onDismiss = { confirmingRemoveSource = null },
+        )
+    }
+
+    confirmingRemoveOffline?.let { work ->
+        WhispConfirmDialog(
+            title = "移除离线副本",
+            message = "移除「${shortTitle(work.title).ifBlank { work.title }}」的离线文件？",
+            confirmLabel = "移除",
+            onConfirm = {
+                confirmingRemoveOffline = null
+                runAction { graph.offline.removeOffline(work.id) }
+            },
+            onDismiss = { confirmingRemoveOffline = null },
+        )
+    }
 
     remoteKind?.let { raw ->
         SourceKind.of(raw)?.let { kind -> RemoteDialog(graph, kind) { remoteKind = null } }
@@ -507,145 +583,169 @@ private fun RemoteDialog(graph: AppGraph, kind: SourceKind, dismiss: () -> Unit)
             SourceKind.NFS -> "NFS"
             else -> "WebDAV"
         }
-    AlertDialog(
-        onDismissRequest = { if (!connecting) dismiss() },
-        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-        title = { Text(title) },
-        text = {
-            Column(
-                Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                OutlinedTextField(name, { name = it }, label = { Text("名称") }, singleLine = true)
-                OutlinedTextField(
-                    address,
-                    { address = it },
-                    label = { Text("地址") },
-                    placeholder = {
-                        Text(
-                            when (kind) {
-                                SourceKind.SMB -> "smb://nas.example/media/Audio/"
-                                SourceKind.NFS -> "nfs://nas.example/media/Audio"
-                                else -> "https://nas.example/Audio/"
-                            },
-                        )
-                    },
-                    singleLine = true,
-                )
-                if (kind == SourceKind.NFS) {
-                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                        listOf(3 to "3", 4 to "4.0", 42 to "4.2").forEachIndexed {
-                            index,
-                            (value, text) ->
-                            SegmentedButton(
-                                selected = version == value,
-                                onClick = { version = value },
-                                enabled = !connecting,
-                                shape = SegmentedButtonDefaults.itemShape(index, 3),
-                            ) {
-                                Text("NFS $text")
-                            }
-                        }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        OutlinedTextField(
-                            uid,
-                            { uid = it },
-                            Modifier.weight(1f),
-                            label = { Text("UID") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        )
-                        OutlinedTextField(
-                            gid,
-                            { gid = it },
-                            Modifier.weight(1f),
-                            label = { Text("GID") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        )
-                    }
-                } else {
-                    OutlinedTextField(
-                        username,
-                        { username = it },
-                        label = { Text("账号") },
-                        singleLine = true,
+    WhispSheet(onDismissRequest = { if (!connecting) dismiss() }) { close ->
+        Column(
+            Modifier.fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp)
+                .navigationBarsPadding()
+                .imePadding(),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.headlineSmall, color = Cream)
+            OutlinedTextField(
+                name,
+                { name = it },
+                Modifier.fillMaxWidth(),
+                label = { Text("名称") },
+                singleLine = true,
+                shape = RoundedCornerShape(14.dp),
+            )
+            OutlinedTextField(
+                address,
+                { address = it },
+                Modifier.fillMaxWidth(),
+                label = { Text("地址") },
+                placeholder = {
+                    Text(
+                        when (kind) {
+                            SourceKind.SMB -> "smb://nas.example/media/Audio/"
+                            SourceKind.NFS -> "nfs://nas.example/media/Audio"
+                            else -> "https://nas.example/Audio/"
+                        },
                     )
-                    OutlinedTextField(
-                        password,
-                        { password = it },
-                        label = { Text("密码") },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                    )
-                    if (kind == SourceKind.SMB) {
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
+                },
+                singleLine = true,
+                shape = RoundedCornerShape(14.dp),
+            )
+            if (kind == SourceKind.NFS) {
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    listOf(3 to "3", 4 to "4.0", 42 to "4.2").forEachIndexed { index, (value, text)
+                        ->
+                        SegmentedButton(
+                            selected = version == value,
+                            onClick = { version = value },
+                            enabled = !connecting,
+                            shape = SegmentedButtonDefaults.itemShape(index, 3),
                         ) {
-                            Text(
-                                stringResource(R.string.label_smb_compat),
-                                Modifier.weight(1f),
-                                fontSize = 14.sp,
-                                color = Muted,
-                            )
-                            Switch(
-                                checked = allowUnencryptedSmb,
-                                onCheckedChange = { allowUnencryptedSmb = it },
-                                enabled = !connecting,
-                            )
+                            Text("NFS $text")
                         }
                     }
                 }
-                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        uid,
+                        { uid = it },
+                        Modifier.weight(1f),
+                        label = { Text("UID") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    )
+                    OutlinedTextField(
+                        gid,
+                        { gid = it },
+                        Modifier.weight(1f),
+                        label = { Text("GID") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    )
+                }
+            } else {
+                OutlinedTextField(
+                    username,
+                    { username = it },
+                    Modifier.fillMaxWidth(),
+                    label = { Text("账号") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                )
+                OutlinedTextField(
+                    password,
+                    { password = it },
+                    Modifier.fillMaxWidth(),
+                    label = { Text("密码") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                    visualTransformation = PasswordVisualTransformation(),
+                )
+                if (kind == SourceKind.SMB) {
+                    WhispToggleRow(
+                        label = stringResource(R.string.label_smb_compat),
+                        checked = allowUnencryptedSmb,
+                        enabled = !connecting,
+                        onCheckedChange = { allowUnencryptedSmb = it },
+                    )
+                }
             }
-        },
-        confirmButton = {
-            TextButton(
-                enabled = !connecting,
-                onClick = {
-                    connecting = true
-                    error = null
-                    scope.launch {
-                        try {
-                            val id =
-                                when (kind) {
-                                    SourceKind.SMB ->
-                                        graph.library.addSmb(
-                                            name,
-                                            address,
-                                            username,
-                                            password,
-                                            encrypt = if (allowUnencryptedSmb) false else null,
-                                        )
-                                    SourceKind.NFS ->
-                                        graph.library.addNfs(
-                                            name,
-                                            address,
-                                            version,
-                                            uid.trim().toIntOrNull() ?: error("UID 应为非负整数"),
-                                            gid.trim().toIntOrNull() ?: error("GID 应为非负整数"),
-                                        )
-                                    else ->
-                                        graph.library.addWebDav(name, address, username, password)
-                                }
-                            graph.sync.scheduleScan(id, force = true)
-                            dismiss()
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            error = e.message ?: "连接失败"
-                        } finally {
-                            connecting = false
-                        }
-                    }
-                },
+            error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                if (connecting) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                else Text("连接")
+                OutlinedButton(
+                    enabled = !connecting,
+                    onClick = close,
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text("取消")
+                }
+                Button(
+                    enabled = !connecting,
+                    onClick = {
+                        connecting = true
+                        error = null
+                        scope.launch {
+                            try {
+                                val id =
+                                    when (kind) {
+                                        SourceKind.SMB ->
+                                            graph.library.addSmb(
+                                                name,
+                                                address,
+                                                username,
+                                                password,
+                                                encrypt = if (allowUnencryptedSmb) false else null,
+                                            )
+                                        SourceKind.NFS ->
+                                            graph.library.addNfs(
+                                                name,
+                                                address,
+                                                version,
+                                                uid.trim().toIntOrNull() ?: error("UID 应为非负整数"),
+                                                gid.trim().toIntOrNull() ?: error("GID 应为非负整数"),
+                                            )
+                                        else ->
+                                            graph.library.addWebDav(
+                                                name,
+                                                address,
+                                                username,
+                                                password,
+                                            )
+                                    }
+                                graph.sync.scheduleScan(id, force = true)
+                                close()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                error = e.message ?: "连接失败"
+                            } finally {
+                                connecting = false
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    if (connecting) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        Text("连接", fontWeight = FontWeight.SemiBold)
+                    }
+                }
             }
-        },
-        dismissButton = { TextButton(enabled = !connecting, onClick = dismiss) { Text("取消") } },
-    )
+        }
+    }
 }

@@ -72,6 +72,8 @@ class PlaybackService : MediaLibraryService() {
                     saveProgress(immediate = true)
                 },
                 onChanged = ::publishSessionState,
+                getVolume = { player.volume },
+                setVolume = { player.volume = it },
             )
         timer.register()
         AudioOffload.apply(player, loop, timer)
@@ -91,11 +93,12 @@ class PlaybackService : MediaLibraryService() {
 
                 override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
                     if (!playWhenReady) {
-                        if (
-                            reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM &&
-                                loop.onEndOfMediaItem()
-                        ) {
-                            return
+                        if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM) {
+                            if (loop.onEndOfMediaItem()) return
+                            if (timer.consumeStopAfterTrack()) {
+                                saveProgress(immediate = true)
+                                return
+                            }
                         }
                         loop.onPauseRequested()
                         saveProgress()
@@ -399,9 +402,11 @@ class PlaybackService : MediaLibraryService() {
     }
 
     private fun publishSessionState() {
+        player.setPauseAtEndOfMediaItems(loop.active || timer.stopAfterTrack)
         session?.setSessionExtras(
             Bundle().apply {
                 putLong("timerEnd", timer.deadlineMs)
+                putBoolean("timerStopAfterTrack", timer.stopAfterTrack)
                 putLong("loopStart", loop.startMs)
                 putLong("loopEnd", loop.endMs)
             },

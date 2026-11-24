@@ -107,6 +107,7 @@ class DlsiteLibraryIntegrationTest {
         ui.onNodeWithText("海边夜话").assertExists()
         ui.onNodeWithContentDescription("管理 DLsite 账号").performClick()
         ui.onNodeWithText("退出账号").performClick()
+        ui.onNodeWithText("确认退出").performClick()
         ui.waitUntil(10_000) { runBlocking { graph.library.dao.source(source) == null } }
         runBlocking { assertTrue(graph.library.dlsitePurchases(source).first().isEmpty()) }
     }

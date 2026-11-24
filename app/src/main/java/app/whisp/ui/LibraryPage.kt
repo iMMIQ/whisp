@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -35,27 +36,59 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.whisp.AppGraph
 import app.whisp.R
+import app.whisp.data.LibrarySort
 import app.whisp.data.ProgressEntity
 import app.whisp.data.WhispImage
 import app.whisp.data.WorkEntity
+import kotlinx.coroutines.launch
+
+private val librarySortOptions =
+    listOf(
+        LibrarySort.ADDED_DESC to "最近添加",
+        LibrarySort.ADDED_ASC to "最早添加",
+        LibrarySort.RECENT to "最近收听",
+        LibrarySort.TITLE_ASC to "作品名 A–Z",
+        LibrarySort.TITLE_DESC to "作品名 Z–A",
+        LibrarySort.OFFLINE_FIRST to "离线优先",
+    )
 
 @Composable
 internal fun LibraryPage(
     graph: AppGraph,
-    favoritesOnly: Boolean,
+    activeMiniWorkId: String? = null,
+    reselectTick: Int = 0,
     open: (String) -> Unit,
+    resumePlay: (String) -> Unit = open,
     sources: () -> Unit,
 ) {
     val works by graph.library.works.collectAsStateWithLifecycle()
     val progressList by graph.library.progress.collectAsStateWithLifecycle()
+    val trackSummaries by graph.library.trackSummaries.collectAsStateWithLifecycle()
+    val settings by graph.settings.settings.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf("全部") }
     var series by rememberSaveable { mutableStateOf<String?>(null) }
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
-    var reversed by rememberSaveable { mutableStateOf(false) }
+    var sortSheet by rememberSaveable { mutableStateOf(false) }
     var matchedIds by remember { mutableStateOf<Set<String>?>(null) }
     val grid = rememberLazyGridState()
     val searchFocus = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+    val haptics = rememberWhispHaptics()
+
+    // Intercept system back for in-page series drilldown and search bar expansion.
+    BackHandler(enabled = series != null) { series = null }
+    BackHandler(enabled = searching && series == null) {
+        searching = false
+        query = ""
+    }
+
+    LaunchedEffect(reselectTick) {
+        if (reselectTick > 0) {
+            series = null
+            grid.animateScrollToItem(0)
+        }
+    }
 
     LaunchedEffect(searching) {
         if (searching) {
@@ -67,15 +100,33 @@ internal fun LibraryPage(
         matchedIds = if (query.isBlank()) null else graph.library.searchWorkIds(query)
     }
 
+    val progressByWork = remember(progressList) { progressList.associateBy { it.workId } }
+    val tracksByWork = remember(trackSummaries) { trackSummaries.groupBy { it.workId } }
+
     val filtered =
-        remember(works, favoritesOnly, tab, series, matchedIds, reversed) {
-            works
-                .filter { work ->
-                    (!favoritesOnly && tab != "收藏" || work.favorite) &&
-                        (series == null || work.series == series) &&
-                        (matchedIds == null || work.id in matchedIds!!)
-                }
-                .let { if (reversed) it.reversed() else it }
+        remember(works, tab, series, matchedIds, settings.librarySort, progressByWork) {
+            val base = works.filter { work ->
+                (tab != "收藏" || work.favorite) &&
+                    (tab != "离线" || work.offlineAttachments) &&
+                    (series == null || work.series == series) &&
+                    (matchedIds == null || work.id in matchedIds!!)
+            }
+            when (settings.librarySort) {
+                LibrarySort.ADDED_ASC -> base.sortedBy { it.addedAt }
+                LibrarySort.RECENT ->
+                    base.sortedWith(
+                        compareByDescending<WorkEntity> { progressByWork[it.id]?.updatedAt ?: 0L }
+                            .thenByDescending { it.addedAt },
+                    )
+                LibrarySort.TITLE_ASC -> base.sortedBy { it.title.lowercase() }
+                LibrarySort.TITLE_DESC -> base.sortedByDescending { it.title.lowercase() }
+                LibrarySort.OFFLINE_FIRST ->
+                    base.sortedWith(
+                        compareByDescending<WorkEntity> { it.offlineAttachments }
+                            .thenByDescending { it.addedAt },
+                    )
+                else -> base
+            }
         }
     val seriesGroups =
         remember(works) {
@@ -86,14 +137,18 @@ internal fun LibraryPage(
                 .sortedBy { it.key }
                 .map { it.key to it.value }
         }
-    val progressByWork = remember(progressList) { progressList.associateBy { it.workId } }
+    // Avoid duplicating the exact same item already pinned in MiniPlayer when only 1 recent item
+    // exists.
     val latestResume =
-        remember(works, progressList, favoritesOnly, tab, series, query) {
-            if (favoritesOnly || tab != "全部" || series != null || query.isNotBlank()) null
+        remember(works, progressList, tab, series, query, activeMiniWorkId) {
+            if (tab != "全部" || series != null || query.isNotBlank()) null
             else {
-                val latest = progressList.firstOrNull() ?: return@remember null
-                val work = works.firstOrNull { it.id == latest.workId } ?: return@remember null
-                work to latest
+                val candidate =
+                    progressList.firstOrNull { it.workId != activeMiniWorkId }
+                        ?: progressList.firstOrNull()?.takeIf { activeMiniWorkId == null }
+                        ?: return@remember null
+                val work = works.firstOrNull { it.id == candidate.workId } ?: return@remember null
+                work to candidate
             }
         }
 
@@ -104,8 +159,7 @@ internal fun LibraryPage(
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
-                    if (favoritesOnly) stringResource(R.string.title_favorites)
-                    else series ?: stringResource(R.string.title_library),
+                    series ?: stringResource(R.string.title_library),
                     style = MaterialTheme.typography.headlineLarge,
                     color = Cream,
                     maxLines = 2,
@@ -116,6 +170,7 @@ internal fun LibraryPage(
                 Icons.Outlined.Search,
                 stringResource(R.string.action_search_works),
                 tint = if (searching || query.isNotBlank()) Rose else Cream,
+                haptic = HapticKind.Tick,
             ) {
                 searching = !searching
                 if (!searching) query = ""
@@ -123,9 +178,10 @@ internal fun LibraryPage(
             IconAction(
                 Icons.Outlined.SwapVert,
                 stringResource(R.string.action_toggle_order),
-                tint = if (reversed) Rose else Cream,
+                tint = if (settings.librarySort != LibrarySort.ADDED_DESC) Rose else Cream,
+                haptic = HapticKind.Tick,
             ) {
-                reversed = !reversed
+                sortSheet = true
             }
         }
         AnimatedVisibility(
@@ -142,31 +198,29 @@ internal fun LibraryPage(
                         .focusRequester(searchFocus),
             )
         }
-        if (!favoritesOnly) {
-            WhispTabBar(
-                options = listOf("全部" to "全部", "系列" to "系列", "收藏" to "收藏"),
-                selected = tab,
-                onSelect = { item ->
-                    tab = item
-                    series = null
-                },
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                trailing =
-                    if (series != null) {
-                        {
-                            IconAction(
-                                Icons.Outlined.Close,
-                                stringResource(R.string.action_exit_series),
-                                Muted,
-                            ) {
-                                series = null
-                            }
+        WhispTabBar(
+            options = listOf("全部" to "全部", "收藏" to "收藏", "系列" to "系列", "离线" to "离线"),
+            selected = tab,
+            onSelect = { item ->
+                haptics.tick()
+                tab = item
+                series = null
+            },
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+            trailing =
+                if (series != null) {
+                    {
+                        IconAction(
+                            Icons.Outlined.Close,
+                            stringResource(R.string.action_exit_series),
+                            Muted,
+                            haptic = HapticKind.Tick,
+                        ) {
+                            series = null
                         }
-                    } else null,
-            )
-        } else {
-            Spacer(Modifier.height(4.dp))
-        }
+                    }
+                } else null,
+        )
         when {
             works.isEmpty() ->
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -182,7 +236,7 @@ internal fun LibraryPage(
                         }
                     }
                 }
-            tab == "系列" && series == null && !favoritesOnly ->
+            tab == "系列" && series == null ->
                 if (seriesGroups.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         WhispEmptyState(
@@ -211,11 +265,17 @@ internal fun LibraryPage(
                                 title = "没有找到匹配的作品",
                                 subtitle = "尝试更换关键词、声优名或 RJ 编号",
                             )
-                        favoritesOnly || tab == "收藏" ->
+                        tab == "收藏" ->
                             WhispEmptyState(
                                 icon = Icons.Outlined.FavoriteBorder,
                                 title = "暂无收藏作品",
                                 subtitle = "在作品页或播放器点击爱心即可收藏",
+                            )
+                        tab == "离线" ->
+                            WhispEmptyState(
+                                icon = Icons.Outlined.DownloadDone,
+                                title = "暂无已离线作品",
+                                subtitle = "在作品详情页点击下载按钮即可离线保存",
                             )
                         else ->
                             WhispEmptyState(
@@ -234,8 +294,10 @@ internal fun LibraryPage(
                     state = grid,
                     tag = "library-grid",
                     progressOf = { work ->
-                        val p = progressByWork[work.id]
-                        if (p != null && p.positionMs > 0L) 1f else null
+                        workProgressFraction(
+                            tracksByWork[work.id].orEmpty(),
+                            progressByWork[work.id],
+                        )
                     },
                     offlineOf = { it.offlineAttachments },
                     header =
@@ -248,12 +310,56 @@ internal fun LibraryPage(
                                     ContinueListeningBanner(
                                         work = work,
                                         progress = progress,
-                                        onClick = { open(work.id) },
+                                        onOpenDetail = { open(work.id) },
+                                        onResumePlay = { resumePlay(work.id) },
                                     )
                                 }
                             }
                         },
                 )
+        }
+    }
+    if (sortSheet) {
+        WhispSheet(onDismissRequest = { sortSheet = false }) { dismiss ->
+            Text(
+                "排序方式",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+            )
+            Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
+                librarySortOptions.forEach { (key, label) ->
+                    val selected = settings.librarySort == key
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickable {
+                                haptics.tick()
+                                scope.launch {
+                                    graph.settings.update { it.copy(librarySort = key) }
+                                }
+                                dismiss()
+                            }
+                            .padding(horizontal = 24.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = if (selected) Rose else Cream,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (selected) {
+                            Icon(
+                                Icons.Outlined.Check,
+                                null,
+                                tint = Rose,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+            }
         }
     }
 }
@@ -262,16 +368,18 @@ internal fun LibraryPage(
 private fun ContinueListeningBanner(
     work: WorkEntity,
     progress: ProgressEntity,
-    onClick: () -> Unit,
+    onOpenDetail: () -> Unit,
+    onResumePlay: () -> Unit,
 ) {
     val shape = RoundedCornerShape(20.dp)
+    val haptics = rememberWhispHaptics()
     Row(
         Modifier.fillMaxWidth()
             .clip(shape)
             .background(MaterialTheme.colorScheme.surfaceContainerHigh)
             .border(0.5.dp, Rose.copy(alpha = 0.24f), shape)
-            .clickable(onClick = onClick)
-            .padding(12.dp),
+            .clickable(onClick = onOpenDetail)
+            .padding(start = 12.dp, top = 12.dp, bottom = 12.dp, end = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Artwork(
@@ -316,10 +424,13 @@ private fun ContinueListeningBanner(
             }
         }
         Box(
-            Modifier.size(38.dp).clip(CircleShape).background(Rose.copy(alpha = 0.16f)),
+            Modifier.size(44.dp).clip(CircleShape).background(Rose.copy(alpha = 0.18f)).clickable {
+                haptics.confirm()
+                onResumePlay()
+            },
             contentAlignment = Alignment.Center,
         ) {
-            Icon(Icons.Filled.PlayArrow, null, tint = Rose, modifier = Modifier.size(22.dp))
+            Icon(Icons.Filled.PlayArrow, "立即继续收听", tint = Rose, modifier = Modifier.size(24.dp))
         }
     }
 }

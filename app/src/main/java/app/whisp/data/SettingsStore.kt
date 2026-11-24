@@ -13,6 +13,19 @@ private val Context.preferences by preferencesDataStore("settings")
 
 private val settingsJson = Json { ignoreUnknownKeys = true }
 
+object LibrarySort {
+    const val ADDED_DESC = "added_desc"
+    const val ADDED_ASC = "added_asc"
+    const val RECENT = "recent"
+    const val TITLE_ASC = "title_asc"
+    const val TITLE_DESC = "title_desc"
+    const val OFFLINE_FIRST = "offline_first"
+
+    val supported = listOf(ADDED_DESC, ADDED_ASC, RECENT, TITLE_ASC, TITLE_DESC, OFFLINE_FIRST)
+}
+
+val SupportedSkipSeconds = listOf(5, 10, 15, 30)
+
 @Serializable
 data class Settings(
     val subtitleSize: Int = 21,
@@ -26,6 +39,8 @@ data class Settings(
     val playbackSpeed: Float = 1f,
     val legacyImagesMigrated: Boolean = false,
     val amoledBlack: Boolean = false,
+    val skipSeconds: Int = 10,
+    val librarySort: String = LibrarySort.ADDED_DESC,
 ) {
     fun normalized(): Settings =
         copy(
@@ -35,6 +50,9 @@ data class Settings(
             textEncoding =
                 textEncoding.takeIf { it in TextEncoding.supported } ?: TextEncoding.AUTO,
             playbackSpeed = playbackSpeed.coerceIn(0.5f, 2.0f),
+            skipSeconds = skipSeconds.takeIf { it in SupportedSkipSeconds } ?: 10,
+            librarySort =
+                librarySort.takeIf { it in LibrarySort.supported } ?: LibrarySort.ADDED_DESC,
         )
 }
 

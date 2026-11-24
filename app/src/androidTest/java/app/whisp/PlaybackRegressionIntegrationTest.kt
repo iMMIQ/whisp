@@ -207,7 +207,7 @@ class PlaybackRegressionIntegrationTest {
             main {
                 assertEquals(12000L, c.currentPosition)
                 assertFalse(c.playWhenReady)
-                assertEquals(Player.REPEAT_MODE_OFF, c.repeatMode)
+                assertEquals(Player.REPEAT_MODE_ONE, c.repeatMode)
             }
         } finally {
             main {

@@ -51,6 +51,7 @@ internal fun StoragePage(graph: AppGraph, back: () -> Unit) {
     var usage by remember { mutableStateOf<StorageUsage?>(null) }
     var clearing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val haptics = rememberWhispHaptics()
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(graph, lifecycleOwner) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -125,6 +126,8 @@ internal fun StoragePage(graph: AppGraph, back: () -> Unit) {
                                 try {
                                     graph.images.clearCaches(graph.media::clearStreamingCache)
                                     usage = graph.images.storageUsage()
+                                    haptics.confirm()
+                                    graph.messages.tryEmit("缓存已清理")
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {

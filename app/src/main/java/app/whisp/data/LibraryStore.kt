@@ -76,6 +76,9 @@ class LibraryStore(
     val progress: StateFlow<List<ProgressEntity>> =
         dao.observeProgress().stateIn(scope, SharingStarted.Eagerly, emptyList())
 
+    val trackSummaries: StateFlow<List<TrackSummary>> =
+        dao.observeTrackSummaries().stateIn(scope, SharingStarted.Eagerly, emptyList())
+
     val bookmarks: StateFlow<List<BookmarkEntity>> =
         dao.observeBookmarks().stateIn(scope, SharingStarted.Eagerly, emptyList())
 

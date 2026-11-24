@@ -9,12 +9,14 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.ViewList
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -160,20 +162,25 @@ internal fun AsmrOnePage(
     graph: AppGraph,
     sourceId: String,
     initialFacet: AsmrFacet? = null,
+    catalogScopeKey: String? = null,
     back: () -> Unit,
     open: (AsmrWork) -> Unit,
 ) {
-    val catalog = graph.asmrCatalog
+    val catalog = remember(graph, catalogScopeKey) { graph.asmrCatalogFor(catalogScopeKey) }
     val active by catalog.query.collectAsStateWithLifecycle()
     val state by catalog.state.collectAsStateWithLifecycle()
     val query = active?.takeIf { it.sourceId == sourceId } ?: AsmrQuery(sourceId)
-    var text by rememberSaveable(sourceId) { mutableStateOf(query.text) }
+    var text by rememberSaveable(sourceId, catalogScopeKey) { mutableStateOf(query.text) }
     var editing by remember { mutableStateOf(false) }
     var filters by remember { mutableStateOf(false) }
+    var listViewOverride by
+        rememberSaveable(sourceId, catalogScopeKey) { mutableStateOf<Boolean?>(null) }
+    val useListView = listViewOverride ?: query.searching
     val history by graph.settings.asmrSearchHistory.collectAsStateWithLifecycle()
     val facets by catalog.facets.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val focus = LocalFocusManager.current
+    val haptics = rememberWhispHaptics()
     val grid = rememberLazyGridState()
     val list = rememberLazyListState()
 
@@ -188,7 +195,8 @@ internal fun AsmrOnePage(
         }
     }
 
-    var displayedQuery by rememberSaveable(sourceId) { mutableStateOf(encodeAsmrQuery(query)) }
+    var displayedQuery by
+        rememberSaveable(sourceId, catalogScopeKey) { mutableStateOf(encodeAsmrQuery(query)) }
     LaunchedEffect(query) {
         val encoded = encodeAsmrQuery(query)
         if (displayedQuery != encoded) {
@@ -198,8 +206,8 @@ internal fun AsmrOnePage(
             list.scrollToItem(0)
         }
     }
-    LaunchedEffect(sourceId, initialFacet) {
-        if (initialFacet != null) {
+    LaunchedEffect(sourceId, initialFacet, catalog) {
+        if (initialFacet != null && catalog.query.value == null) {
             catalog.submit(AsmrQuery(sourceId, facets = listOf(initialFacet)))
         } else if (catalog.query.value?.sourceId != sourceId) {
             catalog.submit(AsmrQuery(sourceId))
@@ -208,9 +216,9 @@ internal fun AsmrOnePage(
 
     // Trigger next-page pagination when scrolling near the end of either list or grid.
     val nearEnd by
-        remember(query.searching) {
+        remember(useListView) {
             derivedStateOf {
-                if (query.searching) {
+                if (useListView) {
                     val info = list.layoutInfo
                     val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
                     info.totalItemsCount > 0 && last >= info.totalItemsCount - 4
@@ -225,6 +233,16 @@ internal fun AsmrOnePage(
         if (nearEnd && state.items.isNotEmpty() && state.hasMore) catalog.loadNextPage()
     }
 
+    val suggestedHistory =
+        if (editing)
+            history.filter { text.isBlank() || it.contains(text, ignoreCase = true) }.take(4)
+        else emptyList()
+    val suggestedFacets =
+        if (editing && text.isNotBlank())
+            facets.filter { it.name.contains(text, true) && it !in query.facets }.take(4)
+        else emptyList()
+    val showSuggestions = editing && (suggestedHistory.isNotEmpty() || suggestedFacets.isNotEmpty())
+
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
         Row(
             Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
@@ -232,20 +250,36 @@ internal fun AsmrOnePage(
         ) {
             IconAction(Icons.AutoMirrored.Outlined.ArrowBack, "返回来源", action = back)
             Text(
-                "ASMR.ONE",
+                initialFacet?.name ?: "ASMR.ONE",
                 Modifier.weight(1f).padding(start = 4.dp),
                 style = MaterialTheme.typography.headlineLarge,
                 color = Cream,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
+            IconAction(
+                if (useListView) Icons.Outlined.GridView else Icons.AutoMirrored.Outlined.ViewList,
+                if (useListView) "切换为网格视图" else "切换为列表视图",
+                Muted,
+                haptic = HapticKind.Tick,
+            ) {
+                listViewOverride = !useListView
+            }
             IconAction(
                 Icons.Outlined.Tune,
                 "筛选作品",
                 if (query.facets.isNotEmpty() || query.subtitlesOnly) Rose else Muted,
+                haptic = HapticKind.Tick,
             ) {
                 focus.clearFocus()
                 filters = true
             }
-            IconAction(Icons.Outlined.Refresh, "刷新在线作品", Muted) {
+            IconAction(
+                Icons.Outlined.Refresh,
+                "刷新在线作品",
+                Muted,
+                haptic = HapticKind.Tick,
+            ) {
                 catalog.refresh(clearItems = false)
             }
         }
@@ -265,280 +299,314 @@ internal fun AsmrOnePage(
             },
             onSubmit = { submit(query.copy(text = text.trim())) },
         )
-        AnimatedVisibility(
-            visible = query.facets.isNotEmpty() || query.subtitlesOnly,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
-        ) {
-            LazyRow(
-                Modifier.fillMaxWidth().padding(top = 6.dp),
-                contentPadding = PaddingValues(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(query.facets, key = { "${it.kind}|${it.name}" }) { facet ->
-                    InputChip(
-                        selected = true,
-                        onClick = {
-                            submit(query.copy(text = text.trim(), facets = query.facets - facet))
-                        },
-                        label = { Text(facet.name) },
-                        trailingIcon = {
-                            Icon(Icons.Outlined.Close, "移除${facet.name}", Modifier.size(16.dp))
-                        },
-                    )
-                }
-                if (query.subtitlesOnly) {
-                    item {
-                        InputChip(
-                            selected = true,
-                            onClick = {
-                                submit(query.copy(text = text.trim(), subtitlesOnly = false))
-                            },
-                            label = { Text("有字幕") },
-                            trailingIcon = {
-                                Icon(Icons.Outlined.Close, "移除字幕筛选", Modifier.size(16.dp))
-                            },
-                        )
-                    }
-                }
-            }
-        }
-        val suggestedHistory =
-            if (editing)
-                history.filter { text.isBlank() || it.contains(text, ignoreCase = true) }.take(4)
-            else emptyList()
-        val suggestedFacets =
-            if (editing && text.isNotBlank())
-                facets.filter { it.name.contains(text, true) && it !in query.facets }.take(4)
-            else emptyList()
-        AnimatedVisibility(
-            visible = editing && (suggestedHistory.isNotEmpty() || suggestedFacets.isNotEmpty()),
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
-        ) {
-            val cardShape = RoundedCornerShape(16.dp)
-            Column(
-                Modifier.fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 6.dp)
-                    .clip(cardShape)
-                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                    .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, cardShape)
-                    .padding(vertical = 4.dp),
-            ) {
-                suggestedHistory.forEach { value ->
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .clickable { submit(query.copy(text = value)) }
-                            .padding(horizontal = 16.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            Column(Modifier.fillMaxSize()) {
+                AnimatedVisibility(
+                    visible = query.facets.isNotEmpty() || query.subtitlesOnly,
+                    enter = fadeIn() + expandVertically(),
+                    exit = fadeOut() + shrinkVertically(),
+                ) {
+                    LazyRow(
+                        Modifier.fillMaxWidth().padding(top = 6.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Icon(Icons.Outlined.History, null, Modifier.size(18.dp), tint = Muted)
-                        Text(
-                            value,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Cream,
-                            modifier = Modifier.weight(1f).padding(start = 12.dp),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-                suggestedFacets.forEach { facet ->
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .clickable {
-                                submit(
-                                    query.copy(
-                                        text = "",
-                                        facets = (query.facets + facet).distinct(),
-                                    ),
+                        items(query.facets, key = { "${it.kind}|${it.name}" }) { facet ->
+                            InputChip(
+                                selected = true,
+                                onClick = {
+                                    haptics.tick()
+                                    submit(
+                                        query.copy(
+                                            text = text.trim(),
+                                            facets = query.facets - facet,
+                                        ),
+                                    )
+                                },
+                                label = { Text(facet.name) },
+                                trailingIcon = {
+                                    Icon(
+                                        Icons.Outlined.Close,
+                                        "移除${facet.name}",
+                                        Modifier.size(16.dp),
+                                    )
+                                },
+                            )
+                        }
+                        if (query.subtitlesOnly) {
+                            item {
+                                InputChip(
+                                    selected = true,
+                                    onClick = {
+                                        haptics.tick()
+                                        submit(
+                                            query.copy(text = text.trim(), subtitlesOnly = false),
+                                        )
+                                    },
+                                    label = { Text("有字幕") },
+                                    trailingIcon = {
+                                        Icon(
+                                            Icons.Outlined.Close,
+                                            "移除字幕筛选",
+                                            Modifier.size(16.dp),
+                                        )
+                                    },
                                 )
                             }
-                            .padding(horizontal = 16.dp, vertical = 11.dp),
+                        }
+                    }
+                }
+                WhispTabBar(
+                    options = listOf("create_date" to "最新", "dl_count" to "热门"),
+                    selected = query.order,
+                    onSelect = { order ->
+                        haptics.tick()
+                        submit(query.copy(text = text.trim(), order = order))
+                    },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                )
+                if (state.refreshError != null && state.items.isNotEmpty()) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(
+                                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f),
+                            )
+                            .padding(horizontal = 14.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Icon(Icons.Outlined.FilterList, null, Modifier.size(18.dp), tint = Rose)
                         Text(
-                            "${facet.label} · ${facet.name}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Rose,
-                            modifier = Modifier.weight(1f).padding(start = 12.dp),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                            "刷新失败",
+                            Modifier.weight(1f),
+                            color = MaterialTheme.colorScheme.error,
+                            fontSize = 14.sp,
+                        )
+                        TextButton(onClick = { catalog.refresh(clearItems = false) }) { Text("重试") }
+                    }
+                }
+                PullToRefreshBox(
+                    isRefreshing = state.refreshing && state.items.isNotEmpty(),
+                    onRefresh = { catalog.refresh(clearItems = false) },
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                ) {
+                    if (useListView) {
+                        LazyColumn(
+                            Modifier.fillMaxSize().testTag("asmr-results"),
+                            state = list,
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            items(state.items, key = { it.workId }) { work ->
+                                val image =
+                                    remember(work.coverId, work.coverUrl, sourceId) {
+                                        val id = work.coverId ?: return@remember null
+                                        val url = work.coverUrl ?: return@remember null
+                                        WhispImage.Catalog(id, url, sourceId)
+                                    }
+                                val rowShape = RoundedCornerShape(16.dp)
+                                Row(
+                                    Modifier.fillMaxWidth()
+                                        .clip(rowShape)
+                                        .background(MaterialTheme.colorScheme.surface)
+                                        .border(
+                                            0.5.dp,
+                                            MaterialTheme.colorScheme.outlineVariant,
+                                            rowShape,
+                                        )
+                                        .clickable { open(work) }
+                                        .padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Artwork(
+                                        image = image,
+                                        description = work.title,
+                                        modifier =
+                                            Modifier.size(width = 116.dp, height = 87.dp)
+                                                .clip(RoundedCornerShape(11.dp)),
+                                    )
+                                    Column(Modifier.weight(1f).padding(start = 14.dp, end = 4.dp)) {
+                                        Text(
+                                            work.title,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            color = Cream,
+                                            fontSize = 15.sp,
+                                            lineHeight = 21.sp,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        if (work.artist.isNotBlank()) {
+                                            Text(
+                                                work.artist,
+                                                Modifier.padding(top = 6.dp),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Muted,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                        if (work.rj.isNotBlank()) {
+                                            Text(
+                                                work.rj,
+                                                style =
+                                                    MaterialTheme.typography.labelSmall.merge(
+                                                        TabularNumeralStyle,
+                                                    ),
+                                                color = Muted.copy(alpha = 0.75f),
+                                                modifier = Modifier.padding(top = 4.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            item {
+                                CatalogAppend(state.appending, state.appendError) {
+                                    catalog.retryAppend()
+                                }
+                            }
+                        }
+                    } else {
+                        WorkGrid(
+                            items = state.items,
+                            key = { it.workId },
+                            workOf = { it.entity(sourceId) },
+                            imageOf = { work ->
+                                val id = work.coverId
+                                val url = work.coverUrl
+                                if (id != null && url != null) WhispImage.Catalog(id, url, sourceId)
+                                else null
+                            },
+                            onClick = open,
+                            state = grid,
+                            tag = "asmr-grid",
+                            footer = {
+                                item(span = { GridItemSpan(maxLineSpan) }) {
+                                    CatalogAppend(state.appending, state.appendError) {
+                                        catalog.retryAppend()
+                                    }
+                                }
+                            },
                         )
                     }
-                }
-                if (suggestedHistory.isNotEmpty()) {
-                    TextButton(
-                        onClick = { scope.launch { graph.settings.clearAsmrSearchHistory() } },
-                        Modifier.align(Alignment.End).padding(end = 8.dp),
-                    ) {
-                        Text("清除记录", fontSize = 13.sp)
+                    if (state.items.isEmpty()) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            when {
+                                state.refreshing -> CircularProgressIndicator(color = Rose)
+                                state.refreshError != null ->
+                                    WhispEmptyState(
+                                        icon = Icons.Outlined.CloudOff,
+                                        title = "无法加载目录",
+                                        subtitle = state.refreshError,
+                                    ) {
+                                        FilledTonalButton(
+                                            onClick = { catalog.refresh(clearItems = true) },
+                                        ) {
+                                            Text("重试")
+                                        }
+                                    }
+                                else ->
+                                    WhispEmptyState(
+                                        icon =
+                                            if (query.searching) Icons.Outlined.Search
+                                            else Icons.Outlined.Headphones,
+                                        title = if (query.searching) "没有匹配的作品" else "暂无作品",
+                                    )
+                            }
+                        }
                     }
                 }
             }
-        }
-        WhispTabBar(
-            options = listOf("create_date" to "最新", "dl_count" to "热门"),
-            selected = query.order,
-            onSelect = { order -> submit(query.copy(text = text.trim(), order = order)) },
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-        )
-        if (state.refreshError != null && state.items.isNotEmpty()) {
-            Row(
-                Modifier.fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f))
-                    .padding(horizontal = 14.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            // Float suggestions as an overlay so focusing the search bar never causes layout shift.
+            androidx.compose.animation.AnimatedVisibility(
+                visible = showSuggestions,
+                enter = fadeIn(),
+                exit = fadeOut(),
             ) {
-                Text(
-                    "刷新失败",
-                    Modifier.weight(1f),
-                    color = MaterialTheme.colorScheme.error,
-                    fontSize = 14.sp,
-                )
-                TextButton(onClick = { catalog.refresh(clearItems = false) }) { Text("重试") }
-            }
-        }
-        PullToRefreshBox(
-            isRefreshing = state.refreshing && state.items.isNotEmpty(),
-            onRefresh = { catalog.refresh(clearItems = false) },
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-        ) {
-            if (query.searching) {
-                LazyColumn(
-                    Modifier.fillMaxSize().testTag("asmr-results"),
-                    state = list,
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                Box(
+                    Modifier.fillMaxSize().background(ScrimDark.copy(alpha = 0.42f)).clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) {
+                        focus.clearFocus()
+                        editing = false
+                    },
                 ) {
-                    items(state.items, key = { it.workId }) { work ->
-                        val image =
-                            remember(work.coverId, work.coverUrl, sourceId) {
-                                val id = work.coverId ?: return@remember null
-                                val url = work.coverUrl ?: return@remember null
-                                WhispImage.Catalog(id, url, sourceId)
-                            }
-                        val rowShape = RoundedCornerShape(16.dp)
-                        Row(
-                            Modifier.fillMaxWidth()
-                                .clip(rowShape)
-                                .background(MaterialTheme.colorScheme.surface)
-                                .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, rowShape)
-                                .clickable { open(work) }
-                                .padding(10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Artwork(
-                                image = image,
-                                description = work.title,
-                                modifier =
-                                    Modifier.size(width = 116.dp, height = 87.dp)
-                                        .clip(RoundedCornerShape(11.dp)),
-                            )
-                            Column(Modifier.weight(1f).padding(start = 14.dp, end = 4.dp)) {
+                    val cardShape = RoundedCornerShape(16.dp)
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp)
+                            .clip(cardShape)
+                            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, cardShape)
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                            ) {}
+                            .padding(vertical = 4.dp),
+                    ) {
+                        suggestedHistory.forEach { value ->
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .clickable { submit(query.copy(text = value)) }
+                                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    Icons.Outlined.History,
+                                    null,
+                                    Modifier.size(18.dp),
+                                    tint = Muted,
+                                )
                                 Text(
-                                    work.title,
-                                    style = MaterialTheme.typography.titleSmall,
+                                    value,
+                                    style = MaterialTheme.typography.bodyMedium,
                                     color = Cream,
-                                    fontSize = 15.sp,
-                                    lineHeight = 21.sp,
-                                    maxLines = 2,
+                                    modifier = Modifier.weight(1f).padding(start = 12.dp),
+                                    maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
-                                val voice = work.facets.firstOrNull { it.kind == "va" }
-                                if (work.artist.isNotBlank()) {
-                                    Text(
-                                        work.artist,
-                                        Modifier.padding(top = 6.dp)
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .then(
-                                                if (voice != null)
-                                                    Modifier.clickable {
-                                                        submit(
-                                                            query.copy(
-                                                                text = "",
-                                                                facets =
-                                                                    (query.facets + voice)
-                                                                        .distinct(),
-                                                            ),
-                                                        )
-                                                    }
-                                                else Modifier,
-                                            ),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color =
-                                            if (voice != null) Rose.copy(alpha = 0.9f) else Muted,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                                if (work.rj.isNotBlank()) {
-                                    Text(
-                                        work.rj,
-                                        style =
-                                            MaterialTheme.typography.labelSmall.merge(
-                                                TabularNumeralStyle,
-                                            ),
-                                        color = Muted.copy(alpha = 0.75f),
-                                        modifier = Modifier.padding(top = 4.dp),
-                                    )
-                                }
                             }
                         }
-                    }
-                    item {
-                        CatalogAppend(state.appending, state.appendError) { catalog.retryAppend() }
-                    }
-                }
-            } else {
-                WorkGrid(
-                    items = state.items,
-                    key = { it.workId },
-                    workOf = { it.entity(sourceId) },
-                    imageOf = { work ->
-                        val id = work.coverId
-                        val url = work.coverUrl
-                        if (id != null && url != null) WhispImage.Catalog(id, url, sourceId)
-                        else null
-                    },
-                    onClick = open,
-                    state = grid,
-                    tag = "asmr-grid",
-                    footer = {
-                        item(span = { GridItemSpan(maxLineSpan) }) {
-                            CatalogAppend(state.appending, state.appendError) {
-                                catalog.retryAppend()
-                            }
-                        }
-                    },
-                )
-            }
-            if (state.items.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    when {
-                        state.refreshing -> CircularProgressIndicator(color = Rose)
-                        state.refreshError != null ->
-                            WhispEmptyState(
-                                icon = Icons.Outlined.CloudOff,
-                                title = "无法加载目录",
-                                subtitle = state.refreshError,
+                        suggestedFacets.forEach { facet ->
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .clickable {
+                                        submit(
+                                            query.copy(
+                                                text = "",
+                                                facets = (query.facets + facet).distinct(),
+                                            ),
+                                        )
+                                    }
+                                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                FilledTonalButton(
-                                    onClick = { catalog.refresh(clearItems = true) },
-                                ) {
-                                    Text("重试")
-                                }
+                                Icon(
+                                    Icons.Outlined.FilterList,
+                                    null,
+                                    Modifier.size(18.dp),
+                                    tint = Rose,
+                                )
+                                Text(
+                                    "${facet.label} · ${facet.name}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Rose,
+                                    modifier = Modifier.weight(1f).padding(start = 12.dp),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
                             }
-                        else ->
-                            WhispEmptyState(
-                                icon =
-                                    if (query.searching) Icons.Outlined.Search
-                                    else Icons.Outlined.Headphones,
-                                title = if (query.searching) "没有匹配的作品" else "暂无作品",
-                            )
+                        }
+                        if (suggestedHistory.isNotEmpty()) {
+                            TextButton(
+                                onClick = {
+                                    scope.launch { graph.settings.clearAsmrSearchHistory() }
+                                },
+                                Modifier.align(Alignment.End).padding(end = 8.dp),
+                            ) {
+                                Text("清除记录", fontSize = 13.sp)
+                            }
+                        }
                     }
                 }
             }
@@ -575,7 +643,10 @@ private fun AsmrFilters(
     var name by rememberSaveable { mutableStateOf("") }
     WhispSheet(close) { dismiss ->
         Column(
-            Modifier.fillMaxWidth().padding(horizontal = 24.dp).navigationBarsPadding(),
+            Modifier.fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .navigationBarsPadding()
+                .imePadding(),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text("筛选", style = MaterialTheme.typography.headlineSmall, color = Cream)
@@ -608,6 +679,7 @@ private fun AsmrFilters(
                         "添加筛选",
                         Rose,
                         enabled = name.isNotBlank() && '$' !in name,
+                        haptic = HapticKind.Tick,
                     ) {
                         selected = (selected + AsmrFacet(kind, name.trim())).distinct()
                         name = ""
@@ -666,15 +738,11 @@ private fun AsmrFilters(
                     }
                 }
             }
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "有字幕",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Cream,
-                    modifier = Modifier.weight(1f),
-                )
-                Switch(subtitles, { subtitles = it })
-            }
+            WhispToggleRow(
+                label = "有字幕",
+                checked = subtitles,
+                onCheckedChange = { subtitles = it },
+            )
             Row(
                 Modifier.fillMaxWidth().padding(bottom = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),

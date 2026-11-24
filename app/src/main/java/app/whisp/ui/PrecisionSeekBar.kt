@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -22,14 +26,19 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 
 /**
- * Pure fine-scrubbing gesture state: pulling vertically away from the bar zooms to a 60s window.
+ * Pure fine-scrubbing gesture state: pulling vertically away from the bar zooms to a fine window.
+ * Supplying [initialPositionMs] preserves the current position when grabbing near the thumb.
  */
 class PrecisionScrubber(
     private val durationMs: Long,
@@ -38,9 +47,11 @@ class PrecisionScrubber(
     private val startY: Float,
     private val fineThresholdPx: Float,
     private val fineWindowMs: Long = 60_000L,
+    initialPositionMs: Long? = null,
 ) {
     var positionMs: Long =
-        ((startX / widthPx.coerceAtLeast(1f)) * durationMs).toLong().coerceIn(0L, durationMs)
+        (initialPositionMs ?: ((startX / widthPx.coerceAtLeast(1f)) * durationMs).toLong())
+            .coerceIn(0L, durationMs)
         private set
 
     var fine: Boolean = false
@@ -89,61 +100,128 @@ internal fun PrecisionSeekBar(
     onSeek: (Long) -> Unit,
     bufferedProvider: () -> Long = { 0L },
     onFineBounds: ((LongRange?) -> Unit)? = null,
+    previewCaptionProvider: ((Long) -> String?)? = null,
+    onScrubbingChange: ((Boolean) -> Unit)? = null,
 ) {
     var drag by remember { mutableStateOf<PrecisionScrubber?>(null) }
     var preview by remember { mutableStateOf<Long?>(null) }
     var fine by remember { mutableStateOf(false) }
+    var showFineHint by remember { mutableStateOf(false) }
     var barWidthPx by remember { mutableIntStateOf(0) }
     var pillWidthPx by remember { mutableIntStateOf(0) }
+    var pillHeightPx by remember { mutableIntStateOf(0) }
     val seek by rememberUpdatedState(onSeek)
     val update by rememberUpdatedState(onPreview)
     val updateBounds by rememberUpdatedState(onFineBounds)
+    val scrubbingChange by rememberUpdatedState(onScrubbingChange)
+    val positionLookup by rememberUpdatedState(positionProvider)
     val haptics = rememberWhispHaptics()
     val density = LocalDensity.current
+    val reduced = LocalReducedMotion.current
     val trackBg = MaterialTheme.colorScheme.surfaceContainerHighest
+
+    val isDragging = preview != null
+    LaunchedEffect(isDragging, fine) {
+        if (isDragging && !fine) {
+            delay(450L)
+            showFineHint = true
+        } else {
+            showFineHint = false
+        }
+    }
+
+    val motionSpec =
+        if (reduced) snap<Float>()
+        else
+            spring(
+                dampingRatio = Spring.DampingRatioNoBouncy,
+                stiffness = Spring.StiffnessMedium,
+            )
+    val trackStrokeDp by
+        animateFloatAsState(if (isDragging) 6f else 4f, motionSpec, label = "seek-stroke")
+    val thumbRadiusDp by
+        animateFloatAsState(if (isDragging) 8.5f else 5.5f, motionSpec, label = "seek-thumb")
+    val haloRadiusDp by
+        animateFloatAsState(if (isDragging) 16f else 0f, motionSpec, label = "seek-halo")
 
     fun clear() {
         drag = null
         preview = null
         fine = false
+        showFineHint = false
         update(null)
         updateBounds?.invoke(null)
+        scrubbingChange?.invoke(false)
     }
 
-    Box(
-        Modifier.fillMaxWidth().height(58.dp).onSizeChanged { barWidthPx = it.width },
-    ) {
-        if (preview != null) {
+    Box(Modifier.fillMaxWidth().height(46.dp).onSizeChanged { barWidthPx = it.width }) {
+        val currentPreview = preview
+        if (currentPreview != null) {
             val start = if (fine) drag?.rangeStart ?: 0L else 0L
             val end = if (fine) drag?.rangeEnd ?: duration else duration
             val span = (end - start).coerceAtLeast(1L)
             val padPx = with(density) { 8.dp.toPx() }
             val usableWidth = (barWidthPx - padPx * 2f).coerceAtLeast(1f)
-            val fraction = ((preview!! - start).toFloat() / span).coerceIn(0f, 1f)
+            val fraction = ((currentPreview - start).toFloat() / span).coerceIn(0f, 1f)
             val centerX = padPx + fraction * usableWidth
             val maxLeft = (barWidthPx - pillWidthPx).coerceAtLeast(0)
             val pillLeft = (centerX - pillWidthPx / 2f).roundToInt().coerceIn(0, maxLeft)
-            Box(
-                Modifier.align(Alignment.TopStart)
-                    .offset { IntOffset(pillLeft, 0) }
-                    .onSizeChanged { pillWidthPx = it.width }
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                    .border(
-                        0.5.dp,
-                        if (fine) Rose.copy(alpha = 0.55f)
-                        else MaterialTheme.colorScheme.outlineVariant,
-                        RoundedCornerShape(999.dp),
-                    )
-                    .padding(horizontal = 10.dp, vertical = 3.dp),
+            // Float cleanly above the thumb so fingers never occlude the timestamp or cue preview.
+            val aboveOffsetY = -(pillHeightPx + with(density) { 26.dp.toPx() }.roundToInt())
+            val caption = previewCaptionProvider?.invoke(currentPreview)?.takeIf { it.isNotBlank() }
+            Popup(
+                alignment = Alignment.TopStart,
+                offset = IntOffset(pillLeft, aboveOffsetY),
+                properties = PopupProperties(focusable = false, clippingEnabled = false),
             ) {
-                Text(
-                    if (fine) "${clock(preview!!)} · 精细" else clock(preview!!),
-                    color = Rose,
-                    style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 12.sp,
-                )
+                Column(
+                    Modifier.onSizeChanged {
+                            pillWidthPx = it.width
+                            pillHeightPx = it.height
+                        }
+                        .widthIn(max = 260.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                        .border(
+                            0.5.dp,
+                            if (fine) Rose.copy(alpha = 0.6f)
+                            else MaterialTheme.colorScheme.outlineVariant,
+                            RoundedCornerShape(14.dp),
+                        )
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    if (caption != null) {
+                        Text(
+                            caption,
+                            color = Cream,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(bottom = 2.dp),
+                        )
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            if (fine) "${clock(currentPreview)} · 精细" else clock(currentPreview),
+                            color = Rose,
+                            style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp,
+                        )
+                        if (showFineHint && !fine) {
+                            Text(
+                                "上下拉微调",
+                                color = Muted.copy(alpha = 0.85f),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontSize = 11.sp,
+                            )
+                        }
+                    }
+                }
             }
         }
         Canvas(
@@ -165,59 +243,66 @@ internal fun PrecisionSeekBar(
                     }
                 }
                 .pointerInput(duration, enabled) {
-                    if (enabled) {
-                        detectTapGestures(
-                            onTap = { point ->
-                                val pad = 8.dp.toPx()
-                                val usable = (size.width - pad * 2f).coerceAtLeast(1f)
-                                val frac = ((point.x - pad) / usable).coerceIn(0f, 1f)
-                                seek((duration * frac).toLong().coerceIn(0, duration))
-                            },
-                        )
-                    }
-                }
-                .pointerInput(duration, enabled) {
-                    if (enabled) {
-                        detectDragGestures(
-                            onDragStart = { point ->
-                                val pad = 8.dp.toPx()
-                                val usable = (size.width - pad * 2f).coerceAtLeast(1f)
-                                drag =
-                                    PrecisionScrubber(
-                                        duration,
-                                        usable,
-                                        (point.x - pad).coerceIn(0f, usable),
-                                        point.y,
-                                        36.dp.toPx(),
-                                    )
-                                preview = drag!!.positionMs
-                                update(preview)
-                                updateBounds?.invoke(null)
-                            },
-                            onDragCancel = { clear() },
-                            onDragEnd = {
-                                preview?.let(seek)
-                                clear()
-                            },
-                            onDrag = { change, _ ->
+                    if (!enabled) return@pointerInput
+                    val pad = 8.dp.toPx()
+                    val fineThreshold = 36.dp.toPx()
+                    val thumbGrabTolerance = 26.dp.toPx()
+                    val adaptiveFineWindow = if (duration in 1L..300_000L) 30_000L else 60_000L
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val usable = (size.width - pad * 2f).coerceAtLeast(1f)
+                        val downX = (down.position.x - pad).coerceIn(0f, usable)
+                        val currentPos = positionLookup().coerceIn(0L, duration)
+                        val thumbX =
+                            if (duration > 0L) (currentPos.toFloat() / duration) * usable else 0f
+                        val grabNearThumb = abs(downX - thumbX) <= thumbGrabTolerance
+                        val session =
+                            PrecisionScrubber(
+                                durationMs = duration,
+                                widthPx = usable,
+                                startX = downX,
+                                startY = down.position.y,
+                                fineThresholdPx = fineThreshold,
+                                fineWindowMs = adaptiveFineWindow,
+                                initialPositionMs = if (grabNearThumb) currentPos else null,
+                            )
+                        drag = session
+                        preview = session.positionMs
+                        fine = false
+                        haptics.tick()
+                        scrubbingChange?.invoke(true)
+                        update(preview)
+                        updateBounds?.invoke(null)
+                        down.consume()
+
+                        var committed = true
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change =
+                                event.changes.firstOrNull { it.id == down.id }
+                                    ?: event.changes.firstOrNull()
+                                    ?: break
+                            if (!change.pressed) {
+                                if (change.isConsumed) committed = false
                                 change.consume()
-                                drag?.let { session ->
-                                    val pad = 8.dp.toPx()
-                                    val wasFine = session.fine
-                                    preview =
-                                        session.move(change.position.x - pad, change.position.y)
-                                    fine = session.fine
-                                    if (fine != wasFine) {
-                                        haptics.tick()
-                                        updateBounds?.invoke(
-                                            if (fine) session.rangeStart..session.rangeEnd
-                                            else null,
-                                        )
-                                    }
-                                    update(preview)
-                                }
-                            },
-                        )
+                                break
+                            }
+                            change.consume()
+                            val wasFine = session.fine
+                            val next = session.move(change.position.x - pad, change.position.y)
+                            preview = next
+                            fine = session.fine
+                            if (fine != wasFine) {
+                                haptics.tick()
+                                updateBounds?.invoke(
+                                    if (fine) session.rangeStart..session.rangeEnd else null,
+                                )
+                            }
+                            update(next)
+                        }
+                        val finalPos = preview
+                        clear()
+                        if (committed && finalPos != null) seek(finalPos)
                     }
                 },
         ) {
@@ -228,9 +313,8 @@ internal fun PrecisionSeekBar(
             val span = (end - start).coerceAtLeast(1L)
             fun x(time: Long) =
                 pad + ((time - start).toFloat() / span).coerceIn(0f, 1f) * usableWidth
-            val y = 40.dp.toPx()
-            val isDragging = preview != null
-            val trackStroke = if (isDragging) 5.5.dp.toPx() else 4.dp.toPx()
+            val y = size.height * 0.54f
+            val trackStroke = trackStrokeDp.dp.toPx()
             val tint = if (enabled) Rose else Muted.copy(alpha = .35f)
 
             // Base track
@@ -301,14 +385,10 @@ internal fun PrecisionSeekBar(
             val value = preview ?: positionProvider()
             val thumbX = x(value)
             drawLine(tint, Offset(pad, y), Offset(thumbX, y), trackStroke, StrokeCap.Round)
-            if (isDragging) {
-                drawCircle(Rose.copy(alpha = 0.22f), 14.dp.toPx(), Offset(thumbX, y))
+            if (haloRadiusDp > 0.5f) {
+                drawCircle(Rose.copy(alpha = 0.22f), haloRadiusDp.dp.toPx(), Offset(thumbX, y))
             }
-            drawCircle(
-                tint,
-                if (isDragging) 7.5.dp.toPx() else 5.5.dp.toPx(),
-                Offset(thumbX, y),
-            )
+            drawCircle(tint, thumbRadiusDp.dp.toPx(), Offset(thumbX, y))
         }
     }
 }

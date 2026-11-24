@@ -6,7 +6,6 @@ import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -21,14 +20,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.whisp.AppGraph
 import app.whisp.DlsiteLoginActivity
-import app.whisp.data.DlsiteNoPlayableAudioException
-import app.whisp.data.DlsiteOwnedWork
 import app.whisp.data.WhispImage
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -39,7 +34,7 @@ internal fun DlsiteLibraryPage(
     graph: AppGraph,
     sourceId: String,
     back: () -> Unit,
-    open: (String) -> Unit,
+    openOwned: (String) -> Unit,
 ) {
     val flow = remember(sourceId) { graph.library.dlsitePurchases(sourceId) }
     val works by flow.collectAsStateWithLifecycle(emptyList())
@@ -50,8 +45,7 @@ internal fun DlsiteLibraryPage(
     var query by rememberSaveable(sourceId) { mutableStateOf("") }
     var sortByTitle by rememberSaveable(sourceId) { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
-    var opening by remember { mutableStateOf<String?>(null) }
-    var officialPlayer by remember { mutableStateOf<DlsiteOwnedWork?>(null) }
+    var confirmingLogout by rememberSaveable(sourceId) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val login =
         rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result
@@ -137,8 +131,7 @@ internal fun DlsiteLibraryPage(
                         text = { Text("退出账号", color = MaterialTheme.colorScheme.error) },
                         onClick = {
                             menu = false
-                            scope.launch { graph.sync.removeSource(sourceId) }
-                            back()
+                            confirmingLogout = true
                         },
                     )
                 }
@@ -204,48 +197,8 @@ internal fun DlsiteLibraryPage(
                         WhispImage.Catalog(coverId, coverUrl, sourceId)
                     else null
                 },
-                onClick = { work ->
-                    if (opening == null) {
-                        opening = work.workno
-                        scope.launch {
-                            try {
-                                open(graph.sync.importDlsiteWork(sourceId, work.workno).work.id)
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (_: DlsiteNoPlayableAudioException) {
-                                officialPlayer = work
-                            } catch (e: Exception) {
-                                graph.messages.tryEmit(e.message ?: "作品读取失败")
-                            } finally {
-                                opening = null
-                            }
-                        }
-                    }
-                },
+                onClick = { work -> openOwned(work.workno) },
             )
-            if (opening != null) {
-                Box(
-                    Modifier.fillMaxSize().background(ScrimDark.copy(alpha = 0.55f)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    val cardShape = RoundedCornerShape(18.dp)
-                    Row(
-                        Modifier.clip(cardShape)
-                            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, cardShape)
-                            .padding(horizontal = 22.dp, vertical = 16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(14.dp),
-                    ) {
-                        CircularProgressIndicator(
-                            Modifier.size(22.dp),
-                            color = Rose,
-                            strokeWidth = 2.dp,
-                        )
-                        Text("正在读取曲目目录", style = MaterialTheme.typography.bodyMedium, color = Cream)
-                    }
-                }
-            }
             if (visible.isEmpty() && !synchronizing) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     WhispEmptyState(
@@ -258,30 +211,17 @@ internal fun DlsiteLibraryPage(
             }
         }
     }
-    officialPlayer?.let { work ->
-        AlertDialog(
-            onDismissRequest = { officialPlayer = null },
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = { Text("使用官方播放器") },
-            text = { Text("该作品可在 DLsite Play 中播放。", color = Muted) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        officialPlayer = null
-                        if (graph.playback.state.value.playWhenReady) graph.playback.togglePlay()
-                        graph.context.startActivity(
-                            Intent(
-                                    Intent.ACTION_VIEW,
-                                    "https://play.dlsite.com/work/${work.workno}".toUri(),
-                                )
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                        )
-                    },
-                ) {
-                    Text("打开 DLsite Play")
-                }
+    if (confirmingLogout) {
+        WhispConfirmDialog(
+            title = "退出 DLsite 账号",
+            message = "退出账号并清理已购作品索引？已离线保存的本地副本会保留。",
+            confirmLabel = "确认退出",
+            onConfirm = {
+                confirmingLogout = false
+                scope.launch { graph.sync.removeSource(sourceId) }
+                back()
             },
-            dismissButton = { TextButton(onClick = { officialPlayer = null }) { Text("返回") } },
+            onDismiss = { confirmingLogout = false },
         )
     }
 }

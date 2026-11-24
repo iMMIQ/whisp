@@ -44,6 +44,7 @@ class PlaybackCoordinator(
     val embeddedSubtitle = MutableStateFlow("")
     val playerFlow = MutableStateFlow<Player?>(null)
     val loopDraftStart = MutableStateFlow(-1L)
+    val lastClearedLoop = MutableStateFlow<LoopState?>(null)
     val audioOnly = MutableStateFlow(false)
     val error = MutableStateFlow<String?>(null)
     val subtitles = SubtitleLoader(scope, library, settings)
@@ -105,6 +106,7 @@ class PlaybackCoordinator(
         queueTracks.value = emptyList()
         embeddedSubtitle.value = ""
         loopDraftStart.value = -1L
+        lastClearedLoop.value = null
         subtitles.load(null)
     }
 
@@ -226,7 +228,6 @@ class PlaybackCoordinator(
                 if (continuingSame && currentQueueIds == targetIds) {
                     ordered.forEach { queueSnapshot[it.id] = it }
                     player.shuffleModeEnabled = false
-                    player.repeatMode = Player.REPEAT_MODE_OFF
                     if (player.playbackState == Player.STATE_ENDED) player.seekTo(resume.index, 0)
                     if (player.playbackState == Player.STATE_IDLE) player.prepare()
                     if (pendingStartPlaying) player.play() else player.pause()
@@ -242,7 +243,6 @@ class PlaybackCoordinator(
                     }
                 ordered.forEach { queueSnapshot[it.id] = it }
                 player.shuffleModeEnabled = shuffle
-                player.repeatMode = Player.REPEAT_MODE_OFF
                 player.setMediaItems(items, resume.index, resumePosition)
                 player.prepare()
                 if (pendingStartPlaying) player.play() else player.pause()
@@ -345,9 +345,51 @@ class PlaybackCoordinator(
         activeTimer?.setMinutes(minutes)
     }
 
+    fun extendTimer(deltaMinutes: Int) {
+        activeTimer?.extendMinutes(deltaMinutes)
+    }
+
+    fun setStopAfterTrack(enabled: Boolean) {
+        activeTimer?.setStopAfterTrack(enabled)
+    }
+
     fun setLoop(start: Long, end: Long) {
         loopDraftStart.value = -1L
         activeLoop?.set(start, end)
+    }
+
+    fun setLoopDraftStart(positionMs: Long) {
+        val player = activePlayer ?: return
+        if (player.currentMediaItem == null) return
+        val duration = player.duration.takeIf { it > 0 }
+        val clamped =
+            if (duration != null) positionMs.coerceIn(0L, duration)
+            else positionMs.coerceAtLeast(0L)
+        activeLoop?.clear()
+        loopDraftStart.value = clamped
+    }
+
+    fun adjustLoop(deltaStartMs: Long = 0L, deltaEndMs: Long = 0L) {
+        val loop = activeLoop ?: return
+        if (loop.active) {
+            val nextStart = (loop.startMs + deltaStartMs).coerceAtLeast(0L)
+            val nextEnd = (loop.endMs + deltaEndMs).coerceAtLeast(nextStart + 500L)
+            loop.set(nextStart, nextEnd)
+        } else if (loopDraftStart.value >= 0L && deltaStartMs != 0L) {
+            loopDraftStart.value = (loopDraftStart.value + deltaStartMs).coerceAtLeast(0L)
+        }
+    }
+
+    fun restoreLastClearedLoop() {
+        val prev = activeLoop?.lastClearedBySeek ?: return
+        val player = activePlayer ?: return
+        activeLoop?.set(prev.startMs, prev.endMs)
+        player.seekTo(prev.startMs)
+    }
+
+    fun dismissClearedLoop() {
+        activeLoop?.dismissClearedHistory()
+        lastClearedLoop.value = null
     }
 
     fun markLoopStart() {
@@ -489,6 +531,7 @@ class PlaybackCoordinator(
                 durationMs = duration,
                 buffering = player.playbackState == Player.STATE_BUFFERING,
                 timerEnd = activeTimer?.deadlineMs ?: 0L,
+                timerStopAfterTrack = activeTimer?.stopAfterTrack == true,
                 loopStart = activeLoop?.startMs ?: -1L,
                 loopEnd = activeLoop?.endMs ?: -1L,
                 playWhenReady = player.playWhenReady,
@@ -503,6 +546,7 @@ class PlaybackCoordinator(
                 speed = player.playbackParameters.speed,
                 repeatMode = player.repeatMode,
             )
+        lastClearedLoop.value = activeLoop?.lastClearedBySeek
         val prev = state.value
         val sameDiscrete =
             prev.trackId == nextState.trackId &&
@@ -510,6 +554,7 @@ class PlaybackCoordinator(
                 prev.durationMs == nextState.durationMs &&
                 prev.buffering == nextState.buffering &&
                 prev.timerEnd == nextState.timerEnd &&
+                prev.timerStopAfterTrack == nextState.timerStopAfterTrack &&
                 prev.loopStart == nextState.loopStart &&
                 prev.loopEnd == nextState.loopEnd &&
                 prev.playWhenReady == nextState.playWhenReady &&

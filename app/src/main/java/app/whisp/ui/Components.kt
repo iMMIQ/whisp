@@ -11,13 +11,16 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.rememberTransformableState
-import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -37,9 +40,13 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -47,14 +54,17 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.graphics.get
 import app.whisp.R
+import app.whisp.data.ProgressEntity
 import app.whisp.data.TextEncoding
 import app.whisp.data.TrackEntity
+import app.whisp.data.TrackSummary
 import app.whisp.data.WhispImage
 import app.whisp.data.WorkEntity
 import app.whisp.data.isVideo
@@ -64,6 +74,7 @@ import coil3.request.ImageRequest
 import coil3.request.crossfade
 import coil3.toBitmap
 import java.util.Locale
+import kotlin.math.abs
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalSharedTransitionApi::class)
@@ -76,6 +87,35 @@ internal val LocalShareArtwork = compositionLocalOf { true }
 internal val LocalCoverControls = compositionLocalOf { false }
 
 internal val LocalImageCacheEpoch = compositionLocalOf { 0 }
+
+internal val LocalSnackbarHost = compositionLocalOf<SnackbarHostState?> { null }
+
+internal fun workProgressFraction(
+    tracks: List<TrackSummary>,
+    progress: ProgressEntity?,
+): Float? {
+    if (progress == null) return null
+    if (tracks.isEmpty()) return null
+    val index = tracks.indexOfFirst { it.id == progress.trackId }
+    if (index < 0) return null
+    if (index == 0 && progress.positionMs <= 0L) return null
+    val totalDuration = tracks.sumOf { it.durationMs.coerceAtLeast(0L) }
+    val allKnown = tracks.all { it.durationMs > 0L }
+    return if (allKnown && totalDuration > 0L) {
+        val before = tracks.take(index).sumOf { it.durationMs }
+        val current = progress.positionMs.coerceIn(0L, tracks[index].durationMs)
+        ((before + current).toFloat() / totalDuration.toFloat()).coerceIn(0.04f, 1f)
+    } else if (tracks.size > 1) {
+        val trackDur = tracks[index].durationMs
+        val inTrack =
+            if (trackDur > 0L) (progress.positionMs.toFloat() / trackDur).coerceIn(0f, 1f)
+            else if (progress.positionMs > 0L) 0.35f else 0f
+        ((index + inTrack) / tracks.size.toFloat()).coerceIn(0.04f, 0.98f)
+    } else {
+        val dur = tracks[0].durationMs
+        if (dur > 0L) (progress.positionMs.toFloat() / dur).coerceIn(0.04f, 1f) else 0.12f
+    }
+}
 
 private val ambientColorCache = LruCache<String, Int>(48)
 
@@ -677,70 +717,263 @@ internal fun WhispImageLightbox(
     title: String,
     onDismiss: () -> Unit,
 ) {
-    var scale by remember { mutableFloatStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
-    val transformState = rememberTransformableState { _, zoomChange, panChange, _ ->
-        val nextScale = (scale * zoomChange).coerceIn(1f, 4f)
-        scale = nextScale
-        offset =
-            if (nextScale > 1.02f) {
-                Offset(offset.x + panChange.x, offset.y + panChange.y)
-            } else {
-                Offset.Zero
-            }
+    val scope = rememberCoroutineScope()
+    val reduced = LocalReducedMotion.current
+    val haptics = rememberWhispHaptics()
+    val scaleAnim = remember { Animatable(1f) }
+    val offsetXAnim = remember { Animatable(0f) }
+    val offsetYAnim = remember { Animatable(0f) }
+    val dismissY = remember { Animatable(0f) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var showChrome by remember { mutableStateOf(true) }
+
+    fun clampOffset(rawX: Float, rawY: Float, currentScale: Float): Offset {
+        if (currentScale <= 1.02f || containerSize.width == 0 || containerSize.height == 0) {
+            return Offset.Zero
+        }
+        val maxX = ((containerSize.width * (currentScale - 1f)) / 2f).coerceAtLeast(0f)
+        val maxY = ((containerSize.height * (currentScale - 1f)) / 2f).coerceAtLeast(0f)
+        return Offset(rawX.coerceIn(-maxX, maxX), rawY.coerceIn(-maxY, maxY))
     }
+
+    val dismissProgress =
+        (abs(dismissY.value) / (containerSize.height.coerceAtLeast(1) * 0.32f)).coerceIn(0f, 1f)
+    val bgAlpha = (0.96f * (1f - dismissProgress * 0.65f)).coerceIn(0.2f, 0.96f)
+    val dismissScale = (1f - dismissProgress * 0.14f).coerceIn(0.84f, 1f)
+
     Dialog(
         onDismissRequest = onDismiss,
         properties =
             DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
         Box(
-            Modifier.fillMaxSize().background(Color(0xF50A060E)).pointerInput(Unit) {
-                detectTapGestures(
-                    onDoubleTap = {
-                        if (scale > 1.2f) {
-                            scale = 1f
-                            offset = Offset.Zero
-                        } else {
-                            scale = 2.4f
+            Modifier.fillMaxSize()
+                .onSizeChanged { containerSize = it }
+                .background(ScrimDark.copy(alpha = bgAlpha))
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = { showChrome = !showChrome },
+                        onDoubleTap = { tap ->
+                            scope.launch {
+                                val spec: AnimationSpec<Float> =
+                                    if (reduced) snap()
+                                    else
+                                        spring(
+                                            dampingRatio = Spring.DampingRatioNoBouncy,
+                                            stiffness = Spring.StiffnessMedium,
+                                        )
+                                if (scaleAnim.value > 1.2f) {
+                                    launch { scaleAnim.animateTo(1f, spec) }
+                                    launch { offsetXAnim.animateTo(0f, spec) }
+                                    launch { offsetYAnim.animateTo(0f, spec) }
+                                } else {
+                                    val targetScale = 2.4f
+                                    val cx = containerSize.width / 2f
+                                    val cy = containerSize.height / 2f
+                                    val desired =
+                                        clampOffset(
+                                            (cx - tap.x) * (targetScale - 1f),
+                                            (cy - tap.y) * (targetScale - 1f),
+                                            targetScale,
+                                        )
+                                    launch { scaleAnim.animateTo(targetScale, spec) }
+                                    launch { offsetXAnim.animateTo(desired.x, spec) }
+                                    launch { offsetYAnim.animateTo(desired.y, spec) }
+                                }
+                            }
+                        },
+                    )
+                }
+                .pointerInput(onDismiss) {
+                    val thresholdPx = 110.dp.toPx()
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        val velocityTracker = VelocityTracker()
+                        var crossedThreshold = false
+                        var dismissing = false
+                        do {
+                            val event = awaitPointerEvent()
+                            val pressedCount = event.changes.count { it.pressed }
+                            if (pressedCount == 0) break
+                            val zoomChange = event.calculateZoom()
+                            val panChange = event.calculatePan()
+                            if (
+                                pressedCount > 1 ||
+                                    scaleAnim.value > 1.02f ||
+                                    abs(zoomChange - 1f) > 0.01f
+                            ) {
+                                dismissing = false
+                                val nextScale = (scaleAnim.value * zoomChange).coerceIn(1f, 4f)
+                                val clamped =
+                                    clampOffset(
+                                        offsetXAnim.value + panChange.x,
+                                        offsetYAnim.value + panChange.y,
+                                        nextScale,
+                                    )
+                                scope.launch {
+                                    scaleAnim.snapTo(nextScale)
+                                    offsetXAnim.snapTo(clamped.x)
+                                    offsetYAnim.snapTo(clamped.y)
+                                    if (dismissY.value != 0f) dismissY.snapTo(0f)
+                                }
+                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                            } else if (abs(panChange.y) > abs(panChange.x) && panChange.y != 0f) {
+                                dismissing = true
+                                val nextY = dismissY.value + panChange.y
+                                event.changes.firstOrNull()?.let {
+                                    velocityTracker.addPosition(it.uptimeMillis, it.position)
+                                    if (it.positionChanged()) it.consume()
+                                }
+                                scope.launch { dismissY.snapTo(nextY) }
+                                val nowCrossed = abs(nextY) >= thresholdPx
+                                if (nowCrossed && !crossedThreshold) {
+                                    crossedThreshold = true
+                                    haptics.tick()
+                                } else if (!nowCrossed) {
+                                    crossedThreshold = false
+                                }
+                            }
+                        } while (event.changes.any { it.pressed })
+                        if (dismissing) {
+                            val velocityY = velocityTracker.calculateVelocity().y
+                            if (abs(dismissY.value) >= thresholdPx || abs(velocityY) > 1200f) {
+                                onDismiss()
+                            } else {
+                                scope.launch {
+                                    dismissY.animateTo(
+                                        0f,
+                                        if (reduced) snap()
+                                        else
+                                            spring(
+                                                dampingRatio = Spring.DampingRatioNoBouncy,
+                                                stiffness = Spring.StiffnessMedium,
+                                            ),
+                                    )
+                                }
+                            }
                         }
-                    },
-                )
-            },
+                    }
+                },
         ) {
             Artwork(
                 image = image,
                 description = title,
                 scale = ContentScale.Fit,
                 modifier =
-                    Modifier.fillMaxSize().transformable(state = transformState).graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
-                        translationX = offset.x
-                        translationY = offset.y
+                    Modifier.fillMaxSize().graphicsLayer {
+                        val effectiveScale = scaleAnim.value * dismissScale
+                        scaleX = effectiveScale
+                        scaleY = effectiveScale
+                        translationX = offsetXAnim.value
+                        translationY = offsetYAnim.value + dismissY.value
                     },
             )
-            Row(
-                Modifier.fillMaxWidth()
-                    .background(
-                        Brush.verticalGradient(listOf(Ink.copy(alpha = 0.75f), Color.Transparent)),
-                    )
-                    .statusBarsPadding()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            androidx.compose.animation.AnimatedVisibility(
+                visible = showChrome && dismissProgress < 0.12f,
+                enter = androidx.compose.animation.fadeIn(tween(if (reduced) 0 else 150)),
+                exit = androidx.compose.animation.fadeOut(tween(if (reduced) 0 else 120)),
             ) {
-                Text(
-                    title,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = Cream,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f).padding(start = 12.dp),
-                )
-                IconAction(Icons.Outlined.Close, "关闭预览", Cream, action = onDismiss)
+                Row(
+                    Modifier.fillMaxWidth()
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Ink.copy(alpha = 0.78f), Color.Transparent),
+                            ),
+                        )
+                        .statusBarsPadding()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Cream,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f).padding(start = 12.dp),
+                    )
+                    IconAction(Icons.Outlined.Close, "关闭预览", Cream, action = onDismiss)
+                }
             }
         }
     }
+}
+
+@Composable
+internal fun WhispToggleRow(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    subtitle: String? = null,
+    tag: String? = null,
+    enabled: Boolean = true,
+) {
+    val haptics = rememberWhispHaptics()
+    Row(
+        modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .then(if (tag != null) Modifier.testTag(tag) else Modifier)
+            .toggleable(
+                value = checked,
+                enabled = enabled,
+                role = Role.Switch,
+                onValueChange = { next ->
+                    haptics.tick()
+                    onCheckedChange(next)
+                },
+            )
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (enabled) Cream else Cream.copy(alpha = 0.45f),
+            )
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Muted,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+        Switch(checked = checked, onCheckedChange = null, enabled = enabled)
+    }
+}
+
+@Composable
+internal fun WhispConfirmDialog(
+    title: String,
+    message: String,
+    confirmLabel: String,
+    destructive: Boolean = true,
+    busy: Boolean = false,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        title = { Text(title, color = Cream) },
+        text = { Text(message, color = Muted) },
+        confirmButton = {
+            TextButton(enabled = !busy, onClick = onConfirm) {
+                Text(
+                    confirmLabel,
+                    color = if (destructive) MaterialTheme.colorScheme.error else Rose,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(enabled = !busy, onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 @Composable
@@ -750,13 +983,18 @@ internal fun IconAction(
     tint: Color = Cream,
     enabled: Boolean = true,
     feedback: Boolean = false,
+    haptic: HapticKind = if (feedback) HapticKind.Confirm else HapticKind.None,
     action: () -> Unit,
 ) {
     val haptics = rememberWhispHaptics()
     val backdrop = LocalCoverControls.current
     IconButton(
         onClick = {
-            if (feedback) haptics.confirm()
+            when (haptic) {
+                HapticKind.Confirm -> haptics.confirm()
+                HapticKind.Tick -> haptics.tick()
+                HapticKind.None -> Unit
+            }
             action()
         },
         enabled = enabled,
