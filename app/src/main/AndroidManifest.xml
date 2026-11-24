@@ -7,12 +7,18 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <application android:name=".WhispApp" android:label="Whisp" android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:theme="@style/Theme.Whisp" android:allowBackup="false"
         android:fullBackupContent="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
+        android:manageSpaceActivity=".ManageSpaceActivity"
         android:networkSecurityConfig="@xml/network_security_config" android:supportsRtl="true">
+        <activity
+            android:name=".ManageSpaceActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Whisp" />
         <activity
             android:name=".DlsiteLoginActivity"
             android:exported="false"
@@ -29,6 +35,34 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter android:label="Whisp">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter android:label="@string/action_process_text_whisp">
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter android:autoVerify="false" android:label="Whisp">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" />
+                <data android:host="www.dlsite.com" />
+                <data android:host="dlsite.com" />
+                <data android:host="asmr.one" />
+                <data android:host="www.asmr.one" />
+            </intent-filter>
+            <intent-filter android:label="Whisp">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" android:mimeType="audio/*" />
+                <data android:scheme="content" android:mimeType="video/*" />
+                <data android:scheme="file" android:mimeType="audio/*" />
+                <data android:scheme="file" android:mimeType="video/*" />
             </intent-filter>
         </activity>
         <service android:name=".playback.PlaybackService" android:exported="true"
@@ -52,5 +86,38 @@
             android:exported="true" />
         <service android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync" tools:node="merge" />
+        <service
+            android:name=".system.WhispSleepTimerTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_whisp"
+            android:label="@string/tile_sleep_timer"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".system.WhispResumeTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_whisp"
+            android:label="@string/tile_resume_playback"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+        <receiver
+            android:name=".system.WhispWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="app.whisp.widget.TOGGLE_PLAY" />
+                <action android:name="app.whisp.widget.EXTEND_TIMER" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/whisp_widget_info" />
+        </receiver>
     </application>
 </manifest>

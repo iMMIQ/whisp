@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import android.graphics.Rect
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
@@ -31,7 +32,9 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -54,6 +57,7 @@ import app.whisp.AppGraph
 import app.whisp.R
 import app.whisp.data.*
 import app.whisp.playback.PlaybackCoordinator
+import app.whisp.system.ExternalLaunchAction
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -68,16 +72,23 @@ import kotlinx.coroutines.withContext
 fun WhispRoot(
     graph: AppGraph,
     playerRequest: Int = 0,
+    launchCounter: Int = 0,
+    launchAction: ExternalLaunchAction? = null,
     inPipMode: Boolean = false,
     requestNotifications: () -> Unit = {},
+    onVideoBoundsChanged: (Rect?) -> Unit = {},
 ) {
+    val context = LocalContext.current
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
-    WhispTheme(reduceMotion = settings.reduceMotion, amoledBlack = settings.amoledBlack) {
+    val effectiveReduceMotion =
+        settings.reduceMotion || remember(context) { systemPrefersReducedMotion(context) }
+    WhispTheme(reduceMotion = effectiveReduceMotion, amoledBlack = settings.amoledBlack) {
         val bg = MaterialTheme.colorScheme.background
         val sources by graph.library.sourceList.collectAsStateWithLifecycle()
         val state by graph.playback.state.collectAsStateWithLifecycle()
         val openingId by graph.playback.openingTrackId.collectAsStateWithLifecycle()
         val playbackError by graph.playback.error.collectAsStateWithLifecycle()
+        val speakerGuardPrompt by graph.playback.speakerGuardPrompt.collectAsStateWithLifecycle()
         val cacheEpoch by graph.images.cacheEpoch.collectAsStateWithLifecycle()
         val hasActiveDownloads by
             remember(graph) {
@@ -196,6 +207,7 @@ fun WhispRoot(
             }
 
         var handledPlayerRequest by rememberSaveable { mutableIntStateOf(0) }
+        var handledLaunchCounter by rememberSaveable { mutableIntStateOf(0) }
         val dispatcher =
             androidx.activity.compose.LocalOnBackPressedDispatcherOwner.current!!
                 .onBackPressedDispatcher
@@ -270,6 +282,94 @@ fun WhispRoot(
                 push(WhispRoute.Player)
             }
         }
+        LaunchedEffect(launchCounter, launchAction, current?.work?.id) {
+            val action = launchAction ?: return@LaunchedEffect
+            if (launchCounter <= handledLaunchCounter) return@LaunchedEffect
+            when (action) {
+                ExternalLaunchAction.OpenPlayer -> {
+                    if (current != null) {
+                        handledLaunchCounter = launchCounter
+                        push(WhispRoute.Player)
+                    }
+                }
+                ExternalLaunchAction.OpenStorage -> {
+                    handledLaunchCounter = launchCounter
+                    activeTabIndex = 2
+                    if (settingsStack.lastOrNull() != WhispRoute.Storage) {
+                        backFallback.isEnabled = true
+                        settingsStack.add(WhispRoute.Storage)
+                    }
+                }
+                is ExternalLaunchAction.StartSleepTimer -> {
+                    handledLaunchCounter = launchCounter
+                    graph.playback.startSleepTimerFromSystem(action.minutes)
+                    graph.messages.tryEmit("已开启 ${action.minutes} 分钟助眠定时")
+                }
+                is ExternalLaunchAction.OpenWorkCode -> {
+                    handledLaunchCounter = launchCounter
+                    val existing =
+                        withContext(Dispatchers.IO) { graph.library.dao.workByRj(action.code) }
+                    if (existing != null) {
+                        activeTabIndex = 0
+                        val target = WhispRoute.Detail(existing.id)
+                        if (libraryStack.lastOrNull() != target) {
+                            backFallback.isEnabled = true
+                            libraryStack.add(target)
+                        }
+                    } else if (action.asmrId != null) {
+                        val sourceId =
+                            sources.firstOrNull { it.kindType == SourceKind.ASMRONE }?.id
+                                ?: runCatching { graph.library.addAsmrOne() }.getOrNull()
+                        if (sourceId != null) {
+                            activeTabIndex = 1
+                            val target = WhispRoute.AsmrPreview(sourceId, action.asmrId)
+                            if (sourcesStack.lastOrNull() != target) {
+                                backFallback.isEnabled = true
+                                sourcesStack.add(target)
+                            }
+                        } else {
+                            graph.messages.tryEmit("未找到 ${action.code}")
+                        }
+                    } else {
+                        graph.messages.tryEmit("作品库中未找到 ${action.code}")
+                    }
+                }
+                is ExternalLaunchAction.SearchQuery -> {
+                    handledLaunchCounter = launchCounter
+                    val matches =
+                        withContext(Dispatchers.IO) { graph.library.searchWorkIds(action.query) }
+                    if (matches.size == 1) {
+                        activeTabIndex = 0
+                        val target = WhispRoute.Detail(matches.first())
+                        if (libraryStack.lastOrNull() != target) {
+                            backFallback.isEnabled = true
+                            libraryStack.add(target)
+                        }
+                    } else {
+                        val sourceId =
+                            sources.firstOrNull { it.kindType == SourceKind.ASMRONE }?.id
+                                ?: runCatching { graph.library.addAsmrOne() }.getOrNull()
+                        if (sourceId != null) {
+                            activeTabIndex = 1
+                            graph.asmrCatalog.submit(
+                                AsmrQuery(sourceId = sourceId, text = action.query),
+                            )
+                            val target = WhispRoute.AsmrOne(sourceId)
+                            if (sourcesStack.lastOrNull() != target) {
+                                backFallback.isEnabled = true
+                                sourcesStack.add(target)
+                            }
+                        } else {
+                            graph.messages.tryEmit("已收到关键词：${action.query}")
+                        }
+                    }
+                }
+                is ExternalLaunchAction.PlayExternalMedia -> {
+                    handledLaunchCounter = launchCounter
+                    graph.playback.playExternalUri(action.uri, action.mimeType)
+                }
+            }
+        }
         LaunchedEffect(graph) { graph.messages.collect { snackbar.showSnackbar(it) } }
         LaunchedEffect(playbackError) {
             playbackError?.let {
@@ -277,9 +377,49 @@ fun WhispRoot(
                 graph.playback.error.value = null
             }
         }
+        speakerGuardPrompt?.let { promptMessage ->
+            AlertDialog(
+                onDismissRequest = graph.playback::dismissSpeakerGuard,
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                title = { Text("外放提醒", color = Cream) },
+                text = { Text(promptMessage, color = Muted) },
+                confirmButton = {
+                    Button(
+                        onClick = graph.playback::confirmSpeakerPlayback,
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Text("继续外放")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = graph.playback::dismissSpeakerGuard) { Text("取消") }
+                },
+            )
+        }
 
         val showMini = !isPlayerRoute && current != null && currentTrack != null
-        val showAnyBottom = showMini || showBottomNav
+        val containerWidthDp =
+            with(LocalDensity.current) { LocalWindowInfo.current.containerSize.width.toDp() }
+        val useNavRail = containerWidthDp >= 720.dp && showBottomNav
+        val showBottomNavBar = showBottomNav && !useNavRail
+        val showAnyBottom = showMini || showBottomNavBar
+        val onSelectNavTab: (Int) -> Unit = { index ->
+            if (index == activeTabIndex) {
+                if (stack.size > 1) {
+                    while (stack.size > 1) {
+                        stack.removeAt(stack.lastIndex)
+                    }
+                } else {
+                    when (index) {
+                        0 -> libraryReselect++
+                        1 -> sourcesReselect++
+                        2 -> settingsReselect++
+                    }
+                }
+            } else {
+                activeTabIndex = index
+            }
+        }
         SharedTransitionLayout(Modifier.fillMaxSize()) {
             val shared = this
             CompositionLocalProvider(
@@ -287,407 +427,414 @@ fun WhispRoot(
                 LocalTouchFeedback provides settings.touchFeedback,
                 LocalImageCacheEpoch provides cacheEpoch,
                 LocalSnackbarHost provides snackbar,
+                LocalVideoBoundsReporter provides onVideoBoundsChanged,
             ) {
-                Scaffold(
-                    containerColor = bg,
-                    contentWindowInsets = WindowInsets(0, 0, 0, 0),
-                    snackbarHost = {
-                        SnackbarHost(
-                            hostState = snackbar,
-                            modifier =
-                                if (!showAnyBottom) Modifier.navigationBarsPadding() else Modifier,
-                        ) { data ->
-                            Snackbar(
-                                snackbarData = data,
-                                containerColor = MaterialTheme.colorScheme.inverseSurface,
-                                contentColor = MaterialTheme.colorScheme.inverseOnSurface,
-                                actionColor = MaterialTheme.colorScheme.inversePrimary,
-                                shape = RoundedCornerShape(14.dp),
-                            )
-                        }
-                    },
-                    bottomBar = {
-                        AnimatedVisibility(
-                            showAnyBottom,
-                            enter = fadeIn(tween(if (settings.reduceMotion) 100 else 200)),
-                            exit = fadeOut(tween(if (settings.reduceMotion) 100 else 160)),
-                        ) {
-                            CompositionLocalProvider(LocalArtworkVisibility provides this) {
-                                Column(
-                                    Modifier.fillMaxWidth().background(bg).navigationBarsPadding(),
-                                    horizontalAlignment = Alignment.CenterHorizontally,
+                Row(Modifier.fillMaxSize().background(bg)) {
+                    if (useNavRail) {
+                        WhispNavRail(
+                            activeTabIndex = activeTabIndex,
+                            onSelect = onSelectNavTab,
+                        )
+                    }
+                    Scaffold(
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        containerColor = bg,
+                        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+                        snackbarHost = {
+                            SnackbarHost(
+                                hostState = snackbar,
+                                modifier =
+                                    if (!showAnyBottom) Modifier.navigationBarsPadding()
+                                    else Modifier,
+                            ) { data ->
+                                Snackbar(
+                                    snackbarData = data,
+                                    containerColor = MaterialTheme.colorScheme.inverseSurface,
+                                    contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+                                    actionColor = MaterialTheme.colorScheme.inversePrimary,
+                                    shape = RoundedCornerShape(14.dp),
+                                )
+                            }
+                        },
+                        bottomBar = {
+                            AnimatedVisibility(
+                                showAnyBottom,
+                                enter = fadeIn(tween(if (settings.reduceMotion) 100 else 200)),
+                                exit = fadeOut(tween(if (settings.reduceMotion) 100 else 160)),
+                            ) {
+                                CompositionLocalProvider(LocalArtworkVisibility provides this) {
+                                    Column(
+                                        Modifier.fillMaxWidth()
+                                            .background(bg)
+                                            .navigationBarsPadding(),
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                    ) {
+                                        if (current != null && currentTrack != null) {
+                                            MiniPlayer(
+                                                detail = current,
+                                                track = currentTrack,
+                                                state = state,
+                                                fallbackPosition = miniFallbackPosition,
+                                                playback = graph.playback,
+                                                onToggle = graph.playback::togglePlay,
+                                                shareCover = miniTransition,
+                                                onClick = { push(WhispRoute.Player) },
+                                            )
+                                        }
+                                        AnimatedVisibility(
+                                            visible = showBottomNavBar,
+                                            enter =
+                                                fadeIn(
+                                                    tween(if (settings.reduceMotion) 0 else 160),
+                                                ) + expandVertically(),
+                                            exit =
+                                                fadeOut(
+                                                    tween(if (settings.reduceMotion) 0 else 120),
+                                                ) + shrinkVertically(),
+                                        ) {
+                                            Column(
+                                                Modifier.fillMaxWidth(),
+                                                horizontalAlignment = Alignment.CenterHorizontally,
+                                            ) {
+                                                HorizontalDivider(
+                                                    thickness = 0.5.dp,
+                                                    color =
+                                                        MaterialTheme.colorScheme.outlineVariant,
+                                                )
+                                                WhispBottomNav(
+                                                    activeTabIndex = activeTabIndex,
+                                                    onSelect = onSelectNavTab,
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    ) { padding ->
+                        val navEntryProvider =
+                            entryProvider<androidx.navigation3.runtime.NavKey> {
+                                @Composable
+                                fun RouteFrame(
+                                    destination: WhispRoute,
+                                    content: @Composable () -> Unit,
                                 ) {
-                                    if (current != null && currentTrack != null) {
-                                        MiniPlayer(
+                                    var bottom by remember {
+                                        mutableStateOf(padding.calculateBottomPadding())
+                                    }
+                                    if (
+                                        destination == route &&
+                                            destination !is WhispRoute.Player &&
+                                            !shared.isTransitionActive
+                                    ) {
+                                        SideEffect { bottom = padding.calculateBottomPadding() }
+                                    }
+                                    CompositionLocalProvider(
+                                        LocalArtworkVisibility provides
+                                            androidx.navigation3.ui.LocalNavAnimatedContentScope
+                                                .current,
+                                        LocalShareArtwork provides
+                                            (!miniTransition || destination is WhispRoute.Player),
+                                    ) {
+                                        val bottomModifier =
+                                            when {
+                                                destination is WhispRoute.Player -> Modifier
+                                                bottom > 0.dp -> Modifier.padding(bottom = bottom)
+                                                else -> Modifier.navigationBarsPadding()
+                                            }
+                                        Box(
+                                            Modifier.fillMaxSize()
+                                                .background(bg)
+                                                .then(bottomModifier),
+                                        ) {
+                                            content()
+                                        }
+                                    }
+                                }
+                                val asmrSource = sources.firstOrNull {
+                                    it.kindType == SourceKind.ASMRONE
+                                }
+                                val openFacetFilter: ((AsmrFacet) -> Unit)? =
+                                    asmrSource?.let { source ->
+                                        { facet: AsmrFacet ->
+                                            push(
+                                                WhispRoute.AsmrOne(
+                                                    source.id,
+                                                    facet.kind,
+                                                    facet.name,
+                                                ),
+                                            )
+                                        }
+                                    }
+                                entry<WhispRoute.Library> { destination ->
+                                    RouteFrame(destination) {
+                                        LibraryPage(
+                                            graph = graph,
+                                            activeMiniWorkId = current?.work?.id,
+                                            reselectTick = libraryReselect,
+                                            open = { push(WhispRoute.Detail(it), destination) },
+                                            resumePlay = { workId ->
+                                                scope.launch {
+                                                    val details =
+                                                        withContext(Dispatchers.IO) {
+                                                            graph.library.workDetails(workId)
+                                                        }
+                                                    if (details != null) {
+                                                        graph.playback.playWork(details)
+                                                        push(WhispRoute.Player, destination)
+                                                    } else {
+                                                        push(WhispRoute.Detail(workId), destination)
+                                                    }
+                                                }
+                                            },
+                                            sources = { activeTabIndex = 1 },
+                                        )
+                                    }
+                                }
+                                entry<WhispRoute.Detail> { destination ->
+                                    RouteFrame(destination) {
+                                        WorkDetailScreen(
+                                            graph = graph,
+                                            target = WorkDetailTarget.Library(destination.workId),
+                                            back = { pop(destination) },
+                                            player = { push(WhispRoute.Player, destination) },
+                                            filter = openFacetFilter,
+                                        )
+                                    }
+                                }
+                                entry<WhispRoute.Player> { destination ->
+                                    RouteFrame(destination) {
+                                        PlayerPage(
                                             detail = current,
                                             track = currentTrack,
-                                            state = state,
-                                            fallbackPosition = miniFallbackPosition,
-                                            playback = graph.playback,
-                                            onToggle = graph.playback::togglePlay,
-                                            shareCover = miniTransition,
-                                            onClick = { push(WhispRoute.Player) },
-                                        )
-                                    }
-                                    AnimatedVisibility(
-                                        visible = showBottomNav,
-                                        enter =
-                                            fadeIn(tween(if (settings.reduceMotion) 0 else 160)) +
-                                                expandVertically(),
-                                        exit =
-                                            fadeOut(tween(if (settings.reduceMotion) 0 else 120)) +
-                                                shrinkVertically(),
-                                    ) {
-                                        Column(
-                                            Modifier.fillMaxWidth(),
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                        ) {
-                                            HorizontalDivider(
-                                                thickness = 0.5.dp,
-                                                color = MaterialTheme.colorScheme.outlineVariant,
-                                            )
-                                            WhispBottomNav(
-                                                activeTabIndex = activeTabIndex,
-                                                onSelect = { index ->
-                                                    if (index == activeTabIndex) {
-                                                        if (stack.size > 1) {
-                                                            while (stack.size > 1) {
-                                                                stack.removeAt(stack.lastIndex)
-                                                            }
-                                                        } else {
-                                                            when (index) {
-                                                                0 -> libraryReselect++
-                                                                1 -> sourcesReselect++
-                                                                2 -> settingsReselect++
-                                                            }
-                                                        }
-                                                    } else {
-                                                        activeTabIndex = index
-                                                    }
-                                                },
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                ) { padding ->
-                    val navEntryProvider =
-                        entryProvider<androidx.navigation3.runtime.NavKey> {
-                            @Composable
-                            fun RouteFrame(
-                                destination: WhispRoute,
-                                content: @Composable () -> Unit,
-                            ) {
-                                var bottom by remember {
-                                    mutableStateOf(padding.calculateBottomPadding())
-                                }
-                                if (
-                                    destination == route &&
-                                        destination !is WhispRoute.Player &&
-                                        !shared.isTransitionActive
-                                ) {
-                                    SideEffect { bottom = padding.calculateBottomPadding() }
-                                }
-                                CompositionLocalProvider(
-                                    LocalArtworkVisibility provides
-                                        androidx.navigation3.ui.LocalNavAnimatedContentScope
-                                            .current,
-                                    LocalShareArtwork provides
-                                        (!miniTransition || destination is WhispRoute.Player),
-                                ) {
-                                    val bottomModifier =
-                                        when {
-                                            destination is WhispRoute.Player -> Modifier
-                                            bottom > 0.dp -> Modifier.padding(bottom = bottom)
-                                            else -> Modifier.navigationBarsPadding()
-                                        }
-                                    Box(
-                                        Modifier.fillMaxSize().background(bg).then(bottomModifier),
-                                    ) {
-                                        content()
-                                    }
-                                }
-                            }
-                            val asmrSource = sources.firstOrNull {
-                                it.kindType == SourceKind.ASMRONE
-                            }
-                            val openFacetFilter: ((AsmrFacet) -> Unit)? =
-                                asmrSource?.let { source ->
-                                    { facet: AsmrFacet ->
-                                        push(
-                                            WhispRoute.AsmrOne(
-                                                source.id,
-                                                facet.kind,
-                                                facet.name,
-                                            ),
+                                            graph = graph,
+                                            back = { pop(destination) },
+                                            openDetail = ::openDetailFromPlayer,
                                         )
                                     }
                                 }
-                            entry<WhispRoute.Library> { destination ->
-                                RouteFrame(destination) {
-                                    LibraryPage(
-                                        graph = graph,
-                                        activeMiniWorkId = current?.work?.id,
-                                        reselectTick = libraryReselect,
-                                        open = { push(WhispRoute.Detail(it), destination) },
-                                        resumePlay = { workId ->
-                                            scope.launch {
-                                                val details =
-                                                    withContext(Dispatchers.IO) {
-                                                        graph.library.workDetails(workId)
-                                                    }
-                                                if (details != null) {
-                                                    graph.playback.playWork(details)
-                                                    push(WhispRoute.Player, destination)
-                                                } else {
-                                                    push(WhispRoute.Detail(workId), destination)
-                                                }
-                                            }
-                                        },
-                                        sources = { activeTabIndex = 1 },
-                                    )
+                                entry<WhispRoute.Sources> { destination ->
+                                    RouteFrame(destination) {
+                                        SourcesPage(
+                                            graph = graph,
+                                            reselectTick = sourcesReselect,
+                                            online = { push(WhispRoute.AsmrOne(it), destination) },
+                                            dlsite = { push(WhispRoute.Dlsite(it), destination) },
+                                            storage = { push(WhispRoute.Storage, destination) },
+                                            openWork = { push(WhispRoute.Detail(it), destination) },
+                                        )
+                                    }
                                 }
-                            }
-                            entry<WhispRoute.Detail> { destination ->
-                                RouteFrame(destination) {
-                                    WorkDetailScreen(
-                                        graph = graph,
-                                        target = WorkDetailTarget.Library(destination.workId),
-                                        back = { pop(destination) },
-                                        player = { push(WhispRoute.Player, destination) },
-                                        filter = openFacetFilter,
-                                    )
+                                entry<WhispRoute.Settings> { destination ->
+                                    RouteFrame(destination) {
+                                        SettingsPage(
+                                            graph = graph,
+                                            openStorage = { push(WhispRoute.Storage, destination) },
+                                            reselectTick = settingsReselect,
+                                        )
+                                    }
                                 }
-                            }
-                            entry<WhispRoute.Player> { destination ->
-                                RouteFrame(destination) {
-                                    PlayerPage(
-                                        detail = current,
-                                        track = currentTrack,
-                                        graph = graph,
-                                        back = { pop(destination) },
-                                        openDetail = ::openDetailFromPlayer,
-                                    )
+                                entry<WhispRoute.Dlsite> { destination ->
+                                    RouteFrame(destination) {
+                                        DlsiteLibraryPage(
+                                            graph = graph,
+                                            sourceId = destination.sourceId,
+                                            back = { pop(destination) },
+                                            openOwned = { workno ->
+                                                push(
+                                                    WhispRoute.DlsiteWork(
+                                                        destination.sourceId,
+                                                        workno,
+                                                    ),
+                                                    destination,
+                                                )
+                                            },
+                                        )
+                                    }
                                 }
-                            }
-                            entry<WhispRoute.Sources> { destination ->
-                                RouteFrame(destination) {
-                                    SourcesPage(
-                                        graph = graph,
-                                        reselectTick = sourcesReselect,
-                                        online = { push(WhispRoute.AsmrOne(it), destination) },
-                                        dlsite = { push(WhispRoute.Dlsite(it), destination) },
-                                        storage = { push(WhispRoute.Storage, destination) },
-                                        openWork = { push(WhispRoute.Detail(it), destination) },
-                                    )
-                                }
-                            }
-                            entry<WhispRoute.Settings> { destination ->
-                                RouteFrame(destination) {
-                                    SettingsPage(
-                                        graph = graph,
-                                        openStorage = { push(WhispRoute.Storage, destination) },
-                                        reselectTick = settingsReselect,
-                                    )
-                                }
-                            }
-                            entry<WhispRoute.Dlsite> { destination ->
-                                RouteFrame(destination) {
-                                    DlsiteLibraryPage(
-                                        graph = graph,
-                                        sourceId = destination.sourceId,
-                                        back = { pop(destination) },
-                                        openOwned = { workno ->
-                                            push(
-                                                WhispRoute.DlsiteWork(
+                                entry<WhispRoute.DlsiteWork> { destination ->
+                                    RouteFrame(destination) {
+                                        WorkDetailScreen(
+                                            graph = graph,
+                                            target =
+                                                WorkDetailTarget.DlsiteOwned(
                                                     destination.sourceId,
-                                                    workno,
+                                                    destination.workno,
                                                 ),
-                                                destination,
-                                            )
-                                        },
-                                    )
-                                }
-                            }
-                            entry<WhispRoute.DlsiteWork> { destination ->
-                                RouteFrame(destination) {
-                                    WorkDetailScreen(
-                                        graph = graph,
-                                        target =
-                                            WorkDetailTarget.DlsiteOwned(
-                                                destination.sourceId,
-                                                destination.workno,
-                                            ),
-                                        back = { pop(destination) },
-                                        player = { push(WhispRoute.Player, destination) },
-                                        filter = openFacetFilter,
-                                    )
-                                }
-                            }
-                            entry<WhispRoute.AsmrOne> { destination ->
-                                RouteFrame(destination) {
-                                    val initialFacet =
-                                        if (
-                                            destination.facetKind != null &&
-                                                destination.facetName != null
+                                            back = { pop(destination) },
+                                            player = { push(WhispRoute.Player, destination) },
+                                            filter = openFacetFilter,
                                         )
-                                            AsmrFacet(
-                                                destination.facetKind,
-                                                destination.facetName,
-                                            )
-                                        else null
-                                    val scopeKey = initialFacet?.let {
-                                        "${destination.sourceId}|${it.kind}|${it.name}"
                                     }
-                                    AsmrOnePage(
-                                        graph = graph,
-                                        sourceId = destination.sourceId,
-                                        initialFacet = initialFacet,
-                                        catalogScopeKey = scopeKey,
-                                        back = { pop(destination) },
-                                        open = { work ->
-                                            push(
-                                                WhispRoute.AsmrPreview(
-                                                    destination.sourceId,
-                                                    work.id,
-                                                ),
-                                                destination,
+                                }
+                                entry<WhispRoute.AsmrOne> { destination ->
+                                    RouteFrame(destination) {
+                                        val initialFacet =
+                                            if (
+                                                destination.facetKind != null &&
+                                                    destination.facetName != null
                                             )
-                                        },
-                                    )
+                                                AsmrFacet(
+                                                    destination.facetKind,
+                                                    destination.facetName,
+                                                )
+                                            else null
+                                        val scopeKey = initialFacet?.let {
+                                            "${destination.sourceId}|${it.kind}|${it.name}"
+                                        }
+                                        AsmrOnePage(
+                                            graph = graph,
+                                            sourceId = destination.sourceId,
+                                            initialFacet = initialFacet,
+                                            catalogScopeKey = scopeKey,
+                                            back = { pop(destination) },
+                                            open = { work ->
+                                                push(
+                                                    WhispRoute.AsmrPreview(
+                                                        destination.sourceId,
+                                                        work.id,
+                                                    ),
+                                                    destination,
+                                                )
+                                            },
+                                        )
+                                    }
+                                }
+                                entry<WhispRoute.AsmrPreview> { destination ->
+                                    RouteFrame(destination) {
+                                        WorkDetailScreen(
+                                            graph = graph,
+                                            target =
+                                                WorkDetailTarget.AsmrPreview(
+                                                    destination.sourceId,
+                                                    destination.workId,
+                                                ),
+                                            back = { pop(destination) },
+                                            player = { push(WhispRoute.Player, destination) },
+                                            filter = openFacetFilter,
+                                        )
+                                    }
+                                }
+                                entry<WhispRoute.Storage> { destination ->
+                                    RouteFrame(destination) {
+                                        StoragePage(
+                                            graph = graph,
+                                            backLabel =
+                                                if (activeTabIndex == 2)
+                                                    stringResource(R.string.action_back_settings)
+                                                else stringResource(R.string.action_back_sources),
+                                            back = { pop(destination) },
+                                        )
+                                    }
                                 }
                             }
-                            entry<WhispRoute.AsmrPreview> { destination ->
-                                RouteFrame(destination) {
-                                    WorkDetailScreen(
-                                        graph = graph,
-                                        target =
-                                            WorkDetailTarget.AsmrPreview(
-                                                destination.sourceId,
-                                                destination.workId,
-                                            ),
-                                        back = { pop(destination) },
-                                        player = { push(WhispRoute.Player, destination) },
-                                        filter = openFacetFilter,
-                                    )
-                                }
+                        // Keep one SaveableStateHolder decorator per top-level tab stack so
+                        // switching
+                        // tabs preserves each tab's rememberSaveable scroll/filter/query state.
+                        val libraryEntries =
+                            rememberDecoratedNavEntries(
+                                backStack = libraryStack,
+                                entryDecorators =
+                                    listOf(rememberSaveableStateHolderNavEntryDecorator()),
+                                entryProvider = navEntryProvider,
+                            )
+                        val sourcesEntries =
+                            rememberDecoratedNavEntries(
+                                backStack = sourcesStack,
+                                entryDecorators =
+                                    listOf(rememberSaveableStateHolderNavEntryDecorator()),
+                                entryProvider = navEntryProvider,
+                            )
+                        val settingsEntries =
+                            rememberDecoratedNavEntries(
+                                backStack = settingsStack,
+                                entryDecorators =
+                                    listOf(rememberSaveableStateHolderNavEntryDecorator()),
+                                entryProvider = navEntryProvider,
+                            )
+                        val activeEntries =
+                            when (activeTabIndex) {
+                                1 -> sourcesEntries
+                                2 -> settingsEntries
+                                else -> libraryEntries
                             }
-                            entry<WhispRoute.Storage> { destination ->
-                                RouteFrame(destination) {
-                                    StoragePage(
-                                        graph = graph,
-                                        backLabel =
-                                            if (activeTabIndex == 2)
-                                                stringResource(R.string.action_back_settings)
-                                            else stringResource(R.string.action_back_sources),
-                                        back = { pop(destination) },
-                                    )
-                                }
-                            }
-                        }
-                    // Keep one SaveableStateHolder decorator per top-level tab stack so switching
-                    // tabs preserves each tab's rememberSaveable scroll/filter/query state.
-                    val libraryEntries =
-                        rememberDecoratedNavEntries(
-                            backStack = libraryStack,
-                            entryDecorators =
-                                listOf(rememberSaveableStateHolderNavEntryDecorator()),
-                            entryProvider = navEntryProvider,
-                        )
-                    val sourcesEntries =
-                        rememberDecoratedNavEntries(
-                            backStack = sourcesStack,
-                            entryDecorators =
-                                listOf(rememberSaveableStateHolderNavEntryDecorator()),
-                            entryProvider = navEntryProvider,
-                        )
-                    val settingsEntries =
-                        rememberDecoratedNavEntries(
-                            backStack = settingsStack,
-                            entryDecorators =
-                                listOf(rememberSaveableStateHolderNavEntryDecorator()),
-                            entryProvider = navEntryProvider,
-                        )
-                    val activeEntries =
-                        when (activeTabIndex) {
-                            1 -> sourcesEntries
-                            2 -> settingsEntries
-                            else -> libraryEntries
-                        }
-                    NavDisplay(
-                        entries = activeEntries,
-                        onBack = {
-                            if (stack.size > 1) stack.removeAt(stack.lastIndex)
-                            else if (activeTabIndex != 0) activeTabIndex = 0
-                        },
-                        modifier = Modifier.fillMaxSize(),
-                        transitionSpec = {
-                            if (settings.reduceMotion) {
-                                fadeIn(tween(100)) togetherWith fadeOut(tween(100))
-                            } else if (targetState.key is WhispRoute.Player) {
-                                (fadeIn(tween(240)) +
-                                    slideInVertically(
-                                        spring(
-                                            dampingRatio = Spring.DampingRatioNoBouncy,
-                                            stiffness = Spring.StiffnessMediumLow,
-                                        ),
-                                    ) {
-                                        it / 12
-                                    }) togetherWith fadeOut(tween(160))
-                            } else {
-                                fadeIn(tween(220)) togetherWith fadeOut(tween(150))
-                            }
-                        },
-                        popTransitionSpec = {
-                            if (settings.reduceMotion) {
-                                fadeIn(tween(100)) togetherWith fadeOut(tween(100))
-                            } else if (initialState.key is WhispRoute.Player) {
-                                fadeIn(tween(180, delayMillis = 40)) togetherWith
-                                    (fadeOut(tween(140)) +
-                                        slideOutVertically(
+                        NavDisplay(
+                            entries = activeEntries,
+                            onBack = {
+                                if (stack.size > 1) stack.removeAt(stack.lastIndex)
+                                else if (activeTabIndex != 0) activeTabIndex = 0
+                            },
+                            modifier = Modifier.fillMaxSize(),
+                            transitionSpec = {
+                                if (settings.reduceMotion) {
+                                    fadeIn(tween(100)) togetherWith fadeOut(tween(100))
+                                } else if (targetState.key is WhispRoute.Player) {
+                                    (fadeIn(tween(240)) +
+                                        slideInVertically(
                                             spring(
                                                 dampingRatio = Spring.DampingRatioNoBouncy,
-                                                stiffness = Spring.StiffnessMedium,
+                                                stiffness = Spring.StiffnessMediumLow,
                                             ),
                                         ) {
-                                            it / 10
-                                        })
-                            } else {
-                                fadeIn(tween(180, delayMillis = 60)) togetherWith
-                                    fadeOut(tween(100))
-                            }
-                        },
-                        predictivePopTransitionSpec = { edge ->
-                            if (settings.reduceMotion) {
-                                fadeIn(tween(100)) togetherWith fadeOut(tween(100))
-                            } else if (initialState.key is WhispRoute.Player) {
-                                // Match the bottom-sheet vertical spatial metaphor for Player.
-                                (fadeIn(tween(240), initialAlpha = .72f) +
-                                    scaleIn(tween(240), initialScale = .98f)) togetherWith
-                                    (slideOutVertically(tween(240)) { it / 5 } +
-                                        scaleOut(
-                                            tween(240),
-                                            targetScale = .94f,
-                                            transformOrigin = TransformOrigin(0.5f, 1f),
-                                        ) +
-                                        fadeOut(tween(180)))
-                            } else {
-                                val direction = if (edge == NavigationEvent.EDGE_RIGHT) -1 else 1
-                                (fadeIn(tween(260), initialAlpha = .72f) +
-                                    scaleIn(tween(260), initialScale = .99f)) togetherWith
-                                    (slideOutHorizontally(tween(260)) { direction * it / 6 } +
-                                        scaleOut(
-                                            tween(260),
-                                            targetScale = .94f,
-                                            transformOrigin =
-                                                TransformOrigin(if (direction > 0) 0f else 1f, .5f),
-                                        ) +
-                                        fadeOut(tween(180)))
-                            }
-                        },
-                    )
+                                            it / 12
+                                        }) togetherWith fadeOut(tween(160))
+                                } else {
+                                    fadeIn(tween(220)) togetherWith fadeOut(tween(150))
+                                }
+                            },
+                            popTransitionSpec = {
+                                if (settings.reduceMotion) {
+                                    fadeIn(tween(100)) togetherWith fadeOut(tween(100))
+                                } else if (initialState.key is WhispRoute.Player) {
+                                    fadeIn(tween(180, delayMillis = 40)) togetherWith
+                                        (fadeOut(tween(140)) +
+                                            slideOutVertically(
+                                                spring(
+                                                    dampingRatio = Spring.DampingRatioNoBouncy,
+                                                    stiffness = Spring.StiffnessMedium,
+                                                ),
+                                            ) {
+                                                it / 10
+                                            })
+                                } else {
+                                    fadeIn(tween(180, delayMillis = 60)) togetherWith
+                                        fadeOut(tween(100))
+                                }
+                            },
+                            predictivePopTransitionSpec = { edge ->
+                                if (settings.reduceMotion) {
+                                    fadeIn(tween(100)) togetherWith fadeOut(tween(100))
+                                } else if (initialState.key is WhispRoute.Player) {
+                                    // Match the bottom-sheet vertical spatial metaphor for Player.
+                                    (fadeIn(tween(240), initialAlpha = .72f) +
+                                        scaleIn(tween(240), initialScale = .98f)) togetherWith
+                                        (slideOutVertically(tween(240)) { it / 5 } +
+                                            scaleOut(
+                                                tween(240),
+                                                targetScale = .94f,
+                                                transformOrigin = TransformOrigin(0.5f, 1f),
+                                            ) +
+                                            fadeOut(tween(180)))
+                                } else {
+                                    val direction =
+                                        if (edge == NavigationEvent.EDGE_RIGHT) -1 else 1
+                                    (fadeIn(tween(260), initialAlpha = .72f) +
+                                        scaleIn(tween(260), initialScale = .99f)) togetherWith
+                                        (slideOutHorizontally(tween(260)) { direction * it / 6 } +
+                                            scaleOut(
+                                                tween(260),
+                                                targetScale = .94f,
+                                                transformOrigin =
+                                                    TransformOrigin(
+                                                        if (direction > 0) 0f else 1f,
+                                                        .5f,
+                                                    ),
+                                            ) +
+                                            fadeOut(tween(180)))
+                                }
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -699,6 +846,63 @@ private data class NavTabItem(
     val unselectedIcon: ImageVector,
     val label: String,
 )
+
+@Composable
+private fun WhispNavRail(activeTabIndex: Int, onSelect: (Int) -> Unit) {
+    val haptics = rememberWhispHaptics()
+    val tabs =
+        listOf(
+            NavTabItem(
+                Icons.Filled.LibraryMusic,
+                Icons.Outlined.LibraryMusic,
+                stringResource(R.string.nav_library),
+            ),
+            NavTabItem(
+                Icons.Filled.Folder,
+                Icons.Outlined.FolderOpen,
+                stringResource(R.string.nav_sources),
+            ),
+            NavTabItem(
+                Icons.Filled.Settings,
+                Icons.Outlined.Settings,
+                stringResource(R.string.nav_settings),
+            ),
+        )
+    Row(Modifier.fillMaxHeight().statusBarsPadding().navigationBarsPadding()) {
+        NavigationRail(
+            containerColor = MaterialTheme.colorScheme.background,
+            contentColor = Cream,
+        ) {
+            Spacer(Modifier.height(16.dp))
+            tabs.forEachIndexed { index, tab ->
+                val selected = activeTabIndex == index
+                NavigationRailItem(
+                    selected = selected,
+                    onClick = {
+                        haptics.tick()
+                        onSelect(index)
+                    },
+                    icon = {
+                        Icon(
+                            if (selected) tab.selectedIcon else tab.unselectedIcon,
+                            contentDescription = tab.label,
+                        )
+                    },
+                    label = { Text(tab.label) },
+                    colors =
+                        NavigationRailItemDefaults.colors(
+                            selectedIconColor = Rose,
+                            selectedTextColor = Rose,
+                            indicatorColor = Rose.copy(alpha = 0.16f),
+                            unselectedIconColor = Muted,
+                            unselectedTextColor = Muted,
+                        ),
+                )
+            }
+        }
+        VerticalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+    }
+}
 
 @Composable
 private fun WhispBottomNav(activeTabIndex: Int, onSelect: (Int) -> Unit) {

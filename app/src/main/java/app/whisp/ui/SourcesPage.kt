@@ -8,6 +8,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -22,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -40,6 +42,7 @@ import app.whisp.data.SourceKind
 import app.whisp.data.WhispImage
 import app.whisp.data.WorkEntity
 import app.whisp.data.kindType
+import app.whisp.system.LanDiscovery
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -600,7 +603,11 @@ private fun RemoteDialog(graph: AppGraph, kind: SourceKind, dismiss: () -> Unit)
     var gid by rememberSaveable(kind) { mutableStateOf("65534") }
     var connecting by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val discoveredServices by
+        remember(context, kind) { LanDiscovery.discover(context, kind) }
+            .collectAsStateWithLifecycle(initialValue = emptyList())
     val title =
         when (kind) {
             SourceKind.SMB -> "SMB"
@@ -618,6 +625,30 @@ private fun RemoteDialog(graph: AppGraph, kind: SourceKind, dismiss: () -> Unit)
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(title, style = MaterialTheme.typography.headlineSmall, color = Cream)
+            if (discoveredServices.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        "发现的局域网设备",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Muted,
+                    )
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(discoveredServices, key = { "${it.name}|${it.host}:${it.port}" }) {
+                            svc ->
+                            AssistChip(
+                                onClick = {
+                                    if (name.isBlank()) name = svc.name
+                                    address = svc.suggestedUrl()
+                                },
+                                label = { Text("${svc.name} (${svc.host})") },
+                                leadingIcon = {
+                                    Icon(Icons.Outlined.Lan, null, Modifier.size(16.dp))
+                                },
+                            )
+                        }
+                    }
+                }
+            }
             OutlinedTextField(
                 name,
                 { name = it },

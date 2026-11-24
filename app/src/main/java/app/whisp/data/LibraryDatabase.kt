@@ -309,6 +309,15 @@ interface LibraryDao {
 
     @Query("SELECT * FROM works") suspend fun allWorks(): List<WorkEntity>
 
+    @Query("SELECT * FROM works WHERE UPPER(rj) = UPPER(:rj) LIMIT 1")
+    suspend fun workByRj(rj: String): WorkEntity?
+
+    @Query("SELECT * FROM works WHERE favorite = 1 ORDER BY addedAt DESC LIMIT :limit")
+    suspend fun favoriteWorks(limit: Int): List<WorkEntity>
+
+    @Query("SELECT * FROM works WHERE offlineAttachments = 1 ORDER BY addedAt DESC LIMIT :limit")
+    suspend fun offlineWorks(limit: Int): List<WorkEntity>
+
     @Query(
         "SELECT EXISTS(SELECT 1 FROM works WHERE coverId = :assetId AND offlineAttachments = 1 AND id != :excludingWork)",
     )
@@ -373,6 +382,18 @@ interface LibraryDao {
     @Query("SELECT * FROM progress ORDER BY updatedAt DESC")
     fun observeProgress(): Flow<List<ProgressEntity>>
 
+    @Query("SELECT * FROM progress ORDER BY updatedAt DESC")
+    suspend fun allProgress(): List<ProgressEntity>
+
+    @Query(
+        """
+        SELECT * FROM progress
+        WHERE EXISTS (SELECT 1 FROM tracks WHERE tracks.workId = progress.workId)
+        ORDER BY updatedAt DESC LIMIT :limit
+        """,
+    )
+    suspend fun recentProgress(limit: Int): List<ProgressEntity>
+
     @Query(
         """
         SELECT * FROM progress
@@ -415,6 +436,9 @@ interface LibraryDao {
 
     @Query("SELECT * FROM bookmarks ORDER BY positionMs")
     fun observeBookmarks(): Flow<List<BookmarkEntity>>
+
+    @Query("SELECT * FROM bookmarks ORDER BY positionMs")
+    suspend fun allBookmarks(): List<BookmarkEntity>
 
     @Query("SELECT * FROM bookmarks WHERE workId = :workId ORDER BY positionMs")
     fun observeBookmarksForWork(workId: String): Flow<List<BookmarkEntity>>

@@ -109,8 +109,18 @@ class MediaSourceRouting(
     private val headersFor: (String) -> Map<String, String>,
     private val storageChanged: () -> Unit,
     streamingCacheMiBUpdates: Flow<Int>,
+    wifiOnlyDownloadsUpdates: Flow<Boolean> = flowOf(true),
     private val messages: MutableSharedFlow<String>,
 ) {
+    companion object {
+        internal fun downloadRequirements(wifiOnly: Boolean): Requirements =
+            Requirements(
+                if (wifiOnly) Requirements.DEVICE_STORAGE_NOT_LOW or Requirements.NETWORK_UNMETERED
+                else Requirements.DEVICE_STORAGE_NOT_LOW,
+            )
+    }
+
+    @Volatile private var currentWifiOnlyDownloads: Boolean = true
     private val streamingEvictor = AdjustableCacheEvictor(Long.MAX_VALUE, storageChanged)
     private val mediaDatabase by lazy { StandaloneDatabaseProvider(context) }
     val downloadCache: SimpleCache by lazy {
@@ -257,7 +267,7 @@ class MediaSourceRouting(
             )
         val configure = {
             manager.maxParallelDownloads = 2
-            manager.requirements = Requirements(Requirements.DEVICE_STORAGE_NOT_LOW)
+            manager.requirements = downloadRequirements(currentWifiOnlyDownloads)
             manager.addListener(
                 object : DownloadManager.Listener {
                     override fun onInitialized(manager: DownloadManager) {
@@ -301,6 +311,12 @@ class MediaSourceRouting(
     init {
         scope.launch {
             streamingCacheMiBUpdates.collect { streamingEvictor.resize(streamingCache, it * MIB) }
+        }
+        scope.launch(Dispatchers.Main.immediate) {
+            wifiOnlyDownloadsUpdates.distinctUntilChanged().collect { wifiOnly ->
+                currentWifiOnlyDownloads = wifiOnly
+                downloadManager.requirements = downloadRequirements(wifiOnly)
+            }
         }
         scope.launch(Dispatchers.Main.immediate) {
             for (ignored in downloadRefresh) {

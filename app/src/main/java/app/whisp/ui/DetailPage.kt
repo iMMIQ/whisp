@@ -1042,14 +1042,16 @@ internal fun WorkDetailScreen(
         InfoDialog(detail, graph, onRemoved = back) { information = false }
     }
     attachment?.let { item ->
-        if (item.kind == "image") {
-            WhispImageLightbox(
-                image = WhispImage.Asset(item.id),
-                title = item.title,
-                onDismiss = { attachment = null },
-            )
-        } else {
-            AttachmentDialog(item, graph) { attachment = null }
+        when {
+            item.kind == "image" ->
+                WhispImageLightbox(
+                    image = WhispImage.Asset(item.id),
+                    title = item.title,
+                    onDismiss = { attachment = null },
+                )
+            item.kind == "document" || item.fileName.endsWith(".pdf", ignoreCase = true) ->
+                PdfViewerDialog(item, graph) { attachment = null }
+            else -> AttachmentDialog(item, graph) { attachment = null }
         }
     }
 }
@@ -1162,7 +1164,7 @@ private fun InfoDialog(
     var loading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val cover =
-        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
             uri?.let {
                 scope.launch {
                     runCatching { graph.offline.setCover(detail.work, it) }
@@ -1239,7 +1241,13 @@ private fun InfoDialog(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 OutlinedButton(
-                    onClick = { cover.launch(arrayOf("image/*")) },
+                    onClick = {
+                        cover.launch(
+                            androidx.activity.result.PickVisualMediaRequest(
+                                ActivityResultContracts.PickVisualMedia.ImageOnly,
+                            ),
+                        )
+                    },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp),
                 ) {

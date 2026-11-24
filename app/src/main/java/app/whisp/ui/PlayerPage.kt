@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.os.SystemClock
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -54,6 +53,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -201,10 +201,42 @@ internal fun PlayerPage(
     var followSignal by remember(track?.id) { mutableIntStateOf(0) }
 
     val context = LocalContext.current
+    val activity = LocalActivity.current
+    val view = LocalView.current
     val density = LocalDensity.current
     val haptics = rememberWhispHaptics()
     val scope = rememberCoroutineScope()
     val reduced = LocalReducedMotion.current
+    val audioOutput by graph.audioDevices.output.collectAsStateWithLifecycle()
+
+    DisposableEffect(activity, view, settings.bedsideDimMode, fullscreen) {
+        val window = activity?.window
+        val originalBrightness = window?.attributes?.screenBrightness
+        val previousKeepOn = view.keepScreenOn
+        if (settings.bedsideDimMode && !fullscreen && window != null) {
+            val lp = window.attributes
+            lp.screenBrightness = 0.01f
+            window.attributes = lp
+            view.keepScreenOn = true
+        }
+        onDispose {
+            if (
+                window != null &&
+                    originalBrightness != null &&
+                    settings.bedsideDimMode &&
+                    !fullscreen
+            ) {
+                val lp = window.attributes
+                if (lp.screenBrightness != originalBrightness) {
+                    lp.screenBrightness = originalBrightness
+                    window.attributes = lp
+                }
+            }
+            if (settings.bedsideDimMode && !fullscreen) {
+                view.keepScreenOn = previousKeepOn
+            }
+        }
+    }
 
     val fallbackPosition =
         remember(workProgress, track?.id) {
@@ -685,6 +717,9 @@ internal fun PlayerPage(
                     onClose = { subtitleTune = false },
                 )
             }
+            if (settings.bedsideDimMode) {
+                Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.28f)))
+            }
         }
     }
 
@@ -740,6 +775,7 @@ internal fun PlayerPage(
             timerEnd = state.timerEnd,
             stopAfterTrack = state.timerStopAfterTrack,
             sleepFadeSeconds = settings.sleepFadeSeconds,
+            shakeExtendTimer = settings.shakeExtendTimer,
             timerStartAnchor = state.timerStartAnchor,
             haptics = haptics,
             onSelectMinutes = playback::setTimer,
@@ -747,6 +783,9 @@ internal fun PlayerPage(
             onStopAfterTrack = playback::setStopAfterTrack,
             onSelectFadeSeconds = { sec ->
                 scope.launch { graph.settings.update { it.copy(sleepFadeSeconds = sec) } }
+            },
+            onToggleShakeExtend = { enabled ->
+                scope.launch { graph.settings.update { it.copy(shakeExtendTimer = enabled) } }
             },
             onJumpToStartAnchor = playback::jumpToTimerStartAnchor,
             onDismiss = { timer = false },
@@ -806,8 +845,13 @@ internal fun PlayerPage(
                     }
                 },
             onCopyCue = {
-                val cm = context.getSystemService(ClipboardManager::class.java)
-                cm?.setPrimaryClip(ClipData.newPlainText("subtitle", cue.text))
+                copyTextWithPrivacy(
+                    context = context,
+                    label = "subtitle",
+                    text = cue.text,
+                    sensitive =
+                        settings.hideArtwork || settings.hideRecents || settings.appLockEnabled,
+                )
                 haptics.tick()
                 graph.messages.tryEmit("已复制台词")
             },
@@ -851,9 +895,16 @@ internal fun PlayerPage(
         PlayerMoreSheet(
             context = context,
             currentSpeed = state.speed,
+            audioOutputLabel = audioOutput.label,
+            bedsideDimMode = settings.bedsideDimMode,
             hasSubtitles = hasAnySubtitles,
             hasSubtitleCandidates = subtitleCandidates.isNotEmpty(),
             onSpeedChange = playback::setPlaybackSpeed,
+            onToggleBedsideDim = {
+                scope.launch {
+                    graph.settings.update { it.copy(bedsideDimMode = !it.bedsideDimMode) }
+                }
+            },
             onOpenDetail = { openDetail(detail.work.id) },
             onSubtitleTune = { subtitleTune = true },
             onSubtitlePicker = { subtitlePicker = true },

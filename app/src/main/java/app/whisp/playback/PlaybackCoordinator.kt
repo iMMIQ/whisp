@@ -3,7 +3,9 @@ package app.whisp.playback
 
 import android.content.ComponentName
 import android.content.Context
+import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.core.net.toUri
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -16,9 +18,12 @@ import androidx.media3.exoplayer.source.ShuffleOrder
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import app.whisp.data.*
+import app.whisp.system.AudioDeviceMonitor
 import app.whisp.ui.PlaybackState
 import app.whisp.ui.SubtitleLoader
+import app.whisp.ui.clock
 import com.google.common.util.concurrent.ListenableFuture
+import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.random.Random
@@ -36,6 +41,7 @@ class PlaybackCoordinator(
     private val library: LibraryStore,
     private val images: WhispImages,
     private val settings: SettingsStore,
+    private val audioDevices: AudioDeviceMonitor,
     private val messages: MutableSharedFlow<String>,
 ) {
     val state = MutableStateFlow(PlaybackState())
@@ -49,7 +55,50 @@ class PlaybackCoordinator(
     val lastClearedLoop = MutableStateFlow<LoopState?>(null)
     val audioOnly = MutableStateFlow(false)
     val error = MutableStateFlow<String?>(null)
+    val speakerGuardPrompt = MutableStateFlow<String?>(null)
     val subtitles = SubtitleLoader(context, scope, library, settings)
+
+    @Volatile private var speakerConfirmedForSession = false
+    private var pendingSpeakerAction: (() -> Unit)? = null
+
+    init {
+        scope.launch {
+            audioDevices.output.collect { snapshot ->
+                if (snapshot.hasExternalOutput) {
+                    speakerConfirmedForSession = false
+                    if (speakerGuardPrompt.value != null) {
+                        speakerGuardPrompt.value = null
+                        pendingSpeakerAction = null
+                    }
+                }
+            }
+        }
+    }
+
+    fun isBlockedBySpeakerGuard(): Boolean =
+        settings.settings.value.speakerGuard &&
+            !speakerConfirmedForSession &&
+            audioDevices.refresh().isBuiltInSpeakerOnly
+
+    private fun guardSpeakerPlayback(action: () -> Unit): Boolean {
+        if (!isBlockedBySpeakerGuard()) return false
+        pendingSpeakerAction = action
+        speakerGuardPrompt.value = "当前音频输出为手机扬声器，确定要外放播放吗？"
+        return true
+    }
+
+    fun confirmSpeakerPlayback() {
+        speakerConfirmedForSession = true
+        speakerGuardPrompt.value = null
+        val pending = pendingSpeakerAction
+        pendingSpeakerAction = null
+        pending?.invoke()
+    }
+
+    fun dismissSpeakerGuard() {
+        speakerGuardPrompt.value = null
+        pendingSpeakerAction = null
+    }
 
     private var activePlayer: ExoPlayer? = null
     private var activeLoop: AbLoopController? = null
@@ -243,6 +292,13 @@ class PlaybackCoordinator(
         restart: Boolean = false,
         startPosition: Long? = null,
     ) {
+        if (
+            guardSpeakerPlayback {
+                playWork(detail, trackId, shuffle, restart, startPosition)
+            }
+        ) {
+            return
+        }
         error.value = null
         bookmarkLoopJob?.cancel()
         bookmarkLoopJob = null
@@ -382,6 +438,7 @@ class PlaybackCoordinator(
         }
         val player = activePlayer
         if (player == null || player.mediaItemCount == 0) {
+            if (guardSpeakerPlayback { togglePlay() }) return
             openJob = scope.launch {
                 val detail = withContext(Dispatchers.IO) { library.latestDetails() }
                 if (detail != null) {
@@ -393,6 +450,7 @@ class PlaybackCoordinator(
         if (player.playWhenReady) {
             player.pause()
         } else {
+            if (guardSpeakerPlayback { togglePlay() }) return
             activeErrorInfo = null
             if (player.playbackState == Player.STATE_ENDED) player.seekTo(0, 0)
             if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
@@ -401,6 +459,115 @@ class PlaybackCoordinator(
             player.play()
         }
     }
+
+    fun togglePlayFromSystem() {
+        val player = activePlayer
+        if (player != null && player.playWhenReady) {
+            player.pause()
+            return
+        }
+        if (isBlockedBySpeakerGuard()) {
+            messages.tryEmit("已开启外放防社死，请连接耳机或打开应用确认")
+            return
+        }
+        if (player == null || player.mediaItemCount == 0) {
+            scope.launch {
+                val detail = withContext(Dispatchers.IO) { library.latestDetails() }
+                if (detail != null) playWork(detail)
+            }
+            return
+        }
+        activeErrorInfo = null
+        if (player.playbackState == Player.STATE_ENDED) player.seekTo(0, 0)
+        if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+            player.prepare()
+        }
+        player.play()
+    }
+
+    fun startSleepTimerFromSystem(minutes: Int) {
+        scope.launch {
+            runCatching { ensurePlayer() }
+            if (minutes <= 0) activeTimer?.setMinutes(0) else activeTimer?.setMinutes(minutes)
+        }
+    }
+
+    fun quickBookmarkCurrent() {
+        val player = activePlayer ?: return
+        val item = player.currentMediaItem ?: return
+        val trackId = item.mediaId
+        val workId = item.mediaMetadata.extras?.getString("workId") ?: return
+        val pos = player.currentPosition.coerceAtLeast(0L)
+        val cues = subtitles.cues.value
+        val offsetMs = settings.subtitleOffsetFor(trackId)
+        val cueIndex = SubtitleTimeline.anchor(cues, (pos - offsetMs).coerceAtLeast(0L))
+        val title =
+            cues.getOrNull(cueIndex)?.text?.takeIf { it.isNotBlank() }
+                ?: item.mediaMetadata.title?.toString()?.takeIf { it.isNotBlank() }
+                ?: clock(pos)
+        scope.launch {
+            library.saveBookmark(
+                BookmarkEntity(
+                    id = UUID.randomUUID().toString(),
+                    workId = workId,
+                    trackId = trackId,
+                    positionMs = pos,
+                    title = title,
+                ),
+            )
+            messages.tryEmit("已保存片段 · ${clock(pos)}")
+        }
+    }
+
+    fun playExternalUri(uri: Uri, mimeType: String? = null) {
+        if (guardSpeakerPlayback { playExternalUri(uri, mimeType) }) return
+        error.value = null
+        openJob?.cancel()
+        openJob = scope.launch {
+            try {
+                val displayName =
+                    withContext(Dispatchers.IO) { resolveDisplayName(uri) }
+                        ?: uri.lastPathSegment
+                        ?: "外部媒体"
+                val player = ensurePlayer()
+                val hide = settings.settingsUpdates.first().hideArtwork
+                val metadata =
+                    MediaMetadata.Builder()
+                        .setTitle(if (hide) "正在收听" else displayName)
+                        .setIsBrowsable(false)
+                        .setIsPlayable(true)
+                        .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                        .build()
+                val item =
+                    MediaItem.Builder()
+                        .setMediaId("external|$uri")
+                        .setUri(uri)
+                        .setMimeType(mimeType ?: MediaFormats.videoMimeType(displayName))
+                        .setMediaMetadata(metadata)
+                        .build()
+                queueSnapshot.clear()
+                activeErrorInfo = null
+                player.shuffleModeEnabled = false
+                player.setMediaItems(listOf(item), 0, 0L)
+                player.prepare()
+                player.play()
+                refreshFromPlayer(player, queueDirty = true)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                reportError(e.message ?: "无法打开外部媒体文件")
+            }
+        }
+    }
+
+    private fun resolveDisplayName(uri: Uri): String? = runCatching {
+        context.contentResolver
+            .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0)?.takeIf { it.isNotBlank() } else null
+            }
+    }
+        .getOrNull()
 
     fun seek(position: Long) {
         val player = activePlayer ?: return

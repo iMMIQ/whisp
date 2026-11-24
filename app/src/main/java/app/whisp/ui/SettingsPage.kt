@@ -2,6 +2,8 @@
 package app.whisp.ui
 
 import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -13,12 +15,15 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.outlined.FileUpload
 import androidx.compose.material.icons.outlined.Storage
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -30,17 +35,24 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import app.whisp.AppGraph
 import app.whisp.R
+import app.whisp.data.LibraryBackup
 import app.whisp.data.StorageUsage
 import app.whisp.data.SupportedSkipSeconds
+import app.whisp.system.AppLockAuthenticator
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val settingsSpeeds = listOf(0.75f, 0.85f, 0.9f, 1.0f, 1.1f, 1.25f, 1.5f, 2.0f)
 
@@ -61,11 +73,70 @@ internal fun SettingsPage(
     reselectTick: Int = 0,
 ) {
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
+    val audioOutput by graph.audioDevices.output.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val haptics = rememberWhispHaptics()
     val listState = rememberLazyListState()
     val lifecycleOwner = LocalLifecycleOwner.current
     var usage by remember { mutableStateOf<StorageUsage?>(null) }
+    var backupBusy by remember { mutableStateOf(false) }
+
+    val exportBackup =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/json"),
+        ) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            backupBusy = true
+            scope.launch {
+                try {
+                    val snapshot = LibraryBackup.exportSnapshot(graph.library, graph.settings)
+                    val encoded = LibraryBackup.encode(snapshot)
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openOutputStream(uri)?.use { out ->
+                            out.write(encoded.toByteArray(Charsets.UTF_8))
+                        } ?: error("无法写入目标文件")
+                    }
+                    haptics.confirm()
+                    graph.messages.tryEmit("本地备份已导出（不含账号凭据）")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    graph.messages.tryEmit(e.message ?: "导出备份失败")
+                } finally {
+                    backupBusy = false
+                }
+            }
+        }
+
+    val importBackup =
+        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            backupBusy = true
+            scope.launch {
+                try {
+                    val raw =
+                        withContext(Dispatchers.IO) {
+                            context.contentResolver.openInputStream(uri)?.use { input ->
+                                input.readBytes().toString(Charsets.UTF_8)
+                            } ?: error("无法读取备份文件")
+                        }
+                    val snapshot = LibraryBackup.decode(raw)
+                    val summary =
+                        LibraryBackup.importSnapshot(snapshot, graph.library, graph.settings)
+                    haptics.confirm()
+                    graph.messages.tryEmit(
+                        "已恢复设置、${summary.restoredProgress} 条进度与 ${summary.restoredBookmarks} 条书签",
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    graph.messages.tryEmit(e.message ?: "恢复备份失败")
+                } finally {
+                    backupBusy = false
+                }
+            }
+        }
 
     LaunchedEffect(reselectTick) {
         if (reselectTick > 0) listState.animateScrollToItem(0)
@@ -240,6 +311,52 @@ internal fun SettingsPage(
                             }
                         },
                     )
+                    if (Build.VERSION.SDK_INT >= 32) {
+                        WhispToggleRow(
+                            label = "保持双耳原声（禁用空间音频重混）",
+                            subtitle = "防止系统空间音频破坏 3Dio / 双耳音声方位感",
+                            checked = settings.preserveBinaural,
+                            tag = "settings-preserve-binaural",
+                            onCheckedChange = { checked ->
+                                scope.launch {
+                                    graph.settings.update { it.copy(preserveBinaural = checked) }
+                                }
+                            },
+                        )
+                    }
+                    WhispToggleRow(
+                        label = "外放防社死拦截",
+                        subtitle = "当前输出：${audioOutput.label} · 未接耳机外放前二次确认",
+                        checked = settings.speakerGuard,
+                        tag = "settings-speaker-guard",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(speakerGuard = checked) }
+                            }
+                        },
+                    )
+                    WhispToggleRow(
+                        label = "按耳机自动切换听感",
+                        subtitle = "自动记忆每副耳机的声道、夜间柔化与精细音量",
+                        checked = settings.autoDeviceAudioProfile,
+                        tag = "settings-device-profile",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(autoDeviceAudioProfile = checked) }
+                            }
+                        },
+                    )
+                    WhispToggleRow(
+                        label = "摇一摇延长助眠定时",
+                        subtitle = "仅在助眠定时期间启用传感器，轻晃手机延长 15 分钟",
+                        checked = settings.shakeExtendTimer,
+                        tag = "settings-shake-timer",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(shakeExtendTimer = checked) }
+                            }
+                        },
+                    )
                 }
             }
             item(key = "section-playback") {
@@ -376,6 +493,70 @@ internal fun SettingsPage(
                             },
                         )
                     }
+                    WhispToggleRow(
+                        label = "应用锁（生物识别 / 锁屏密码）",
+                        subtitle = "启动或切后台超过 30 秒后验证解锁，不影响后台播放",
+                        checked = settings.appLockEnabled,
+                        tag = "settings-app-lock",
+                        onCheckedChange = { checked ->
+                            if (checked && !AppLockAuthenticator.isDeviceSecure(context)) {
+                                graph.messages.tryEmit("请先在系统设置中开启锁屏密码或生物识别")
+                            } else {
+                                scope.launch {
+                                    graph.settings.update { it.copy(appLockEnabled = checked) }
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+            item(key = "section-network-backup") {
+                SettingsGroupCard("网络与数据迁移") {
+                    WhispToggleRow(
+                        label = "仅在 Wi-Fi 下离线下载",
+                        subtitle = "避免无损音声与视频意外消耗移动数据流量",
+                        checked = settings.wifiOnlyDownloads,
+                        tag = "settings-wifi-only-downloads",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(wifiOnlyDownloads = checked) }
+                            }
+                        },
+                    )
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            enabled = !backupBusy,
+                            onClick = {
+                                val stamp =
+                                    SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+                                exportBackup.launch("whisp-backup-$stamp.json")
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Icon(Icons.Outlined.FileUpload, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("导出备份")
+                        }
+                        OutlinedButton(
+                            enabled = !backupBusy,
+                            onClick = { importBackup.launch(arrayOf("application/json", "*/*")) },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Icon(Icons.Outlined.FileDownload, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("恢复备份")
+                        }
+                    }
+                    Text(
+                        "备份包含设置、书签、播放进度与单曲字幕偏移，不含任何 NAS 密码或账号 Cookie",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Muted,
+                    )
                 }
             }
             item(key = "section-storage") {

@@ -40,6 +40,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
@@ -77,6 +79,7 @@ internal fun VideoOutput(
     val player by playback.playerFlow.collectAsStateWithLifecycle()
     val state by playback.state.collectAsStateWithLifecycle()
     val view = LocalView.current
+    val reportBounds = LocalVideoBoundsReporter.current
     var resumed by remember { mutableStateOf(false) }
     val owner = remember { Any() }
     val attached = if (active) player else null
@@ -86,6 +89,7 @@ internal fun VideoOutput(
         onPauseOrDispose {
             resumed = false
             playback.videoVisibility(owner, false)
+            reportBounds(null)
         }
     }
     DisposableEffect(view, resumed, active, playing) {
@@ -94,9 +98,25 @@ internal fun VideoOutput(
         onDispose { view.keepScreenOn = previous }
     }
     Box(
-        modifier.background(Color.Black).testTag("video-output").semantics {
-            contentDescription = "视频画面"
-        },
+        modifier
+            .background(Color.Black)
+            .onGloballyPositioned { coords ->
+                if (resumed && active) {
+                    val b = coords.boundsInWindow()
+                    if (b.width > 1f && b.height > 1f) {
+                        reportBounds(
+                            android.graphics.Rect(
+                                b.left.roundToInt(),
+                                b.top.roundToInt(),
+                                b.right.roundToInt(),
+                                b.bottom.roundToInt(),
+                            ),
+                        )
+                    }
+                }
+            }
+            .testTag("video-output")
+            .semantics { contentDescription = "视频画面" },
     ) {
         key(trackId) {
             PlayerSurface(

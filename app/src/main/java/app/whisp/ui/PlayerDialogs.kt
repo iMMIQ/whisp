@@ -448,12 +448,14 @@ internal fun SleepTimerDialog(
     timerEnd: Long,
     stopAfterTrack: Boolean,
     sleepFadeSeconds: Int = 15,
+    shakeExtendTimer: Boolean = false,
     timerStartAnchor: TimerStartAnchor? = null,
     haptics: WhispHaptics,
     onSelectMinutes: (Int) -> Unit,
     onExtendMinutes: (Int) -> Unit,
     onStopAfterTrack: (Boolean) -> Unit,
     onSelectFadeSeconds: ((Int) -> Unit)? = null,
+    onToggleShakeExtend: ((Boolean) -> Unit)? = null,
     onJumpToStartAnchor: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
@@ -650,6 +652,14 @@ internal fun SleepTimerDialog(
                     )
                 }
             }
+            if (onToggleShakeExtend != null) {
+                WhispToggleRow(
+                    label = "摇一摇延长 15 分钟",
+                    subtitle = "仅定时期间开启低功耗检测，黑暗中闭眼轻晃延长",
+                    checked = shakeExtendTimer,
+                    onCheckedChange = onToggleShakeExtend,
+                )
+            }
             Text(
                 "定时到期前按听觉曲线平滑淡出音量，避免突然中断",
                 style = MaterialTheme.typography.bodySmall,
@@ -830,9 +840,12 @@ internal fun SubtitleActionSheet(
 internal fun PlayerMoreSheet(
     context: Context,
     currentSpeed: Float,
+    audioOutputLabel: String = "切换蓝牙耳机或系统输出设备",
+    bedsideDimMode: Boolean = false,
     hasSubtitles: Boolean,
     hasSubtitleCandidates: Boolean = false,
     onSpeedChange: (Float) -> Unit,
+    onToggleBedsideDim: (() -> Unit)? = null,
     onOpenDetail: () -> Unit,
     onSubtitleTune: () -> Unit,
     onSubtitlePicker: () -> Unit = {},
@@ -934,12 +947,23 @@ internal fun PlayerMoreSheet(
         WhispSheetRow(
             icon = Icons.Outlined.Headphones,
             title = "音频输出",
-            subtitle = "切换蓝牙耳机或系统输出设备",
+            subtitle = "当前：$audioOutputLabel · 点击切换输出设备",
             onClick = {
                 openAudioOutput(context)
                 dismiss()
             },
         )
+        if (onToggleBedsideDim != null) {
+            WhispSheetRow(
+                icon = Icons.Outlined.Bedtime,
+                title = if (bedsideDimMode) "退出床头微光模式" else "床头微光模式",
+                subtitle = "压低屏幕亮度并保持字幕常亮，退出自动恢复",
+                onClick = {
+                    onToggleBedsideDim()
+                    dismiss()
+                },
+            )
+        }
         WhispSheetRow(
             icon = Icons.Outlined.Replay,
             title = "从头播放",
@@ -1482,6 +1506,33 @@ internal fun PlaybackPreferencesDialog(
                 checked = settings.duckOnInterrupt,
                 tag = "audio-duck-interrupt",
                 onCheckedChange = { onUpdateSettings { cur -> cur.copy(duckOnInterrupt = it) } },
+            )
+            if (Build.VERSION.SDK_INT >= 32) {
+                WhispToggleRow(
+                    label = "保持双耳原声（禁用空间音频重混）",
+                    subtitle = "防止系统空间音频破坏双耳录音定位",
+                    checked = settings.preserveBinaural,
+                    tag = "audio-preserve-binaural",
+                    onCheckedChange = {
+                        onUpdateSettings { cur -> cur.copy(preserveBinaural = it) }
+                    },
+                )
+            }
+            WhispToggleRow(
+                label = "外放防社死拦截",
+                subtitle = "未接耳机使用手机外放前二次确认",
+                checked = settings.speakerGuard,
+                tag = "audio-speaker-guard",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(speakerGuard = it) } },
+            )
+            WhispToggleRow(
+                label = "按耳机自动切换听感",
+                subtitle = "自动保存并恢复每副耳机的声道/柔化/音量衰减",
+                checked = settings.autoDeviceAudioProfile,
+                tag = "audio-device-profile",
+                onCheckedChange = {
+                    onUpdateSettings { cur -> cur.copy(autoDeviceAudioProfile = it) }
+                },
             )
             HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
             Text(

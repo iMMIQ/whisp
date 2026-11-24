@@ -21,6 +21,9 @@ import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import app.whisp.MainActivity
 import app.whisp.WhispApp
 import app.whisp.data.ProgressEntity
+import app.whisp.system.SleepShakeDetector
+import app.whisp.system.WhispShortcuts
+import app.whisp.system.WhispWidgetProvider
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -36,7 +39,9 @@ class PlaybackService : MediaLibraryService() {
     companion object {
         const val TIMER = "whisp.timer"
         const val LOOP = "whisp.loop"
-        const val RECENT_ROOT = "whisp.recent"
+        const val QUICK_BOOKMARK = "whisp.quick_bookmark"
+        const val EXTEND_TIMER = "whisp.extend_timer"
+        const val RECENT_ROOT = ResumeCatalog.RECENT_ROOT
         private const val LONG_PAUSE_REWIND_THRESHOLD_MS = 5 * 60_000L
         private const val SMART_RESUME_REWIND_MS = 3_000L
         private const val IDLE_POOL_CLOSE_DELAY_MS = 30_000L
@@ -49,6 +54,7 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var player: ExoPlayer
     private lateinit var loop: AbLoopController
     private lateinit var timer: SleepTimerController
+    private lateinit var shakeDetector: SleepShakeDetector
     private val audioProcessor = WhispAudioProcessor()
     private var session: MediaLibrarySession? = null
     private var currentTrackId: String? = null
@@ -64,6 +70,10 @@ class PlaybackService : MediaLibraryService() {
     private var gaplessPriority: Boolean = false
     private var softFadePauseEnabled: Boolean = true
     private var smartResumeRewindEnabled: Boolean = true
+    private var shakeExtendTimerEnabled: Boolean = false
+    private var autoDeviceProfileEnabled: Boolean = false
+    private var applyingDeviceProfile: Boolean = false
+    private var lastAppliedDeviceKey: String? = null
     private var configuredVolumeGain: Float = 1f
     private var lastAppliedGain: Float = 1f
     private var pausedAtElapsedMs: Long = 0L
@@ -76,6 +86,8 @@ class PlaybackService : MediaLibraryService() {
         gaplessPriority = initialSettings.gaplessPriority
         softFadePauseEnabled = initialSettings.softFadePause
         smartResumeRewindEnabled = initialSettings.smartResumeRewind
+        shakeExtendTimerEnabled = initialSettings.shakeExtendTimer
+        autoDeviceProfileEnabled = initialSettings.autoDeviceAudioProfile
         configuredVolumeGain = initialSettings.volumeGain
         lastAppliedGain = initialSettings.volumeGain
         audioProcessor.swapChannels = initialSettings.swapChannels
@@ -103,7 +115,13 @@ class PlaybackService : MediaLibraryService() {
             ExoPlayer.Builder(this, renderersFactory)
                 .setMediaSourceFactory(mediaSourceFactory)
                 .setLoadControl(WhispLoadControl.create())
-                .setAudioAttributes(buildAudioAttributes(initialSettings.duckOnInterrupt), true)
+                .setAudioAttributes(
+                    buildAudioAttributes(
+                        initialSettings.duckOnInterrupt,
+                        initialSettings.preserveBinaural,
+                    ),
+                    true,
+                )
                 .setHandleAudioBecomingNoisy(true)
                 .setWakeMode(C.WAKE_MODE_LOCAL)
                 .experimentalSetDynamicSchedulingEnabled(true)
@@ -136,19 +154,35 @@ class PlaybackService : MediaLibraryService() {
                     fadeDurationMs = initialSettings.sleepFadeSeconds * 1000L
                 }
         timer.register()
+        shakeDetector =
+            SleepShakeDetector(this) {
+                if (timer.deadlineMs > 0L) {
+                    timer.extendMinutes(15)
+                    graph.messages.tryEmit("摇一摇已延长定时 15 分钟")
+                }
+            }
         applyAudioOffload()
         installPlayerListener()
         session = buildMediaSession()
         updateMediaButtonPreferences()
         graph.playback.attach(player, loop, timer, ::setVideoEnabled, ::setTextEnabled)
         observeSettings()
+        observeAudioOutputProfiles()
+        refreshSystemSurfaces()
     }
 
-    private fun buildAudioAttributes(duckOnInterrupt: Boolean): AudioAttributes =
+    private fun buildAudioAttributes(
+        duckOnInterrupt: Boolean,
+        preserveBinaural: Boolean,
+    ): AudioAttributes =
         AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(
                 if (duckOnInterrupt) C.AUDIO_CONTENT_TYPE_MUSIC else C.AUDIO_CONTENT_TYPE_SPEECH,
+            )
+            .setSpatializationBehavior(
+                if (preserveBinaural) C.SPATIALIZATION_BEHAVIOR_NEVER
+                else C.SPATIALIZATION_BEHAVIOR_AUTO,
             )
             .build()
 
@@ -240,6 +274,14 @@ class PlaybackService : MediaLibraryService() {
                     .setDisplayName("前进${skipSec}秒")
                     .setPlayerCommand(Player.COMMAND_SEEK_FORWARD)
                     .build(),
+                CommandButton.Builder(CommandButton.ICON_BOOKMARK_UNFILLED)
+                    .setDisplayName("保存片段")
+                    .setSessionCommand(SessionCommand(QUICK_BOOKMARK, Bundle.EMPTY))
+                    .build(),
+                CommandButton.Builder(CommandButton.ICON_PLUS)
+                    .setDisplayName("定时+15分")
+                    .setSessionCommand(SessionCommand(EXTEND_TIMER, Bundle.EMPTY))
+                    .build(),
             )
         currentSession.setMediaButtonPreferences(buttons)
     }
@@ -268,6 +310,7 @@ class PlaybackService : MediaLibraryService() {
                     reconcileWakeMode()
                     reconcileIdleConnectionClose()
                     saveProgress()
+                    refreshSystemSurfaces()
                 }
 
                 override fun onIsLoadingChanged(isLoading: Boolean) {
@@ -309,6 +352,7 @@ class PlaybackService : MediaLibraryService() {
                         loop.onTrackTransition()
                         reconcileWakeMode()
                         saveProgress()
+                        refreshSystemSurfaces()
                     }
                 }
 
@@ -377,6 +421,10 @@ class PlaybackService : MediaLibraryService() {
 
                 override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
                     if (playWhenReady) {
+                        if (graph.playback.isBlockedBySpeakerGuard()) {
+                            graph.messages.tryEmit("已开启外放防社死，请连接耳机或打开应用确认")
+                            return Futures.immediateVoidFuture()
+                        }
                         if (player.playbackState == Player.STATE_ENDED) player.seekTo(0, 0)
                         if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0)
                             player.prepare()
@@ -435,6 +483,8 @@ class PlaybackService : MediaLibraryService() {
                                 .buildUpon()
                                 .add(SessionCommand(TIMER, Bundle.EMPTY))
                                 .add(SessionCommand(LOOP, Bundle.EMPTY))
+                                .add(SessionCommand(QUICK_BOOKMARK, Bundle.EMPTY))
+                                .add(SessionCommand(EXTEND_TIMER, Bundle.EMPTY))
                                 .build()
                         return MediaSession.ConnectionResult.AcceptedResultBuilder(
                                 session,
@@ -449,7 +499,12 @@ class PlaybackService : MediaLibraryService() {
                         browser: MediaSession.ControllerInfo,
                         params: LibraryParams?,
                     ): ListenableFuture<LibraryResult<MediaItem>> =
-                        Futures.immediateFuture(LibraryResult.ofItem(recentRoot(), params))
+                        Futures.immediateFuture(
+                            LibraryResult.ofItem(
+                                if (params?.isRecent == true) recentRoot() else libraryRoot(),
+                                params,
+                            ),
+                        )
 
                     override fun onGetChildren(
                         session: MediaLibrarySession,
@@ -459,17 +514,23 @@ class PlaybackService : MediaLibraryService() {
                         pageSize: Int,
                         params: LibraryParams?,
                     ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-                        if (parentId != RECENT_ROOT)
+                        if (
+                            parentId !in
+                                setOf(
+                                    ResumeCatalog.ROOT,
+                                    ResumeCatalog.RECENT_ROOT,
+                                    ResumeCatalog.FAVORITES_ROOT,
+                                    ResumeCatalog.OFFLINE_ROOT,
+                                )
+                        ) {
                             return Futures.immediateFuture(
                                 LibraryResult.ofError(SessionError.ERROR_BAD_VALUE),
                             )
+                        }
                         return scope.ioResult {
-                            val snapshot = if (page == 0) catalog.snapshot() else null
-                            LibraryResult.ofItemList(
-                                if (snapshot == null) emptyList()
-                                else listOf(catalog.recentItem(snapshot)),
-                                params,
-                            )
+                            val items =
+                                if (page == 0) catalog.childrenFor(parentId) else emptyList()
+                            LibraryResult.ofItemList(items, params)
                         }
                     }
 
@@ -477,22 +538,11 @@ class PlaybackService : MediaLibraryService() {
                         session: MediaLibrarySession,
                         browser: MediaSession.ControllerInfo,
                         mediaId: String,
-                    ): ListenableFuture<LibraryResult<MediaItem>> =
-                        if (mediaId == RECENT_ROOT) {
-                            Futures.immediateFuture(LibraryResult.ofItem(recentRoot(), null))
-                        } else {
-                            scope.ioResult {
-                                val snapshot = catalog.snapshot()
-                                if (
-                                    snapshot == null ||
-                                        snapshot.tracks[snapshot.position.index].id != mediaId
-                                ) {
-                                    LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
-                                } else {
-                                    LibraryResult.ofItem(catalog.recentItem(snapshot), null)
-                                }
-                            }
-                        }
+                    ): ListenableFuture<LibraryResult<MediaItem>> = scope.ioResult {
+                        val item = catalog.itemFor(mediaId)
+                        if (item == null) LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
+                        else LibraryResult.ofItem(item, null)
+                    }
 
                     override fun onAddMediaItems(
                         session: MediaSession,
@@ -515,6 +565,12 @@ class PlaybackService : MediaLibraryService() {
                         when (customCommand.customAction) {
                             TIMER -> timer.setMinutes(args.getInt("minutes", 0))
                             LOOP -> loop.set(args.getLong("start", -1), args.getLong("end", -1))
+                            QUICK_BOOKMARK -> graph.playback.quickBookmarkCurrent()
+                            EXTEND_TIMER -> {
+                                val mins = args.getInt("minutes", 15).coerceIn(1, 60)
+                                timer.extendMinutes(mins)
+                                graph.messages.tryEmit("已延长定时 $mins 分钟")
+                            }
                             else ->
                                 return Futures.immediateFuture(
                                     SessionResult(SessionError.ERROR_NOT_SUPPORTED),
@@ -595,6 +651,8 @@ class PlaybackService : MediaLibraryService() {
                         it.softFadePause,
                         it.smartResumeRewind,
                         it.sleepFadeSeconds,
+                        it.shakeExtendTimer,
+                        it.autoDeviceAudioProfile,
                     )
                 }
                 .distinctUntilChanged()
@@ -607,16 +665,20 @@ class PlaybackService : MediaLibraryService() {
                     gaplessPriority = s.gaplessPriority
                     softFadePauseEnabled = s.softFadePause
                     smartResumeRewindEnabled = s.smartResumeRewind
+                    shakeExtendTimerEnabled = s.shakeExtendTimer
+                    autoDeviceProfileEnabled = s.autoDeviceAudioProfile
                     timer.fadeDurationMs = s.sleepFadeSeconds * 1000L
                     applyAudioOffload()
+                    reconcileShakeDetector()
+                    persistActiveDeviceProfileIfNeeded(s)
                 }
         }
         scope.launch {
             graph.settings.settingsUpdates
-                .map { it.duckOnInterrupt }
+                .map { it.duckOnInterrupt to it.preserveBinaural }
                 .distinctUntilChanged()
-                .collect { duck ->
-                    val desired = buildAudioAttributes(duck)
+                .collect { (duck, preserveBinaural) ->
+                    val desired = buildAudioAttributes(duck, preserveBinaural)
                     if (player.audioAttributes != desired) {
                         player.setAudioAttributes(desired, true)
                     }
@@ -637,6 +699,7 @@ class PlaybackService : MediaLibraryService() {
                             player.volume = gain
                         }
                     }
+                    persistActiveDeviceProfileIfNeeded(graph.settings.settings.value)
                 }
         }
         scope.launch {
@@ -701,8 +764,54 @@ class PlaybackService : MediaLibraryService() {
                     val hasRecent =
                         withContext(Dispatchers.IO) { graph.library.dao.latestProgress() != null }
                     session?.notifyChildrenChanged(RECENT_ROOT, if (hasRecent) 1 else 0, null)
+                    session?.notifyChildrenChanged(ResumeCatalog.ROOT, if (hide) 1 else 3, null)
+                    refreshSystemSurfaces()
                 }
         }
+    }
+
+    private fun observeAudioOutputProfiles() {
+        scope.launch {
+            graph.audioDevices.output.collect { output ->
+                if (!autoDeviceProfileEnabled || !output.hasExternalOutput) {
+                    if (!output.hasExternalOutput) lastAppliedDeviceKey = null
+                    return@collect
+                }
+                if (output.deviceKey == lastAppliedDeviceKey) return@collect
+                lastAppliedDeviceKey = output.deviceKey
+                val saved = graph.settings.deviceAudioProfileFor(output.deviceKey)
+                if (saved != null) {
+                    applyingDeviceProfile = true
+                    try {
+                        graph.settings.update { it.applyingDeviceAudioProfile(saved) }
+                    } finally {
+                        applyingDeviceProfile = false
+                    }
+                } else {
+                    persistActiveDeviceProfileIfNeeded(graph.settings.settings.value)
+                }
+            }
+        }
+    }
+
+    private fun persistActiveDeviceProfileIfNeeded(settings: app.whisp.data.Settings) {
+        if (!autoDeviceProfileEnabled || applyingDeviceProfile) return
+        val output = graph.audioDevices.output.value
+        if (!output.hasExternalOutput) return
+        lastAppliedDeviceKey = output.deviceKey
+        val profile = settings.toDeviceAudioProfile()
+        graph.scope.launch { graph.settings.saveDeviceAudioProfile(output.deviceKey, profile) }
+    }
+
+    private fun reconcileShakeDetector() {
+        if (::shakeDetector.isInitialized) {
+            shakeDetector.setActive(shakeExtendTimerEnabled && timer.deadlineMs > 0L)
+        }
+    }
+
+    private fun refreshSystemSurfaces() {
+        WhispWidgetProvider.requestUpdate(this)
+        graph.scope.launch { WhispShortcuts.refresh(this@PlaybackService, graph) }
     }
 
     private fun setVideoEnabled(enabled: Boolean) {
@@ -761,7 +870,9 @@ class PlaybackService : MediaLibraryService() {
             },
         )
         applyAudioOffload()
+        reconcileShakeDetector()
         graph.playback.onControllerStateChanged()
+        refreshSystemSurfaces()
     }
 
     private fun reconcileCheckpoint() {
@@ -811,6 +922,19 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
+    private fun libraryRoot(): MediaItem =
+        MediaItem.Builder()
+            .setMediaId(ResumeCatalog.ROOT)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle("Whisp")
+                    .setIsBrowsable(true)
+                    .setIsPlayable(false)
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                    .build(),
+            )
+            .build()
+
     private fun recentRoot(): MediaItem =
         MediaItem.Builder()
             .setMediaId(RECENT_ROOT)
@@ -836,6 +960,7 @@ class PlaybackService : MediaLibraryService() {
         saveProgress(immediate = true)
         softFadeJob?.cancel()
         idleCloseJob?.cancel()
+        if (::shakeDetector.isInitialized) shakeDetector.release()
         graph.playback.detach(player)
         loop.release()
         timer.release()
@@ -843,6 +968,7 @@ class PlaybackService : MediaLibraryService() {
         session?.release()
         player.release()
         session = null
+        WhispWidgetProvider.requestUpdate(this)
         super.onDestroy()
     }
 }

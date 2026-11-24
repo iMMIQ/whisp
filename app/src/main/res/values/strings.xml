@@ -38,4 +38,13 @@
     <string name="label_text_encoding">字幕与台本编码</string>
     <string name="label_encoding_auto">自动</string>
     <string name="label_smb_compat">允许未加密的局域网共享</string>
+    <string name="tile_sleep_timer">Whisp 定时</string>
+    <string name="tile_resume_playback">Whisp 续播</string>
+    <string name="widget_label">Whisp 夜间播放</string>
+    <string name="widget_description">一键续播与助眠定时，自动遵循隐私伪装设置</string>
+    <string name="widget_default_title">Whisp</string>
+    <string name="widget_default_subtitle">轻触继续收听</string>
+    <string name="widget_action_play">播放</string>
+    <string name="widget_action_timer">定时30分</string>
+    <string name="action_process_text_whisp">在 Whisp 中查找</string>
 </resources>

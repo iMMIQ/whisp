@@ -7,6 +7,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.room.Room
 import app.whisp.data.*
 import app.whisp.playback.PlaybackCoordinator
+import app.whisp.system.AudioDeviceMonitor
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import java.io.File
@@ -33,6 +34,7 @@ class AppGraph(val context: Context) {
 
     val secrets = SecretStore()
     val settings = SettingsStore(context, scope)
+    val audioDevices = AudioDeviceMonitor(context)
     val dlsiteDiagnostics = DlsiteDiagnostics(context)
 
     val http: OkHttpClient =
@@ -129,6 +131,7 @@ class AppGraph(val context: Context) {
                 },
                 storageChanged = { storageChanges.tryEmit(Unit) },
                 streamingCacheMiBUpdates = settings.streamingCacheMiBUpdates,
+                wifiOnlyDownloadsUpdates = settings.wifiOnlyDownloadsUpdates,
                 messages = messages,
             )
         library =
@@ -159,7 +162,16 @@ class AppGraph(val context: Context) {
                 storageChanged = { storageChanges.tryEmit(Unit) },
             )
         offline = OfflineStore(context, library, media, images) { playback.detachTracks(it) }
-        playback = PlaybackCoordinator(context, mainScope, library, images, settings, messages)
+        playback =
+            PlaybackCoordinator(
+                context,
+                mainScope,
+                library,
+                images,
+                settings,
+                audioDevices,
+                messages,
+            )
     }
 }
 
