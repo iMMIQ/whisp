@@ -38,6 +38,7 @@ class PlaybackCoordinator(
 ) {
     val state = MutableStateFlow(PlaybackState())
     val positionMs = MutableStateFlow(0L)
+    val bufferedMs = MutableStateFlow(0L)
     val queueTracks = MutableStateFlow<List<TrackEntity>>(emptyList())
     val openingTrackId = MutableStateFlow<String?>(null)
     val embeddedSubtitle = MutableStateFlow("")
@@ -100,6 +101,7 @@ class PlaybackCoordinator(
         playerFlow.value = null
         state.value = PlaybackState()
         positionMs.value = 0L
+        bufferedMs.value = 0L
         queueTracks.value = emptyList()
         embeddedSubtitle.value = ""
         loopDraftStart.value = -1L
@@ -156,6 +158,8 @@ class PlaybackCoordinator(
             if (player != null) {
                 val pos = player.currentPosition.coerceAtLeast(0L)
                 if (positionMs.value != pos) positionMs.value = pos
+                val buf = player.bufferedPosition.coerceAtLeast(0L)
+                if (bufferedMs.value != buf) bufferedMs.value = buf
             }
             delay(if (state.value.playing) 150L else 500L)
         }
@@ -452,6 +456,8 @@ class PlaybackCoordinator(
         val duration = player.duration.takeIf { it > 0 } ?: 0L
         val pos = player.currentPosition.coerceAtLeast(0L)
         if (positionMs.value != pos) positionMs.value = pos
+        val buf = player.bufferedPosition.coerceAtLeast(0L)
+        if (bufferedMs.value != buf) bufferedMs.value = buf
 
         val currentTracks = player.currentTracks
         val hasVideo =

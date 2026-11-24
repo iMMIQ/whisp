@@ -4,10 +4,15 @@ package app.whisp.ui
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.*
@@ -17,9 +22,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -34,6 +43,7 @@ import androidx.navigationevent.NavigationEvent
 import app.whisp.AppGraph
 import app.whisp.R
 import app.whisp.data.*
+import app.whisp.playback.PlaybackCoordinator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.*
@@ -44,10 +54,10 @@ import kotlinx.coroutines.withContext
 @Composable
 fun WhispRoot(graph: AppGraph, playerRequest: Int = 0) {
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
-    WhispTheme(reduceMotion = settings.reduceMotion) {
+    WhispTheme(reduceMotion = settings.reduceMotion, amoledBlack = settings.amoledBlack) {
+        val bg = MaterialTheme.colorScheme.background
         val sources by graph.library.sourceList.collectAsStateWithLifecycle()
         val state by graph.playback.state.collectAsStateWithLifecycle()
-        val opening by graph.playback.openingTrackId.collectAsStateWithLifecycle()
         val playbackError by graph.playback.error.collectAsStateWithLifecycle()
         val cacheEpoch by graph.images.cacheEpoch.collectAsStateWithLifecycle()
 
@@ -169,71 +179,52 @@ fun WhispRoot(graph: AppGraph, playerRequest: Int = 0) {
                 LocalImageCacheEpoch provides cacheEpoch,
             ) {
                 Scaffold(
-                    containerColor = Ink,
-                    snackbarHost = { SnackbarHost(snackbar) },
+                    containerColor = bg,
+                    contentWindowInsets = WindowInsets(0, 0, 0, 0),
+                    snackbarHost = {
+                        SnackbarHost(snackbar) { data ->
+                            Snackbar(
+                                snackbarData = data,
+                                containerColor = MaterialTheme.colorScheme.inverseSurface,
+                                contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+                                actionColor = MaterialTheme.colorScheme.inversePrimary,
+                                shape = RoundedCornerShape(14.dp),
+                            )
+                        }
+                    },
                     bottomBar = {
                         AnimatedVisibility(
                             !isPlayerRoute,
-                            enter = fadeIn(tween(if (settings.reduceMotion) 100 else 280)),
-                            exit = fadeOut(tween(if (settings.reduceMotion) 100 else 280)),
+                            enter = fadeIn(tween(if (settings.reduceMotion) 100 else 240)),
+                            exit = fadeOut(tween(if (settings.reduceMotion) 100 else 200)),
                         ) {
                             CompositionLocalProvider(LocalArtworkVisibility provides this) {
-                                Column(Modifier.background(Ink).navigationBarsPadding()) {
+                                Column(
+                                    Modifier.fillMaxWidth().background(bg).navigationBarsPadding(),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                ) {
                                     if (current != null && currentTrack != null) {
                                         MiniPlayer(
                                             detail = current,
                                             track = currentTrack,
                                             state = state,
+                                            playback = graph.playback,
                                             onToggle = graph.playback::togglePlay,
                                             shareCover = miniTransition,
                                             onClick = { push(WhispRoute.Player) },
                                         )
                                     }
-                                    val tabs =
-                                        listOf(
-                                            Triple<WhispRoute, _, String>(
-                                                WhispRoute.Library,
-                                                Icons.Outlined.LibraryMusic,
-                                                stringResource(R.string.nav_library),
-                                            ),
-                                            Triple(
-                                                WhispRoute.Favorites,
-                                                Icons.Outlined.FavoriteBorder,
-                                                stringResource(R.string.nav_favorites),
-                                            ),
-                                            Triple(
-                                                WhispRoute.Sources,
-                                                Icons.Outlined.FolderOpen,
-                                                stringResource(R.string.nav_sources),
-                                            ),
-                                        )
-                                    Row(
-                                        Modifier.fillMaxWidth()
-                                            .padding(horizontal = 32.dp, vertical = 2.dp),
-                                        horizontalArrangement = Arrangement.SpaceAround,
-                                    ) {
-                                        tabs.forEach { (target, icon, text) ->
-                                            TextButton(
-                                                onClick = {
-                                                    stack.clear()
-                                                    stack.add(target)
-                                                },
-                                                colors =
-                                                    ButtonDefaults.textButtonColors(
-                                                        contentColor =
-                                                            if (route == target) Rose else Muted,
-                                                    ),
-                                            ) {
-                                                Column(
-                                                    horizontalAlignment =
-                                                        Alignment.CenterHorizontally,
-                                                ) {
-                                                    Icon(icon, text, Modifier.size(22.dp))
-                                                    Text(text, fontSize = 12.sp)
-                                                }
-                                            }
-                                        }
-                                    }
+                                    HorizontalDivider(
+                                        thickness = 0.5.dp,
+                                        color = MaterialTheme.colorScheme.outlineVariant,
+                                    )
+                                    WhispBottomNav(
+                                        currentRoute = route,
+                                        onSelect = { target ->
+                                            stack.clear()
+                                            stack.add(target)
+                                        },
+                                    )
                                 }
                             }
                         }
@@ -242,23 +233,33 @@ fun WhispRoot(graph: AppGraph, playerRequest: Int = 0) {
                     NavDisplay(
                         backStack = stack,
                         onBack = { if (stack.size > 1) stack.removeAt(stack.lastIndex) },
-                        modifier =
-                            Modifier.fillMaxSize()
-                                .padding(top = padding.calculateTopPadding())
-                                .consumeWindowInsets(
-                                    PaddingValues(top = padding.calculateTopPadding()),
-                                ),
+                        modifier = Modifier.fillMaxSize(),
                         transitionSpec = {
-                            fadeIn(tween(if (settings.reduceMotion) 100 else 280)) togetherWith
-                                fadeOut(tween(if (settings.reduceMotion) 100 else 180))
+                            if (settings.reduceMotion) {
+                                fadeIn(tween(100)) togetherWith fadeOut(tween(100))
+                            } else if (targetState.key is WhispRoute.Player) {
+                                (fadeIn(tween(260)) +
+                                    slideInVertically(tween(260, easing = FastOutSlowInEasing)) {
+                                        it / 14
+                                    }) togetherWith fadeOut(tween(180))
+                            } else {
+                                fadeIn(tween(260)) togetherWith fadeOut(tween(170))
+                            }
                         },
                         popTransitionSpec = {
-                            fadeIn(
-                                tween(
-                                    if (settings.reduceMotion) 100 else 190,
-                                    delayMillis = if (settings.reduceMotion) 0 else 90,
-                                ),
-                            ) togetherWith fadeOut(tween(if (settings.reduceMotion) 100 else 90))
+                            if (settings.reduceMotion) {
+                                fadeIn(tween(100)) togetherWith fadeOut(tween(100))
+                            } else if (initialState.key is WhispRoute.Player) {
+                                fadeIn(tween(190, delayMillis = 60)) togetherWith
+                                    (fadeOut(tween(140)) +
+                                        slideOutVertically(
+                                            tween(200, easing = FastOutSlowInEasing),
+                                        ) {
+                                            it / 12
+                                        })
+                            } else {
+                                fadeIn(tween(190, delayMillis = 90)) togetherWith fadeOut(tween(90))
+                            }
                         },
                         predictivePopTransitionSpec = { edge ->
                             if (settings.reduceMotion) {
@@ -303,7 +304,7 @@ fun WhispRoot(graph: AppGraph, playerRequest: Int = 0) {
                                     ) {
                                         Box(
                                             Modifier.fillMaxSize()
-                                                .background(Ink)
+                                                .background(bg)
                                                 .padding(
                                                     bottom =
                                                         if (destination is WhispRoute.Player) 0.dp
@@ -377,6 +378,7 @@ fun WhispRoot(graph: AppGraph, playerRequest: Int = 0) {
                                             online = { push(WhispRoute.AsmrOne(it), destination) },
                                             dlsite = { push(WhispRoute.Dlsite(it), destination) },
                                             storage = { push(WhispRoute.Storage, destination) },
+                                            openWork = { push(WhispRoute.Detail(it), destination) },
                                         )
                                     }
                                 }
@@ -447,51 +449,183 @@ fun WhispRoot(graph: AppGraph, playerRequest: Int = 0) {
     }
 }
 
+private data class NavTabItem(
+    val route: WhispRoute,
+    val selectedIcon: ImageVector,
+    val unselectedIcon: ImageVector,
+    val label: String,
+)
+
+@Composable
+private fun WhispBottomNav(currentRoute: WhispRoute, onSelect: (WhispRoute) -> Unit) {
+    val reduced = LocalReducedMotion.current
+    val tabs =
+        listOf(
+            NavTabItem(
+                WhispRoute.Library,
+                Icons.Filled.LibraryMusic,
+                Icons.Outlined.LibraryMusic,
+                stringResource(R.string.nav_library),
+            ),
+            NavTabItem(
+                WhispRoute.Favorites,
+                Icons.Filled.Favorite,
+                Icons.Outlined.FavoriteBorder,
+                stringResource(R.string.nav_favorites),
+            ),
+            NavTabItem(
+                WhispRoute.Sources,
+                Icons.Filled.Folder,
+                Icons.Outlined.FolderOpen,
+                stringResource(R.string.nav_sources),
+            ),
+        )
+    Row(
+        Modifier.widthIn(max = 520.dp).fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        tabs.forEach { tab ->
+            val selected = currentRoute == tab.route
+            val tint by
+                animateColorAsState(
+                    if (selected) Rose else Muted,
+                    tween(if (reduced) 0 else 160),
+                    label = "nav-tint",
+                )
+            val pill by
+                animateColorAsState(
+                    if (selected) Rose.copy(alpha = 0.16f) else Color.Transparent,
+                    tween(if (reduced) 0 else 160),
+                    label = "nav-pill",
+                )
+            Column(
+                Modifier.weight(1f)
+                    .clip(RoundedCornerShape(14.dp))
+                    .clickable { onSelect(tab.route) }
+                    .padding(vertical = 4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box(
+                    Modifier.clip(RoundedCornerShape(16.dp))
+                        .background(pill)
+                        .padding(horizontal = 18.dp, vertical = 4.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        if (selected) tab.selectedIcon else tab.unselectedIcon,
+                        tab.label,
+                        tint = tint,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    tab.label,
+                    color = tint,
+                    fontSize = 11.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun MiniPlayer(
     detail: WorkDetails,
     track: TrackEntity,
     state: PlaybackState,
+    playback: PlaybackCoordinator,
     onToggle: () -> Unit,
     shareCover: Boolean,
     onClick: () -> Unit,
 ) {
-    Row(
+    val shape = RoundedCornerShape(18.dp)
+    var dragAccumulator by remember { mutableFloatStateOf(0f) }
+    Column(
         Modifier.testTag("mini-player")
-            .padding(horizontal = 16.dp, vertical = 5.dp)
-            .clip(RoundedCornerShape(18.dp))
-            .background(Surface)
+            .widthIn(max = 560.dp)
             .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(7.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .padding(horizontal = 14.dp, vertical = 6.dp)
+            .clip(shape)
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+            .pointerInput(onClick) {
+                detectVerticalDragGestures(
+                    onDragStart = { dragAccumulator = 0f },
+                    onDragEnd = {
+                        if (dragAccumulator < -48.dp.toPx()) onClick()
+                        dragAccumulator = 0f
+                    },
+                    onDragCancel = { dragAccumulator = 0f },
+                    onVerticalDrag = { _, dragAmount -> dragAccumulator += dragAmount },
+                )
+            }
+            .clickable(onClick = onClick),
     ) {
-        Artwork(
-            image = detail.work.coverId?.let { WhispImage.Asset(it) },
-            description = null,
-            modifier = Modifier.size(46.dp).clip(RoundedCornerShape(11.dp)),
-            sharedKey = detail.work.id.takeIf { shareCover },
-        )
-        Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-            Text(
-                shortTitle(detail.work.title),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                fontSize = 14.sp,
+        Row(
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 6.dp, top = 7.dp, bottom = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Artwork(
+                image = detail.work.coverId?.let { WhispImage.Asset(it) },
+                description = null,
+                modifier = Modifier.size(46.dp).clip(RoundedCornerShape(11.dp)),
+                sharedKey = detail.work.id.takeIf { shareCover },
             )
-            Text(
-                track.title,
-                color = Muted,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                fontSize = 12.sp,
-            )
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text(
+                    shortTitle(detail.work.title).ifBlank { detail.work.title },
+                    style = MaterialTheme.typography.titleSmall,
+                    color = Cream,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    track.title,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Muted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            }
+            Box(contentAlignment = Alignment.Center) {
+                IconAction(
+                    if (state.playWhenReady) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                    playControlLabel(state),
+                    Rose,
+                    action = onToggle,
+                )
+                if (state.buffering) {
+                    CircularProgressIndicator(
+                        Modifier.size(34.dp),
+                        color = Rose,
+                        trackColor = Rose.copy(alpha = 0.2f),
+                        strokeWidth = 2.dp,
+                    )
+                }
+            }
         }
-        IconAction(
-            if (state.playWhenReady) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-            playControlLabel(state),
-            Rose,
-            action = onToggle,
-        )
+        MiniPlayerProgressBar(track = track, state = state, playback = playback)
+    }
+}
+
+@Composable
+private fun MiniPlayerProgressBar(
+    track: TrackEntity,
+    state: PlaybackState,
+    playback: PlaybackCoordinator,
+) {
+    val livePos by playback.positionMs.collectAsStateWithLifecycle()
+    val duration =
+        state.durationMs.takeIf { state.trackId == track.id && it > 0 } ?: track.durationMs
+    val position = if (state.trackId == track.id) livePos else state.positionMs
+    if (duration > 0) {
+        val fraction = (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+        Box(Modifier.fillMaxWidth().height(2.dp).background(Raised.copy(alpha = 0.7f))) {
+            Box(Modifier.fillMaxHeight().fillMaxWidth(fraction).background(Rose))
+        }
     }
 }

@@ -8,20 +8,28 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.*
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import app.whisp.data.DlsiteLoginRequired
 import app.whisp.data.DlsiteSession
+import app.whisp.ui.Cream
+import app.whisp.ui.Ink
+import app.whisp.ui.Muted
 import app.whisp.ui.WhispTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -73,6 +81,10 @@ class DlsiteLoginActivity : ComponentActivity() {
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false)
         val restoredBrowser = savedInstanceState?.getBundle(BROWSER_STATE)
@@ -84,29 +96,56 @@ class DlsiteLoginActivity : ComponentActivity() {
         setContent {
             WhispTheme {
                 Scaffold(
+                    containerColor = MaterialTheme.colorScheme.background,
                     topBar = {
-                        Row(Modifier.statusBarsPadding().fillMaxWidth().padding(8.dp)) {
-                            IconButton(onClick = { finish() }) {
-                                Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回")
+                        Column(
+                            Modifier.fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.background),
+                        ) {
+                            Row(
+                                Modifier.statusBarsPadding()
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                IconButton(onClick = { finish() }) {
+                                    Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回", tint = Cream)
+                                }
+                                Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
+                                    Text(
+                                        "DLsite 登录",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = Cream,
+                                    )
+                                    Text(
+                                        "login.dlsite.com",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Muted,
+                                    )
+                                }
+                                TextButton(enabled = !checking, onClick = { verify(true) }) {
+                                    Text("完成")
+                                }
                             }
-                            Column(Modifier.weight(1f).padding(8.dp)) {
-                                Text("DLsite 登录", style = MaterialTheme.typography.titleMedium)
-                                Text(
-                                    "login.dlsite.com",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            }
-                            TextButton(enabled = !checking, onClick = { verify(true) }) {
-                                Text("完成")
-                            }
+                            HorizontalDivider(
+                                thickness = 0.5.dp,
+                                color = MaterialTheme.colorScheme.outlineVariant,
+                            )
                         }
                     },
                 ) { padding ->
                     Column(Modifier.fillMaxSize().padding(padding)) {
                         if (checking) LinearProgressIndicator(Modifier.fillMaxWidth())
                         error?.let {
-                            Row(Modifier.fillMaxWidth().padding(12.dp)) {
-                                Text(it, Modifier.weight(1f))
+                            Row(
+                                Modifier.fillMaxWidth().padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    it,
+                                    Modifier.weight(1f),
+                                    color = MaterialTheme.colorScheme.error,
+                                )
                                 TextButton(
                                     onClick = {
                                         error = null
@@ -123,6 +162,7 @@ class DlsiteLoginActivity : ComponentActivity() {
                                 factory = { context ->
                                     WebView(context).apply {
                                         browser = this
+                                        setBackgroundColor(Ink.toArgb())
                                         settings.javaScriptEnabled = true
                                         settings.domStorageEnabled = true
                                         settings.allowFileAccess = false
@@ -196,6 +236,7 @@ class DlsiteLoginActivity : ComponentActivity() {
                 if (socialLogin)
                     AlertDialog(
                         onDismissRequest = { socialLogin = false },
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                         title = { Text("使用 viviON ID 登录") },
                         text = { Text("在 DLsite 账号管理中设置登录 ID 和密码，然后返回登录。") },
                         confirmButton = {

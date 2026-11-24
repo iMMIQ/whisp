@@ -3,23 +3,26 @@ package app.whisp.ui
 
 import android.content.Context
 import android.os.Build
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.Repeat
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -27,6 +30,7 @@ import app.whisp.R
 import app.whisp.data.*
 import app.whisp.playback.PlaybackCoordinator
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.roundToInt
 
 private val playbackSpeeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
@@ -62,12 +66,22 @@ internal fun PlayerQueueSheet(
     onDismiss: () -> Unit,
 ) {
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
-        Text(
-            stringResource(R.string.action_queue),
-            fontFamily = FontFamily.Serif,
-            fontSize = 24.sp,
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
-        )
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                stringResource(R.string.action_queue),
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                "${queueTracks.size} 曲",
+                style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                color = Muted,
+            )
+        }
         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 500.dp).navigationBarsPadding()) {
             items(queueTracks, key = { it.id }) { item ->
                 TrackRow(item, item.id == activeTrackId) {
@@ -100,28 +114,40 @@ internal fun PlayerFragmentsSheet(
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
         Text(
             stringResource(R.string.action_fragments),
-            fontFamily = FontFamily.Serif,
-            fontSize = 24.sp,
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+            style = MaterialTheme.typography.headlineSmall,
+            color = Cream,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp),
         )
         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 500.dp).navigationBarsPadding()) {
             item(key = "loop-controls") {
                 Column(
                     Modifier.padding(horizontal = 24.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     if (state.loopStart >= 0 || markA >= 0) {
-                        Text(
-                            if (state.loopStart >= 0)
-                                "${clock(state.loopStart)} — ${clock(state.loopEnd)}"
-                            else "起点 ${clock(markA)}",
-                            color = Rose,
-                            fontSize = 18.sp,
-                        )
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Rose.copy(alpha = 0.12f))
+                                .border(0.5.dp, Rose.copy(alpha = 0.25f), RoundedCornerShape(12.dp))
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                if (state.loopStart >= 0)
+                                    "${clock(state.loopStart)} — ${clock(state.loopEnd)}"
+                                else "起点 ${clock(markA)}",
+                                color = Rose,
+                                style =
+                                    MaterialTheme.typography.titleMedium.merge(TabularNumeralStyle),
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(onClick = playback::clearLoop) { Text("取消循环") }
+                        }
                     }
                     Row(
                         Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         OutlinedButton(
                             onClick = {
@@ -130,6 +156,7 @@ internal fun PlayerFragmentsSheet(
                             },
                             enabled = shownTrack != null,
                             modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(14.dp),
                         ) {
                             Text("设起点")
                         }
@@ -137,12 +164,10 @@ internal fun PlayerFragmentsSheet(
                             onClick = { if (playback.markLoopEnd()) haptics.confirm() },
                             enabled = shownTrack != null && markA >= 0,
                             modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(14.dp),
                         ) {
                             Text("设终点")
                         }
-                    }
-                    if (state.loopStart >= 0 || markA >= 0) {
-                        TextButton(onClick = playback::clearLoop) { Text("取消循环") }
                     }
                     FilledTonalButton(
                         onClick = {
@@ -163,15 +188,23 @@ internal fun PlayerFragmentsSheet(
                         },
                         enabled = shownTrack != null,
                         modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
                     ) {
+                        Icon(Icons.Outlined.BookmarkAdd, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
                         Text("保存当前位置")
                     }
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(6.dp))
                 }
             }
             if (saved.isEmpty()) {
                 item(key = "empty-fragments") {
-                    Text("暂无片段", color = Muted, modifier = Modifier.padding(24.dp))
+                    Text(
+                        "暂无片段",
+                        color = Muted,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
+                    )
                 }
             }
             items(saved, key = { it.id }) { item ->
@@ -184,10 +217,16 @@ internal fun PlayerFragmentsSheet(
                         .padding(horizontal = 24.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(clock(item.positionMs), color = Rose)
+                    Text(
+                        clock(item.positionMs),
+                        color = Rose,
+                        style = MaterialTheme.typography.labelLarge.merge(TabularNumeralStyle),
+                    )
                     Text(
                         item.title,
                         Modifier.weight(1f).padding(horizontal = 14.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Cream,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
@@ -213,38 +252,70 @@ internal fun SleepTimerDialog(
     onSelectMinutes: (Int) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = Surface,
-        title = { Text(stringResource(R.string.action_sleep_timer)) },
-        text = {
-            Column {
-                listOf(15, 30, 60, 90).forEach { minutes ->
-                    TextButton(
-                        onClick = {
-                            onSelectMinutes(minutes)
-                            haptics.confirm()
-                            onDismiss()
-                        },
-                        Modifier.fillMaxWidth(),
-                    ) {
-                        Text("$minutes 分钟")
-                    }
+    val remainingMin =
+        if (timerEnd > 0L)
+            ceil(((timerEnd - System.currentTimeMillis()).coerceAtLeast(0L)) / 60_000.0).toInt()
+        else 0
+    WhispSheet(onDismissRequest = onDismiss) { dismiss ->
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 24.dp).navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    stringResource(R.string.action_sleep_timer),
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = Cream,
+                    modifier = Modifier.weight(1f),
+                )
+                if (remainingMin > 0) {
+                    Text(
+                        "剩余约 $remainingMin 分钟",
+                        style = MaterialTheme.typography.labelLarge.merge(TabularNumeralStyle),
+                        color = Rose,
+                    )
                 }
-                if (timerEnd > 0) {
-                    TextButton(
-                        onClick = {
-                            onSelectMinutes(0)
-                            onDismiss()
-                        },
-                    ) {
-                        Text("取消定时")
+            }
+            val presets = listOf(15, 30, 60, 90)
+            presets.chunked(2).forEach { rowItems ->
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    rowItems.forEach { minutes ->
+                        FilledTonalButton(
+                            onClick = {
+                                onSelectMinutes(minutes)
+                                haptics.confirm()
+                                dismiss()
+                            },
+                            modifier = Modifier.weight(1f).height(48.dp),
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            Text(
+                                "$minutes 分钟",
+                                style =
+                                    MaterialTheme.typography.titleSmall.merge(TabularNumeralStyle),
+                            )
+                        }
                     }
                 }
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-    )
+            if (timerEnd > 0) {
+                OutlinedButton(
+                    onClick = {
+                        onSelectMinutes(0)
+                        dismiss()
+                    },
+                    modifier = Modifier.fillMaxWidth().height(46.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text("取消定时", color = MaterialTheme.colorScheme.error)
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+    }
 }
 
 @Composable
@@ -257,7 +328,7 @@ internal fun SaveBookmarkDialog(
     var title by remember(draft) { mutableStateOf(draft.title) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = Surface,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
         title = { Text("保存片段") },
         text = { OutlinedTextField(title, { title = it }, label = { Text("名称") }) },
         confirmButton = {
@@ -285,35 +356,47 @@ internal fun SubtitleActionSheet(
     onDismiss: () -> Unit,
 ) {
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
-        Text(
-            cue.text,
-            fontSize = subtitleSize.sp,
-            lineHeight = (subtitleSize + 10).sp,
-            modifier =
-                Modifier.padding(horizontal = 24.dp, vertical = 16.dp)
-                    .heightIn(max = 180.dp)
-                    .verticalScroll(rememberScrollState()),
-        )
-        TextButton(
+        Column(
+            Modifier.fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 8.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerLow)
+                .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+                .padding(16.dp),
+        ) {
+            Text(
+                clock(cue.startMs),
+                style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                color = Rose,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                cue.text,
+                color = Cream,
+                fontSize = subtitleSize.sp,
+                lineHeight = (subtitleSize + 10).sp,
+                modifier = Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState()),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        WhispSheetRow(
+            icon = Icons.Outlined.PlayArrow,
+            title = "从这里播放",
+            enabled = canSeek,
             onClick = {
                 onPlayFromHere()
                 dismiss()
             },
-            enabled = canSeek,
-            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
-        ) {
-            Text("从这里播放")
-        }
-        TextButton(
+        )
+        WhispSheetRow(
+            icon = Icons.Outlined.BookmarkAdd,
+            title = "保存这句",
             onClick = {
                 onSaveCue()
                 dismiss()
             },
-            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
-        ) {
-            Text("保存这句")
-        }
-        Spacer(Modifier.navigationBarsPadding())
+        )
+        Spacer(Modifier.navigationBarsPadding().height(8.dp))
     }
 }
 
@@ -326,24 +409,43 @@ internal fun PlayerMoreSheet(
     onDismiss: () -> Unit,
 ) {
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
-        listOf(
-                "精确跳转" to onPreciseSeek,
-                "音频输出" to { openAudioOutput(context) },
-                stringResource(R.string.label_playback_settings) to onPreferences,
-                "从头播放" to onRestart,
-            )
-            .forEach { (label, action) ->
-                TextButton(
-                    onClick = {
-                        action()
-                        dismiss()
-                    },
-                    Modifier.fillMaxWidth().heightIn(min = 56.dp),
-                ) {
-                    Text(label, fontSize = 17.sp)
-                }
-            }
-        Spacer(Modifier.navigationBarsPadding())
+        WhispSheetRow(
+            icon = Icons.Outlined.Tune,
+            title = stringResource(R.string.label_playback_settings),
+            subtitle = "倍速、字幕、外观与隐私",
+            onClick = {
+                onPreferences()
+                dismiss()
+            },
+        )
+        WhispSheetRow(
+            icon = Icons.Outlined.AvTimer,
+            title = "精确跳转",
+            subtitle = "在当前位置前后 30 秒内按秒微调",
+            onClick = {
+                onPreciseSeek()
+                dismiss()
+            },
+        )
+        WhispSheetRow(
+            icon = Icons.Outlined.Headphones,
+            title = "音频输出",
+            subtitle = "切换蓝牙耳机或系统输出设备",
+            onClick = {
+                openAudioOutput(context)
+                dismiss()
+            },
+        )
+        WhispSheetRow(
+            icon = Icons.Outlined.Replay,
+            title = "从头播放",
+            subtitle = "回到作品首曲开头重新收听",
+            onClick = {
+                onRestart()
+                dismiss()
+            },
+        )
+        Spacer(Modifier.navigationBarsPadding().height(8.dp))
     }
 }
 
@@ -363,21 +465,25 @@ internal fun PreciseSeekDialog(
         remember(trackId) { (initial + 30_000).coerceAtMost(duration).coerceAtLeast(start + 1) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = Surface,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
         title = { Text("精确跳转") },
         text = {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(clock(target), fontSize = 28.sp, color = Rose)
+                Text(
+                    clock(target),
+                    style = MaterialTheme.typography.headlineLarge.merge(TabularNumeralStyle),
+                    color = Rose,
+                )
                 SyncedSlider(
                     target.toFloat(),
                     start.toFloat()..end.toFloat(),
                     onValueChange = { target = it.toLong() },
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    OutlinedButton(onClick = { target = (target - 1000).coerceAtLeast(start) }) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    FilledTonalButton(onClick = { target = (target - 1000).coerceAtLeast(start) }) {
                         Text("−1 秒")
                     }
-                    OutlinedButton(onClick = { target = (target + 1000).coerceAtMost(end) }) {
+                    FilledTonalButton(onClick = { target = (target + 1000).coerceAtMost(end) }) {
                         Text("+1 秒")
                     }
                 }
@@ -406,85 +512,148 @@ internal fun PlaybackPreferencesDialog(
     onUpdateSettings: ((Settings) -> Settings) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = Surface,
-        title = { Text(stringResource(R.string.label_playback_settings)) },
-        text = {
-            Column(
-                Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
-            ) {
-                Text(stringResource(R.string.label_playback_speed))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(playbackSpeeds, key = { it }) { speed ->
-                        val label =
-                            if (speed == 1.0f) "1x" else if (speed == 2.0f) "2x" else "${speed}x"
-                        FilterChip(
-                            selected = abs(currentSpeed - speed) < 0.01f,
-                            onClick = { onSpeedChange(speed) },
-                            label = { Text(label, fontSize = 13.sp) },
-                        )
-                    }
-                }
-                Text("字幕字号")
-                SyncedSlider(
-                    settings.subtitleSize.toFloat(),
-                    16f..30f,
-                    steps = 13,
-                    onValueChange = { value ->
-                        onUpdateSettings { it.copy(subtitleSize = value.roundToInt()) }
-                    },
-                )
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("字幕偏移")
-                    Text("${settings.subtitleOffsetMs} ms", color = Muted)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    OutlinedButton(
-                        onClick = {
-                            onUpdateSettings {
-                                it.copy(subtitleOffsetMs = it.subtitleOffsetMs - 250)
-                            }
+    WhispSheet(onDismissRequest = onDismiss) { dismiss ->
+        Row(
+            Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                stringResource(R.string.label_playback_settings),
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = dismiss) {
+                Text("完成", fontWeight = FontWeight.SemiBold)
+            }
+        }
+        Column(
+            Modifier.fillMaxWidth()
+                .weight(1f, fill = false)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp)
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                stringResource(R.string.label_playback_speed),
+                style = MaterialTheme.typography.labelLarge,
+                color = Muted,
+            )
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(playbackSpeeds, key = { it }) { speed ->
+                    val label =
+                        if (speed == 1.0f) "1x" else if (speed == 2.0f) "2x" else "${speed}x"
+                    FilterChip(
+                        selected = abs(currentSpeed - speed) < 0.01f,
+                        onClick = { onSpeedChange(speed) },
+                        label = {
+                            Text(
+                                label,
+                                style =
+                                    MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                            )
                         },
-                    ) {
-                        Text("−250")
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            onUpdateSettings {
-                                it.copy(subtitleOffsetMs = it.subtitleOffsetMs + 250)
-                            }
-                        },
-                    ) {
-                        Text("+250")
-                    }
-                }
-                Text(stringResource(R.string.label_text_encoding))
-                EncodingChips(
-                    selected = settings.textEncoding,
-                    onSelect = { encoding ->
-                        onUpdateSettings { it.copy(textEncoding = encoding) }
-                    },
-                )
-                SettingToggleRow("隐藏通知封面与标题", settings.hideArtwork, "notification-privacy") {
-                    onUpdateSettings { current -> current.copy(hideArtwork = it) }
-                }
-                if (Build.VERSION.SDK_INT >= 33) {
-                    SettingToggleRow("隐藏最近任务预览", settings.hideRecents, "recents-privacy") {
-                        onUpdateSettings { current -> current.copy(hideRecents = it) }
-                    }
-                }
-                SettingToggleRow("触觉反馈", settings.touchFeedback, "touch-feedback") {
-                    onUpdateSettings { current -> current.copy(touchFeedback = it) }
-                }
-                SettingToggleRow("减少动态效果", settings.reduceMotion, "reduce-motion") {
-                    onUpdateSettings { current -> current.copy(reduceMotion = it) }
+                    )
                 }
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
-    )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "字幕字号",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Muted,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    "样例 · ${settings.subtitleSize}sp",
+                    color = Cream,
+                    fontSize = settings.subtitleSize.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            SyncedSlider(
+                settings.subtitleSize.toFloat(),
+                16f..30f,
+                steps = 13,
+                onValueChange = { value ->
+                    onUpdateSettings { it.copy(subtitleSize = value.roundToInt()) }
+                },
+            )
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("字幕偏移", style = MaterialTheme.typography.labelLarge, color = Muted)
+                    Text(
+                        "${settings.subtitleOffsetMs} ms",
+                        style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                        color = if (settings.subtitleOffsetMs != 0L) Rose else Muted,
+                    )
+                }
+                OutlinedButton(
+                    onClick = {
+                        onUpdateSettings { it.copy(subtitleOffsetMs = it.subtitleOffsetMs - 250) }
+                    },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                ) {
+                    Text(
+                        "−250",
+                        style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                    )
+                }
+                if (settings.subtitleOffsetMs != 0L) {
+                    TextButton(
+                        onClick = { onUpdateSettings { it.copy(subtitleOffsetMs = 0L) } },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                    ) {
+                        Text("归零")
+                    }
+                }
+                OutlinedButton(
+                    onClick = {
+                        onUpdateSettings { it.copy(subtitleOffsetMs = it.subtitleOffsetMs + 250) }
+                    },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                ) {
+                    Text(
+                        "+250",
+                        style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                    )
+                }
+            }
+            Text(
+                stringResource(R.string.label_text_encoding),
+                style = MaterialTheme.typography.labelLarge,
+                color = Muted,
+            )
+            EncodingChips(
+                selected = settings.textEncoding,
+                onSelect = { encoding -> onUpdateSettings { it.copy(textEncoding = encoding) } },
+            )
+            HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+            SettingToggleRow("隐藏通知封面与标题", settings.hideArtwork, "notification-privacy") {
+                onUpdateSettings { current -> current.copy(hideArtwork = it) }
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                SettingToggleRow("隐藏最近任务预览", settings.hideRecents, "recents-privacy") {
+                    onUpdateSettings { current -> current.copy(hideRecents = it) }
+                }
+            }
+            SettingToggleRow("触觉反馈", settings.touchFeedback, "touch-feedback") {
+                onUpdateSettings { current -> current.copy(touchFeedback = it) }
+            }
+            SettingToggleRow("减少动态效果", settings.reduceMotion, "reduce-motion") {
+                onUpdateSettings { current -> current.copy(reduceMotion = it) }
+            }
+            SettingToggleRow("深夜纯黑背景", settings.amoledBlack, "amoled-black") {
+                onUpdateSettings { current -> current.copy(amoledBlack = it) }
+            }
+            Spacer(Modifier.height(10.dp))
+        }
+    }
 }
 
 @Composable
@@ -494,8 +663,16 @@ private fun SettingToggleRow(
     tag: String,
     onCheckedChange: (Boolean) -> Unit,
 ) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f))
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 1.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = Cream,
+            modifier = Modifier.weight(1f),
+        )
         Switch(checked, onCheckedChange = onCheckedChange, modifier = Modifier.testTag(tag))
     }
 }

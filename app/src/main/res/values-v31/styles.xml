@@ -1,0 +1,11 @@
+<resources>
+    <style name="Theme.Whisp" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#17101F</item>
+        <item name="android:colorAccent">#EE9EBE</item>
+        <item name="android:windowSplashScreenBackground">#17101F</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_whisp_fg</item>
+    </style>
+</resources>

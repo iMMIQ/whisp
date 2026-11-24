@@ -2,10 +2,18 @@
 package app.whisp.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -14,9 +22,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.QueueMusic
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.*
@@ -25,13 +35,21 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -44,6 +62,8 @@ import app.whisp.data.*
 import app.whisp.playback.PlaybackCoordinator
 import java.util.UUID
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** Subtitle auto-scroll policy: animate only single-step transitions while visible. */
@@ -63,6 +83,7 @@ internal fun PlayerPage(
     graph: AppGraph,
     back: () -> Unit,
 ) {
+    val bg = MaterialTheme.colorScheme.background
     val playback = graph.playback
     val state by playback.state.collectAsStateWithLifecycle()
     val cues by playback.subtitles.cues.collectAsStateWithLifecycle()
@@ -90,6 +111,7 @@ internal fun PlayerPage(
     val context = LocalContext.current
     val haptics = rememberWhispHaptics()
     val scope = rememberCoroutineScope()
+    val reduced = LocalReducedMotion.current
 
     val fallbackPosition =
         remember(history, track?.id) {
@@ -100,16 +122,37 @@ internal fun PlayerPage(
     }
     val shownTrack = track?.takeIf { it.id == state.trackId && opening == null }
     if (detail == null || track == null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxSize().statusBarsPadding(), contentAlignment = Alignment.Center) {
             IconAction(Icons.AutoMirrored.Outlined.ArrowBack, "返回", action = back)
         }
         return
     }
+
+    val coverImage =
+        remember(detail.work.coverId) { detail.work.coverId?.let { WhispImage.Asset(it) } }
+    var ambientSeed by
+        remember(detail.work.coverId) {
+            mutableStateOf(cachedAmbientColor(coverImage?.diskKey) ?: RoseContainer)
+        }
+    val ambient by
+        animateColorAsState(
+            ambientSeed,
+            tween(if (reduced) 0 else 420, easing = FastOutSlowInEasing),
+            label = "player-ambient",
+        )
+
     val video =
         if (state.trackId == track.id && state.tracksKnown) state.hasVideo else track.isVideo
     val showVideo = video && !audioOnly && (shownTrack != null || opening != null)
     LaunchedEffect(showVideo) { if (!showVideo) fullscreen = false }
     BackHandler(fullscreen && showVideo) { fullscreen = false }
+
+    val hasAnySubtitles =
+        cues.isNotEmpty() ||
+            loading ||
+            subtitleError != null ||
+            (track.subtitleId == null && embeddedSubtitle.isNotBlank() && state.trackId == track.id)
+    val coverFocusMode = !showVideo && !hasAnySubtitles
 
     if (fullscreen && showVideo) {
         val timeline = playback.positionMs.collectAsStateWithLifecycle()
@@ -154,30 +197,31 @@ internal fun PlayerPage(
             },
         )
     } else {
-        BoxWithConstraints(Modifier.fillMaxSize().navigationBarsPadding()) {
+        BoxWithConstraints(
+            Modifier.fillMaxSize()
+                .background(bg)
+                .drawBehind {
+                    drawRect(
+                        brush =
+                            Brush.radialGradient(
+                                colors = listOf(ambient.copy(alpha = 0.34f), Color.Transparent),
+                                center = Offset(size.width * 0.5f, size.height * 0.18f),
+                                radius = maxOf(size.width, size.height) * 0.72f,
+                            ),
+                    )
+                }
+                .navigationBarsPadding(),
+        ) {
             val width = maxWidth
             val height = maxHeight
-            val cover: @Composable (Modifier) -> Unit = { mod ->
-                PlayerCover(
+            val onToggleFavorite: () -> Unit = {
+                scope.launch { graph.library.toggleFavorite(detail.work.id) }
+            }
+            val controls: @Composable (Modifier, Boolean) -> Unit = { mod, showTrackHeader ->
+                PlayerControls(
                     detail = detail,
                     track = track,
-                    state = state,
-                    shownTrack = shownTrack,
-                    video = video,
-                    showVideo = showVideo,
-                    audioOnly = audioOnly,
-                    playback = playback,
-                    onToggleFavorite = {
-                        scope.launch { graph.library.toggleFavorite(detail.work.id) }
-                    },
-                    back = back,
-                    onFullscreen = { fullscreen = true },
-                    modifier = mod,
-                )
-            }
-            val controls: @Composable (Modifier) -> Unit = { mod ->
-                PlayerControls(
-                    track = track,
+                    coverImage = coverImage,
                     state = state,
                     shownTrack = shownTrack,
                     opening = opening,
@@ -189,7 +233,11 @@ internal fun PlayerPage(
                     markA = markA,
                     fallbackPosition = fallbackPosition,
                     hasQueue = queueTracks.isNotEmpty(),
+                    coverFocusMode = coverFocusMode && width <= height,
+                    showTrackHeader = showTrackHeader,
+                    video = video,
                     playback = playback,
+                    onAmbientColor = { ambientSeed = it },
                     onSelectSubtitle = { subtitleAction = it },
                     onBookmarkCue = { cue ->
                         bookmark = BookmarkDraft.fromCue(track.id, cue, settings.subtitleOffsetMs)
@@ -197,29 +245,86 @@ internal fun PlayerPage(
                     onOpenQueue = { queue = true },
                     onOpenFragments = { fragments = true },
                     onOpenTimer = { timer = true },
+                    onOpenPreferences = { preferences = true },
                     onOpenMore = { more = true },
                     modifier = mod,
                 )
             }
             if (width > height) {
                 Row(Modifier.fillMaxSize()) {
-                    cover(Modifier.fillMaxHeight().width(width * if (showVideo) .55f else .38f))
-                    controls(Modifier.weight(1f).fillMaxHeight())
+                    if (showVideo) {
+                        PlayerCover(
+                            detail = detail,
+                            coverImage = coverImage,
+                            track = track,
+                            state = state,
+                            shownTrack = shownTrack,
+                            video = video,
+                            showVideo = true,
+                            audioOnly = audioOnly,
+                            playback = playback,
+                            onToggleFavorite = onToggleFavorite,
+                            onAmbientColor = { ambientSeed = it },
+                            back = back,
+                            onFullscreen = { fullscreen = true },
+                            modifier = Modifier.fillMaxHeight().width(width * .55f),
+                        )
+                    } else {
+                        LandscapeCoverPane(
+                            detail = detail,
+                            coverImage = coverImage,
+                            video = video,
+                            audioOnly = audioOnly,
+                            playback = playback,
+                            onToggleFavorite = onToggleFavorite,
+                            onAmbientColor = { ambientSeed = it },
+                            back = back,
+                            modifier = Modifier.fillMaxHeight().width(width * .40f),
+                        )
+                    }
+                    controls(Modifier.weight(1f).fillMaxHeight().statusBarsPadding(), true)
                 }
             } else {
                 Column(Modifier.fillMaxSize()) {
-                    cover(
-                        Modifier.fillMaxWidth()
-                            .height(
-                                if (showVideo)
-                                    minOf(
-                                        width / state.videoAspectRatio.coerceIn(.5f, 3f),
-                                        height * .43f,
-                                    )
-                                else height * .29f,
-                            ),
-                    )
-                    controls(Modifier.weight(1f).fillMaxWidth())
+                    if (coverFocusMode) {
+                        PlayerTopBar(
+                            favorite = detail.work.favorite,
+                            video = video,
+                            audioOnly = audioOnly,
+                            onToggleAudioOnly = { playback.setAudioOnly(!audioOnly) },
+                            onToggleFavorite = onToggleFavorite,
+                            back = back,
+                            overlayBackdrop = false,
+                        )
+                        controls(Modifier.weight(1f).fillMaxWidth(), false)
+                    } else {
+                        PlayerCover(
+                            detail = detail,
+                            coverImage = coverImage,
+                            track = track,
+                            state = state,
+                            shownTrack = shownTrack,
+                            video = video,
+                            showVideo = showVideo,
+                            audioOnly = audioOnly,
+                            playback = playback,
+                            onToggleFavorite = onToggleFavorite,
+                            onAmbientColor = { ambientSeed = it },
+                            back = back,
+                            onFullscreen = { fullscreen = true },
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .height(
+                                        if (showVideo)
+                                            minOf(
+                                                width / state.videoAspectRatio.coerceIn(.5f, 3f),
+                                                height * .43f,
+                                            )
+                                        else height * .30f,
+                                    ),
+                        )
+                        controls(Modifier.weight(1f).fillMaxWidth(), true)
+                    }
                 }
             }
         }
@@ -329,8 +434,116 @@ internal fun PlayerPage(
 }
 
 @Composable
+private fun PlayerTopBar(
+    favorite: Boolean,
+    video: Boolean,
+    audioOnly: Boolean,
+    onToggleAudioOnly: () -> Unit,
+    onToggleFavorite: () -> Unit,
+    back: () -> Unit,
+    overlayBackdrop: Boolean,
+) {
+    CompositionLocalProvider(LocalCoverControls provides overlayBackdrop) {
+        Row(
+            Modifier.fillMaxWidth()
+                .statusBarsPadding()
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconAction(
+                Icons.Outlined.KeyboardArrowDown,
+                stringResource(R.string.action_collapse_player),
+                action = back,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                if (video) {
+                    IconAction(
+                        if (audioOnly) Icons.Outlined.Videocam else Icons.Outlined.Headphones,
+                        if (audioOnly) "显示画面" else "只听声音",
+                        action = onToggleAudioOnly,
+                    )
+                }
+                IconAction(
+                    if (favorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                    stringResource(R.string.action_favorite),
+                    if (favorite) Rose else Cream,
+                    enabled = true,
+                    feedback = true,
+                    action = onToggleFavorite,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LandscapeCoverPane(
+    detail: WorkDetails,
+    coverImage: WhispImage?,
+    video: Boolean,
+    audioOnly: Boolean,
+    playback: PlaybackCoordinator,
+    onToggleFavorite: () -> Unit,
+    onAmbientColor: (Color) -> Unit,
+    back: () -> Unit,
+    modifier: Modifier,
+) {
+    Column(modifier.padding(bottom = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        PlayerTopBar(
+            favorite = detail.work.favorite,
+            video = video,
+            audioOnly = audioOnly,
+            onToggleAudioOnly = { playback.setAudioOnly(!audioOnly) },
+            onToggleFavorite = onToggleFavorite,
+            back = back,
+            overlayBackdrop = false,
+        )
+        Column(
+            Modifier.weight(1f).padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            val shape = RoundedCornerShape(20.dp)
+            Artwork(
+                image = coverImage,
+                description = detail.work.title,
+                modifier =
+                    Modifier.fillMaxWidth()
+                        .aspectRatio(1.25f)
+                        .clip(shape)
+                        .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, shape),
+                sharedKey = detail.work.id.takeUnless { video },
+                onAmbientColor = onAmbientColor,
+            )
+            Spacer(Modifier.height(14.dp))
+            Text(
+                shortTitle(detail.work.title).ifBlank { detail.work.title },
+                style = MaterialTheme.typography.titleLarge,
+                color = Cream,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (detail.work.artist.isNotBlank()) {
+                Text(
+                    detail.work.artist,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Muted,
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun PlayerCover(
     detail: WorkDetails,
+    coverImage: WhispImage?,
     track: TrackEntity,
     state: PlaybackState,
     shownTrack: TrackEntity?,
@@ -339,11 +552,26 @@ private fun PlayerCover(
     audioOnly: Boolean,
     playback: PlaybackCoordinator,
     onToggleFavorite: () -> Unit,
+    onAmbientColor: (Color) -> Unit,
     back: () -> Unit,
     onFullscreen: () -> Unit,
     modifier: Modifier,
 ) {
-    Box(modifier.background(Surface)) {
+    val bg = MaterialTheme.colorScheme.background
+    var dragDistance by remember { mutableFloatStateOf(0f) }
+    Box(
+        modifier.background(MaterialTheme.colorScheme.surface).pointerInput(back) {
+            detectVerticalDragGestures(
+                onDragStart = { dragDistance = 0f },
+                onDragEnd = {
+                    if (dragDistance > 72.dp.toPx()) back()
+                    dragDistance = 0f
+                },
+                onDragCancel = { dragDistance = 0f },
+                onVerticalDrag = { _, delta -> dragDistance += delta },
+            )
+        },
+    ) {
         if (showVideo) {
             VideoOutput(
                 playback = playback,
@@ -354,72 +582,117 @@ private fun PlayerCover(
             )
         } else {
             Artwork(
-                image = detail.work.coverId?.let { WhispImage.Asset(it) },
+                image = coverImage,
                 description = detail.work.title,
                 modifier = Modifier.matchParentSize(),
                 sharedKey = detail.work.id.takeUnless { video },
+                onAmbientColor = onAmbientColor,
             )
         }
         Box(
             Modifier.matchParentSize()
                 .background(
-                    Brush.verticalGradient(listOf(Ink.copy(alpha = .12f), Color.Transparent, Ink)),
+                    Brush.verticalGradient(
+                        0.0f to bg.copy(alpha = .44f),
+                        0.32f to Color.Transparent,
+                        0.66f to bg.copy(alpha = .58f),
+                        1.0f to bg,
+                    ),
                 ),
         )
-        CompositionLocalProvider(LocalCoverControls provides true) {
-            Row(
-                Modifier.fillMaxWidth().padding(8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                IconAction(
-                    Icons.Outlined.KeyboardArrowDown,
-                    stringResource(R.string.action_collapse_player),
-                    action = back,
-                )
-                Row {
-                    if (video) {
-                        IconAction(
-                            if (audioOnly) Icons.Outlined.Videocam else Icons.Outlined.Headphones,
-                            if (audioOnly) "显示画面" else "只听声音",
-                        ) {
-                            playback.setAudioOnly(!audioOnly)
-                        }
-                    }
-                    IconAction(
-                        if (detail.work.favorite) Icons.Outlined.Favorite
-                        else Icons.Outlined.FavoriteBorder,
-                        stringResource(R.string.action_favorite),
-                        if (detail.work.favorite) Rose else Cream,
-                        enabled = true,
-                        feedback = true,
-                        action = onToggleFavorite,
-                    )
-                }
-            }
-        }
+        PlayerTopBar(
+            favorite = detail.work.favorite,
+            video = video,
+            audioOnly = audioOnly,
+            onToggleAudioOnly = { playback.setAudioOnly(!audioOnly) },
+            onToggleFavorite = onToggleFavorite,
+            back = back,
+            overlayBackdrop = true,
+        )
         Text(
-            shortTitle(detail.work.title),
-            fontSize = 25.sp,
-            lineHeight = 32.sp,
-            fontFamily = FontFamily.Serif,
+            shortTitle(detail.work.title).ifBlank { detail.work.title },
+            style = MaterialTheme.typography.headlineSmall,
+            color = Cream,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
             modifier =
                 Modifier.align(Alignment.BottomStart)
                     .padding(
-                        start = 24.dp,
-                        end = if (showVideo) 64.dp else 24.dp,
+                        start = 22.dp,
+                        end = if (showVideo) 64.dp else 22.dp,
                         top = 12.dp,
-                        bottom = 12.dp,
+                        bottom = 10.dp,
                     ),
         )
         if (showVideo) {
-            Box(Modifier.align(Alignment.BottomEnd).padding(8.dp)) {
-                IconAction(Icons.Outlined.Fullscreen, "全屏", enabled = shownTrack != null) {
-                    onFullscreen()
+            CompositionLocalProvider(LocalCoverControls provides true) {
+                Box(Modifier.align(Alignment.BottomEnd).padding(8.dp)) {
+                    IconAction(Icons.Outlined.Fullscreen, "全屏", enabled = shownTrack != null) {
+                        onFullscreen()
+                    }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun CoverFocusPane(
+    detail: WorkDetails,
+    track: TrackEntity,
+    coverImage: WhispImage?,
+    video: Boolean,
+    onAmbientColor: (Color) -> Unit,
+    modifier: Modifier,
+) {
+    val trackTitle = (if (track.order < 9999) "%02d · ".format(track.order) else "") + track.title
+    Column(
+        modifier.testTag("subtitle-pane").padding(horizontal = 28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        val shape = RoundedCornerShape(22.dp)
+        Artwork(
+            image = coverImage,
+            description = detail.work.title,
+            modifier =
+                Modifier.widthIn(max = 360.dp)
+                    .fillMaxWidth()
+                    .aspectRatio(1.25f)
+                    .clip(shape)
+                    .border(0.5.dp, Cream.copy(alpha = 0.14f), shape),
+            sharedKey = detail.work.id.takeUnless { video },
+            onAmbientColor = onAmbientColor,
+        )
+        Spacer(Modifier.height(22.dp))
+        Text(
+            shortTitle(detail.work.title).ifBlank { detail.work.title },
+            style = MaterialTheme.typography.headlineSmall,
+            color = Cream,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (detail.work.artist.isNotBlank()) {
+            Text(
+                detail.work.artist,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Muted,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        Text(
+            trackTitle,
+            style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+            color = Rose.copy(alpha = 0.88f),
+            textAlign = TextAlign.Center,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 10.dp),
+        )
     }
 }
 
@@ -444,10 +717,12 @@ private fun PlayerSubtitles(
             embeddedSubtitle.isNotBlank() &&
             activeTrackId == track.id
     ) {
-        Box(modifier.padding(24.dp), contentAlignment = Alignment.Center) {
+        Box(modifier.testTag("subtitle-pane").padding(24.dp), contentAlignment = Alignment.Center) {
             Text(
                 embeddedSubtitle,
+                color = Cream,
                 fontSize = settings.subtitleSize.sp,
+                lineHeight = (settings.subtitleSize + 10).sp,
                 textAlign = TextAlign.Center,
             )
         }
@@ -490,13 +765,18 @@ private fun PlayerTimeline(
     playback: PlaybackCoordinator,
 ) {
     val timeline = playback.positionMs.collectAsStateWithLifecycle()
+    val buffered = playback.bufferedMs.collectAsStateWithLifecycle()
     var dragging by remember(track.id) { mutableStateOf<Long?>(null) }
+    var fineBounds by remember(track.id) { mutableStateOf<LongRange?>(null) }
     val duration =
         state.durationMs.takeIf { state.trackId == track.id && it > 0 } ?: track.durationMs
     val positionProvider: () -> Long = {
         if (state.trackId == track.id) timeline.value else fallbackPosition
     }
-    Column(Modifier.padding(horizontal = 25.dp)) {
+    val bufferedProvider: () -> Long = {
+        if (state.trackId == track.id) buffered.value else 0L
+    }
+    Column(Modifier.padding(horizontal = 18.dp)) {
         key(track.id) {
             PrecisionSeekBar(
                 positionProvider = positionProvider,
@@ -506,18 +786,101 @@ private fun PlayerTimeline(
                 loopEnd = state.loopEnd,
                 onPreview = { dragging = it },
                 onSeek = playback::seek,
+                bufferedProvider = bufferedProvider,
+                onFineBounds = { fineBounds = it },
             )
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(clock(dragging ?: positionProvider()), color = Muted, fontSize = 12.sp)
-            Text(clock(duration), color = Muted, fontSize = 12.sp)
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            val leftLabel =
+                fineBounds?.let { clock(it.first) } ?: clock(dragging ?: positionProvider())
+            val rightLabel = fineBounds?.let { clock(it.last) } ?: clock(duration)
+            Text(
+                leftLabel,
+                color = if (fineBounds != null) Rose.copy(alpha = 0.8f) else Muted,
+                style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+            )
+            Text(
+                rightLabel,
+                color = if (fineBounds != null) Rose.copy(alpha = 0.8f) else Muted,
+                style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+            )
         }
     }
 }
 
 @Composable
+private fun ActiveModifiersRow(
+    state: PlaybackState,
+    markA: Long,
+    onOpenPreferences: () -> Unit,
+    onOpenTimer: () -> Unit,
+    onOpenFragments: () -> Unit,
+) {
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(state.timerEnd) {
+        if (state.timerEnd > 0L) {
+            while (true) {
+                nowMs = System.currentTimeMillis()
+                delay(15_000L)
+            }
+        }
+    }
+    val showSpeed = abs(state.speed - 1f) > 0.01f
+    val remainingMin =
+        if (state.timerEnd > nowMs) ceil((state.timerEnd - nowMs) / 60_000.0).toInt() else 0
+    val showTimer = state.timerEnd > 0L && remainingMin > 0
+    val showLoop = state.loopStart >= 0L || markA >= 0L
+    if (!showSpeed && !showTimer && !showLoop) return
+
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (showSpeed) {
+            val speedText =
+                if (state.speed == 2.0f) "2x"
+                else if (state.speed == 1.0f) "1x" else "${state.speed}x"
+            StatusPill(text = speedText, onClick = onOpenPreferences)
+        }
+        if (showLoop) {
+            val text =
+                if (state.loopStart >= 0L) "A–B ${clock(state.loopStart)}–${clock(state.loopEnd)}"
+                else "A ${clock(markA)}"
+            StatusPill(text = text, onClick = onOpenFragments)
+        }
+        if (showTimer) {
+            StatusPill(text = "定时 ${remainingMin}分", onClick = onOpenTimer)
+        }
+    }
+}
+
+@Composable
+private fun StatusPill(text: String, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(999.dp)
+    Box(
+        Modifier.clip(shape)
+            .background(Rose.copy(alpha = 0.14f))
+            .border(0.5.dp, Rose.copy(alpha = 0.30f), shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 3.dp),
+    ) {
+        Text(
+            text,
+            color = Rose,
+            style = MaterialTheme.typography.labelSmall.merge(TabularNumeralStyle),
+        )
+    }
+}
+
+@Composable
 private fun PlayerControls(
+    detail: WorkDetails,
     track: TrackEntity,
+    coverImage: WhispImage?,
     state: PlaybackState,
     shownTrack: TrackEntity?,
     opening: String?,
@@ -529,12 +892,17 @@ private fun PlayerControls(
     markA: Long,
     fallbackPosition: Long,
     hasQueue: Boolean,
+    coverFocusMode: Boolean,
+    showTrackHeader: Boolean,
+    video: Boolean,
     playback: PlaybackCoordinator,
+    onAmbientColor: (Color) -> Unit,
     onSelectSubtitle: (Cue) -> Unit,
     onBookmarkCue: (Cue) -> Unit,
     onOpenQueue: () -> Unit,
     onOpenFragments: () -> Unit,
     onOpenTimer: () -> Unit,
+    onOpenPreferences: () -> Unit,
     onOpenMore: () -> Unit,
     modifier: Modifier,
 ) {
@@ -547,27 +915,49 @@ private fun PlayerControls(
             Player.REPEAT_MODE_ONE -> stringResource(R.string.action_repeat_one)
             else -> stringResource(R.string.action_repeat_off)
         }
+    val reduced = LocalReducedMotion.current
     Column(modifier) {
-        Text(
-            (if (track.order < 9999) "%02d · ".format(track.order) else "") + track.title,
-            fontSize = 16.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 26.dp, vertical = 8.dp),
-        )
-        PlayerSubtitles(
-            track = track,
-            activeTrackId = state.trackId,
-            cues = cues,
-            loading = loading,
-            subtitleError = subtitleError,
-            embeddedSubtitle = embeddedSubtitle,
-            settings = settings,
-            fallbackPosition = fallbackPosition,
-            playback = playback,
-            onSelect = onSelectSubtitle,
-            onBookmark = onBookmarkCue,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
+        if (showTrackHeader) {
+            Text(
+                (if (track.order < 9999) "%02d · ".format(track.order) else "") + track.title,
+                style = MaterialTheme.typography.titleMedium.merge(TabularNumeralStyle),
+                color = Cream.copy(alpha = 0.92f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp),
+            )
+        }
+        if (coverFocusMode) {
+            CoverFocusPane(
+                detail = detail,
+                track = track,
+                coverImage = coverImage,
+                video = video,
+                onAmbientColor = onAmbientColor,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+            )
+        } else {
+            PlayerSubtitles(
+                track = track,
+                activeTrackId = state.trackId,
+                cues = cues,
+                loading = loading,
+                subtitleError = subtitleError,
+                embeddedSubtitle = embeddedSubtitle,
+                settings = settings,
+                fallbackPosition = fallbackPosition,
+                playback = playback,
+                onSelect = onSelectSubtitle,
+                onBookmark = onBookmarkCue,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+            )
+        }
+        ActiveModifiersRow(
+            state = state,
+            markA = markA,
+            onOpenPreferences = onOpenPreferences,
+            onOpenTimer = onOpenTimer,
+            onOpenFragments = onOpenFragments,
         )
         PlayerTimeline(
             track = track,
@@ -578,7 +968,7 @@ private fun PlayerControls(
             playback = playback,
         )
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 7.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
@@ -598,33 +988,59 @@ private fun PlayerControls(
             Box(contentAlignment = Alignment.Center) {
                 val interaction = remember { MutableInteractionSource() }
                 val pressed by interaction.collectIsPressedAsState()
-                val reduced = LocalReducedMotion.current
                 val scale by
                     animateFloatAsState(
                         if (pressed && !reduced) .92f else 1f,
                         tween(90),
                         label = "play-press",
                     )
+                val glowAlpha by
+                    animateFloatAsState(
+                        if (state.playing) 0.22f else 0f,
+                        tween(if (reduced) 0 else 280),
+                        label = "play-glow",
+                    )
+                if (glowAlpha > 0.01f) {
+                    Box(
+                        Modifier.size(74.dp)
+                            .clip(CircleShape)
+                            .background(
+                                Brush.radialGradient(
+                                    listOf(Rose.copy(alpha = glowAlpha), Color.Transparent),
+                                ),
+                            ),
+                    )
+                }
                 FilledIconButton(
                     onClick = playback::togglePlay,
                     modifier = Modifier.size(62.dp),
                     shape = CircleShape,
                     interactionSource = interaction,
                 ) {
-                    Icon(
-                        if (state.playWhenReady) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                        playControlLabel(state),
-                        Modifier.size(32.dp).graphicsLayer {
-                            scaleX = scale
-                            scaleY = scale
+                    AnimatedContent(
+                        targetState = state.playWhenReady,
+                        transitionSpec = {
+                            if (reduced) fadeIn(tween(0)) togetherWith fadeOut(tween(0))
+                            else fadeIn(tween(120)) togetherWith fadeOut(tween(90))
                         },
-                    )
+                        label = "play-pause-icon",
+                    ) { playing ->
+                        Icon(
+                            if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            playControlLabel(state),
+                            Modifier.size(32.dp).graphicsLayer {
+                                scaleX = scale
+                                scaleY = scale
+                            },
+                        )
+                    }
                 }
                 if (state.buffering) {
                     CircularProgressIndicator(
-                        Modifier.size(66.dp),
+                        Modifier.size(70.dp),
                         color = Rose,
-                        strokeWidth = 1.dp,
+                        trackColor = Rose.copy(alpha = 0.18f),
+                        strokeWidth = 2.5.dp,
                     )
                 }
             }
@@ -643,7 +1059,7 @@ private fun PlayerControls(
             )
         }
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 14.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -676,7 +1092,7 @@ private fun PlayerControls(
             IconAction(
                 Icons.Outlined.MoreHoriz,
                 stringResource(R.string.action_more_playback),
-                Muted,
+                if (abs(state.speed - 1f) > 0.01f) Rose else Muted,
                 action = onOpenMore,
             )
         }
@@ -725,11 +1141,26 @@ private fun SubtitlePane(
         if (cues.isEmpty()) {
             if (loading)
                 CircularProgressIndicator(Modifier.size(24.dp), color = Rose, strokeWidth = 2.dp)
-            else if (error != null) TextButton(onClick = onRetry) { Text("重试字幕", fontSize = 17.sp) }
-            else Text("暂无字幕", color = Muted, fontSize = 17.sp)
+            else if (error != null)
+                FilledTonalButton(onClick = onRetry) { Text("重试字幕", fontSize = 15.sp) }
+            else Text("暂无字幕", color = Muted.copy(alpha = 0.7f), fontSize = 16.sp)
         } else {
             LazyColumn(
-                Modifier.fillMaxSize(),
+                Modifier.fillMaxSize()
+                    .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
+                    .drawWithContent {
+                        drawContent()
+                        drawRect(
+                            brush =
+                                Brush.verticalGradient(
+                                    0.0f to Color.Transparent,
+                                    0.12f to Color.Black,
+                                    0.88f to Color.Black,
+                                    1.0f to Color.Transparent,
+                                ),
+                            blendMode = BlendMode.DstIn,
+                        )
+                    },
                 state = list,
                 contentPadding =
                     PaddingValues(
@@ -743,12 +1174,26 @@ private fun SubtitlePane(
                 itemsIndexed(cues, key = { index, cue -> "$index|${cue.startMs}|${cue.endMs}" }) {
                     index,
                     cue ->
+                    val isActive = index == active
+                    val targetColor =
+                        when {
+                            isActive -> Cream
+                            active >= 0 && index < active -> Muted.copy(alpha = 0.42f)
+                            else -> Muted.copy(alpha = 0.68f)
+                        }
                     val color by
                         animateColorAsState(
-                            if (index == active) Cream else Muted,
-                            tween(100),
+                            targetColor,
+                            tween(if (reduced) 0 else 140),
                             label = "subtitle-highlight",
                         )
+                    val highlightAlpha by
+                        animateFloatAsState(
+                            if (isActive) 0.10f else 0f,
+                            tween(if (reduced) 0 else 160),
+                            label = "subtitle-bg",
+                        )
+                    // Draw highlight behind without altering layout bounds or line height.
                     Text(
                         cue.text,
                         color = color,
@@ -758,6 +1203,22 @@ private fun SubtitlePane(
                         modifier =
                             Modifier.fillMaxWidth()
                                 .testTag("subtitle-$index")
+                                .drawBehind {
+                                    if (highlightAlpha > 0.005f) {
+                                        val padX = 12.dp.toPx()
+                                        val padY = 6.dp.toPx()
+                                        drawRoundRect(
+                                            color = Rose.copy(alpha = highlightAlpha),
+                                            topLeft = Offset(-padX, -padY),
+                                            size =
+                                                Size(
+                                                    this.size.width + padX * 2f,
+                                                    this.size.height + padY * 2f,
+                                                ),
+                                            cornerRadius = CornerRadius(12.dp.toPx()),
+                                        )
+                                    }
+                                }
                                 .combinedClickable(
                                     hapticFeedbackEnabled = LocalTouchFeedback.current,
                                     onClick = { onSelect(cue) },
@@ -768,9 +1229,37 @@ private fun SubtitlePane(
                 }
             }
         }
-        if (!following) {
-            Box(Modifier.align(Alignment.BottomEnd).padding(4.dp)) {
-                IconAction(Icons.Outlined.MyLocation, "跟随字幕", Rose) { following = true }
+        AnimatedVisibility(
+            visible = !following && cues.isNotEmpty(),
+            modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 10.dp),
+            enter =
+                fadeIn(tween(if (reduced) 0 else 150)) +
+                    slideInVertically(tween(if (reduced) 0 else 150)) { it / 2 },
+            exit =
+                fadeOut(tween(if (reduced) 0 else 120)) +
+                    slideOutVertically(tween(if (reduced) 0 else 120)) { it / 2 },
+        ) {
+            val pillShape = RoundedCornerShape(999.dp)
+            Row(
+                Modifier.clip(pillShape)
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                    .border(0.5.dp, Rose.copy(alpha = 0.35f), pillShape)
+                    .clickable { following = true }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(
+                    Icons.Outlined.MyLocation,
+                    "跟随字幕",
+                    tint = Rose,
+                    modifier = Modifier.size(16.dp),
+                )
+                Text(
+                    "回到当前",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Cream,
+                )
             }
         }
     }

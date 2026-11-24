@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -20,8 +26,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -149,6 +154,7 @@ class AsmrCatalogController(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun AsmrOnePage(
     graph: AppGraph,
@@ -219,13 +225,18 @@ internal fun AsmrOnePage(
         if (nearEnd && state.items.isNotEmpty() && state.hasMore) catalog.loadNextPage()
     }
 
-    Column(Modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconAction(Icons.AutoMirrored.Outlined.ArrowBack, "返回来源", action = back)
-            Text("ASMR.ONE", Modifier.weight(1f), fontFamily = FontFamily.Serif, fontSize = 28.sp)
+            Text(
+                "ASMR.ONE",
+                Modifier.weight(1f).padding(start = 4.dp),
+                style = MaterialTheme.typography.headlineLarge,
+                color = Cream,
+            )
             IconAction(
                 Icons.Outlined.Tune,
                 "筛选作品",
@@ -238,37 +249,30 @@ internal fun AsmrOnePage(
                 catalog.refresh(clearItems = false)
             }
         }
-        OutlinedTextField(
-            text,
-            { text = it.take(300) },
-            Modifier.fillMaxWidth()
-                .padding(horizontal = 20.dp)
-                .testTag("asmr-search")
-                .onFocusChanged { editing = it.isFocused },
-            singleLine = true,
-            shape = RoundedCornerShape(18.dp),
-            placeholder = { Text("作品、声优、RJ") },
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-            keyboardActions =
-                KeyboardActions(onSearch = { submit(query.copy(text = text.trim())) }),
-            trailingIcon = {
-                Row {
-                    if (text.isNotEmpty()) {
-                        IconAction(Icons.Outlined.Close, "清空检索") {
-                            text = ""
-                            submit(query.copy(text = ""))
-                        }
-                    }
-                    IconAction(Icons.Outlined.Search, "提交在线搜索") {
-                        submit(query.copy(text = text.trim()))
-                    }
-                }
+        WhispSearchBar(
+            value = text,
+            onValueChange = { text = it.take(300) },
+            placeholder = "作品、声优、RJ",
+            modifier =
+                Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                    .testTag("asmr-search")
+                    .onFocusChanged { editing = it.isFocused },
+            clearLabel = "清空检索",
+            submitLabel = "提交在线搜索",
+            onClear = {
+                text = ""
+                submit(query.copy(text = ""))
             },
+            onSubmit = { submit(query.copy(text = text.trim())) },
         )
-        if (query.facets.isNotEmpty() || query.subtitlesOnly) {
+        AnimatedVisibility(
+            visible = query.facets.isNotEmpty() || query.subtitlesOnly,
+            enter = fadeIn() + expandVertically(),
+            exit = fadeOut() + shrinkVertically(),
+        ) {
             LazyRow(
-                Modifier.fillMaxWidth().padding(top = 8.dp),
-                contentPadding = PaddingValues(horizontal = 20.dp),
+                Modifier.fillMaxWidth().padding(top = 6.dp),
+                contentPadding = PaddingValues(horizontal = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(query.facets, key = { "${it.kind}|${it.name}" }) { facet ->
@@ -299,88 +303,116 @@ internal fun AsmrOnePage(
                 }
             }
         }
-        if (editing) {
-            val suggestedHistory =
+        val suggestedHistory =
+            if (editing)
                 history.filter { text.isBlank() || it.contains(text, ignoreCase = true) }.take(4)
-            val suggestedFacets =
-                if (text.isBlank()) emptyList()
-                else facets.filter { it.name.contains(text, true) && it !in query.facets }.take(4)
-            if (suggestedHistory.isNotEmpty() || suggestedFacets.isNotEmpty()) {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
-                    suggestedHistory.forEach { value ->
-                        Row(
-                            Modifier.fillMaxWidth()
-                                .clickable { submit(query.copy(text = value)) }
-                                .padding(vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Icon(Icons.Outlined.History, null, Modifier.size(20.dp), tint = Muted)
-                            Text(
-                                value,
-                                Modifier.weight(1f).padding(start = 12.dp),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
+            else emptyList()
+        val suggestedFacets =
+            if (editing && text.isNotBlank())
+                facets.filter { it.name.contains(text, true) && it !in query.facets }.take(4)
+            else emptyList()
+        AnimatedVisibility(
+            visible = editing && (suggestedHistory.isNotEmpty() || suggestedFacets.isNotEmpty()),
+            enter = fadeIn() + expandVertically(),
+            exit = fadeOut() + shrinkVertically(),
+        ) {
+            val cardShape = RoundedCornerShape(16.dp)
+            Column(
+                Modifier.fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                    .clip(cardShape)
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                    .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, cardShape)
+                    .padding(vertical = 4.dp),
+            ) {
+                suggestedHistory.forEach { value ->
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickable { submit(query.copy(text = value)) }
+                            .padding(horizontal = 16.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons.Outlined.History, null, Modifier.size(18.dp), tint = Muted)
+                        Text(
+                            value,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Cream,
+                            modifier = Modifier.weight(1f).padding(start = 12.dp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
-                    suggestedFacets.forEach { facet ->
-                        TextButton(
-                            onClick = {
+                }
+                suggestedFacets.forEach { facet ->
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickable {
                                 submit(
                                     query.copy(
                                         text = "",
                                         facets = (query.facets + facet).distinct(),
                                     ),
                                 )
-                            },
-                        ) {
-                            Text(
-                                "${facet.label} · ${facet.name}",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
+                            }
+                            .padding(horizontal = 16.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons.Outlined.FilterList, null, Modifier.size(18.dp), tint = Rose)
+                        Text(
+                            "${facet.label} · ${facet.name}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Rose,
+                            modifier = Modifier.weight(1f).padding(start = 12.dp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
-                    if (suggestedHistory.isNotEmpty()) {
-                        TextButton(
-                            onClick = { scope.launch { graph.settings.clearAsmrSearchHistory() } },
-                            Modifier.align(Alignment.End),
-                        ) {
-                            Text("清除记录")
-                        }
+                }
+                if (suggestedHistory.isNotEmpty()) {
+                    TextButton(
+                        onClick = { scope.launch { graph.settings.clearAsmrSearchHistory() } },
+                        Modifier.align(Alignment.End).padding(end = 8.dp),
+                    ) {
+                        Text("清除记录", fontSize = 13.sp)
                     }
                 }
             }
         }
-        Row(Modifier.padding(horizontal = 20.dp, vertical = 2.dp)) {
-            listOf("create_date" to "最新", "dl_count" to "热门").forEach { (order, title) ->
-                TextButton(
-                    onClick = { submit(query.copy(text = text.trim(), order = order)) },
-                    colors =
-                        ButtonDefaults.textButtonColors(
-                            contentColor = if (query.order == order) Rose else Muted,
-                        ),
-                ) {
-                    Text(title, fontSize = 15.sp)
-                }
-            }
-        }
+        WhispTabBar(
+            options = listOf("create_date" to "最新", "dl_count" to "热门"),
+            selected = query.order,
+            onSelect = { order -> submit(query.copy(text = text.trim(), order = order)) },
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+        )
         if (state.refreshError != null && state.items.isNotEmpty()) {
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+                Modifier.fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f))
+                    .padding(horizontal = 14.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("刷新失败", Modifier.weight(1f), color = Muted)
+                Text(
+                    "刷新失败",
+                    Modifier.weight(1f),
+                    color = MaterialTheme.colorScheme.error,
+                    fontSize = 14.sp,
+                )
                 TextButton(onClick = { catalog.refresh(clearItems = false) }) { Text("重试") }
             }
         }
-        Box(Modifier.weight(1f).fillMaxWidth()) {
+        PullToRefreshBox(
+            isRefreshing = state.refreshing && state.items.isNotEmpty(),
+            onRefresh = { catalog.refresh(clearItems = false) },
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+        ) {
             if (query.searching) {
                 LazyColumn(
                     Modifier.fillMaxSize().testTag("asmr-results"),
                     state = list,
-                    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(state.items, key = { it.workId }) { work ->
                         val image =
@@ -389,24 +421,30 @@ internal fun AsmrOnePage(
                                 val url = work.coverUrl ?: return@remember null
                                 WhispImage.Catalog(id, url, sourceId)
                             }
+                        val rowShape = RoundedCornerShape(16.dp)
                         Row(
-                            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).clickable {
-                                open(work)
-                            },
+                            Modifier.fillMaxWidth()
+                                .clip(rowShape)
+                                .background(MaterialTheme.colorScheme.surface)
+                                .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, rowShape)
+                                .clickable { open(work) }
+                                .padding(10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Artwork(
                                 image = image,
                                 description = work.title,
                                 modifier =
-                                    Modifier.size(width = 100.dp, height = 112.dp)
-                                        .clip(RoundedCornerShape(14.dp)),
+                                    Modifier.size(width = 116.dp, height = 87.dp)
+                                        .clip(RoundedCornerShape(11.dp)),
                             )
-                            Column(Modifier.weight(1f).padding(start = 14.dp)) {
+                            Column(Modifier.weight(1f).padding(start = 14.dp, end = 4.dp)) {
                                 Text(
                                     work.title,
-                                    fontSize = 17.sp,
-                                    lineHeight = 24.sp,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = Cream,
+                                    fontSize = 15.sp,
+                                    lineHeight = 21.sp,
                                     maxLines = 2,
                                     overflow = TextOverflow.Ellipsis,
                                 )
@@ -414,7 +452,8 @@ internal fun AsmrOnePage(
                                 if (work.artist.isNotBlank()) {
                                     Text(
                                         work.artist,
-                                        Modifier.padding(top = 8.dp)
+                                        Modifier.padding(top = 6.dp)
+                                            .clip(RoundedCornerShape(6.dp))
                                             .then(
                                                 if (voice != null)
                                                     Modifier.clickable {
@@ -429,10 +468,22 @@ internal fun AsmrOnePage(
                                                     }
                                                 else Modifier,
                                             ),
-                                        color = Muted,
-                                        fontSize = 14.sp,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color =
+                                            if (voice != null) Rose.copy(alpha = 0.9f) else Muted,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                if (work.rj.isNotBlank()) {
+                                    Text(
+                                        work.rj,
+                                        style =
+                                            MaterialTheme.typography.labelSmall.merge(
+                                                TabularNumeralStyle,
+                                            ),
+                                        color = Muted.copy(alpha = 0.75f),
+                                        modifier = Modifier.padding(top = 4.dp),
                                     )
                                 }
                             }
@@ -466,23 +517,27 @@ internal fun AsmrOnePage(
                 )
             }
             if (state.items.isEmpty()) {
-                Column(
-                    Modifier.align(Alignment.Center),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     when {
-                        state.refreshing -> CircularProgressIndicator()
-                        state.refreshError != null -> {
-                            Text(state.refreshError!!, color = Muted)
-                            TextButton(onClick = { catalog.refresh(clearItems = true) }) {
-                                Text("重试")
+                        state.refreshing -> CircularProgressIndicator(color = Rose)
+                        state.refreshError != null ->
+                            WhispEmptyState(
+                                icon = Icons.Outlined.CloudOff,
+                                title = "无法加载目录",
+                                subtitle = state.refreshError,
+                            ) {
+                                FilledTonalButton(
+                                    onClick = { catalog.refresh(clearItems = true) },
+                                ) {
+                                    Text("重试")
+                                }
                             }
-                        }
                         else ->
-                            Text(
-                                if (query.searching) "没有匹配的作品" else "暂无作品",
-                                color = Muted,
-                                fontSize = 17.sp,
+                            WhispEmptyState(
+                                icon =
+                                    if (query.searching) Icons.Outlined.Search
+                                    else Icons.Outlined.Headphones,
+                                title = if (query.searching) "没有匹配的作品" else "暂无作品",
                             )
                     }
                 }
@@ -500,7 +555,8 @@ internal fun AsmrOnePage(
 private fun CatalogAppend(appending: Boolean, error: String?, retry: () -> Unit) {
     Box(Modifier.fillMaxWidth().padding(18.dp), contentAlignment = Alignment.Center) {
         when {
-            appending -> CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+            appending ->
+                CircularProgressIndicator(Modifier.size(24.dp), color = Rose, strokeWidth = 2.dp)
             error != null -> TextButton(onClick = retry) { Text("重试") }
         }
     }
@@ -518,35 +574,31 @@ private fun AsmrFilters(
     var kind by remember { mutableStateOf("va") }
     var name by rememberSaveable { mutableStateOf("") }
     WhispSheet(close) { dismiss ->
-        Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp)) {
-            Text("筛选", fontFamily = FontFamily.Serif, fontSize = 26.sp)
-            Row {
-                listOf("va" to "声优", "circle" to "社团", "tagw" to "标签").forEach { (value, title) ->
-                    TextButton(
-                        onClick = {
-                            kind = value
-                            name = ""
-                        },
-                        colors =
-                            ButtonDefaults.textButtonColors(
-                                contentColor = if (kind == value) Rose else Muted,
-                            ),
-                    ) {
-                        Text(title)
-                    }
-                }
-            }
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 24.dp).navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("筛选", style = MaterialTheme.typography.headlineSmall, color = Cream)
+            WhispTabBar(
+                options = listOf("va" to "声优", "circle" to "社团", "tagw" to "标签"),
+                selected = kind,
+                onSelect = { value ->
+                    kind = value
+                    name = ""
+                },
+            )
             OutlinedTextField(
                 name,
                 { name = it.take(160) },
                 Modifier.fillMaxWidth().testTag("asmr-facet-input"),
                 singleLine = true,
+                shape = RoundedCornerShape(14.dp),
                 placeholder = {
                     Text(
                         when (kind) {
-                            "va" -> "声优"
-                            "circle" -> "社团"
-                            else -> "标签"
+                            "va" -> "输入声优名"
+                            "circle" -> "输入社团名"
+                            else -> "输入标签"
                         },
                     )
                 },
@@ -554,6 +606,7 @@ private fun AsmrFilters(
                     IconAction(
                         Icons.Outlined.Add,
                         "添加筛选",
+                        Rose,
                         enabled = name.isNotBlank() && '$' !in name,
                     ) {
                         selected = (selected + AsmrFacet(kind, name.trim())).distinct()
@@ -561,7 +614,7 @@ private fun AsmrFilters(
                     }
                 },
             )
-            LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(max = 220.dp)) {
+            LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(max = 200.dp)) {
                 items(
                     choices
                         .filter {
@@ -572,33 +625,58 @@ private fun AsmrFilters(
                         .take(20),
                     key = { "${it.kind}|${it.name}" },
                 ) { facet ->
-                    TextButton(
-                        onClick = {
-                            selected = (selected + facet).distinct()
-                            name = ""
-                        },
-                        Modifier.fillMaxWidth(),
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable {
+                                selected = (selected + facet).distinct()
+                                name = ""
+                            }
+                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(facet.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            facet.name,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Cream,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Icon(
+                            Icons.Outlined.Add,
+                            null,
+                            tint = Muted,
+                            modifier = Modifier.size(16.dp),
+                        )
                     }
                 }
             }
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(selected, key = { "${it.kind}|${it.name}" }) { facet ->
-                    InputChip(
-                        selected = true,
-                        onClick = { selected = selected - facet },
-                        label = { Text(facet.name) },
-                        trailingIcon = { Icon(Icons.Outlined.Close, null, Modifier.size(16.dp)) },
-                    )
+            if (selected.isNotEmpty()) {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(selected, key = { "${it.kind}|${it.name}" }) { facet ->
+                        InputChip(
+                            selected = true,
+                            onClick = { selected = selected - facet },
+                            label = { Text(facet.name) },
+                            trailingIcon = {
+                                Icon(Icons.Outlined.Close, null, Modifier.size(16.dp))
+                            },
+                        )
+                    }
                 }
             }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("有字幕", Modifier.weight(1f))
+                Text(
+                    "有字幕",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Cream,
+                    modifier = Modifier.weight(1f),
+                )
                 Switch(subtitles, { subtitles = it })
             }
             Row(
-                Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                Modifier.fillMaxWidth().padding(bottom = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 OutlinedButton(
@@ -607,6 +685,7 @@ private fun AsmrFilters(
                         subtitles = false
                     },
                     Modifier.weight(1f),
+                    shape = RoundedCornerShape(14.dp),
                 ) {
                     Text("重置")
                 }
@@ -626,8 +705,9 @@ private fun AsmrFilters(
                         dismiss()
                     },
                     Modifier.weight(1f),
+                    shape = RoundedCornerShape(14.dp),
                 ) {
-                    Text("应用")
+                    Text("应用", fontWeight = FontWeight.SemiBold)
                 }
             }
         }

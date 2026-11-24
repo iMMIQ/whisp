@@ -3,7 +3,9 @@ package app.whisp.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -14,6 +16,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.InsertDriveFile
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -21,13 +24,14 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -37,6 +41,7 @@ import app.whisp.AppGraph
 import app.whisp.R
 import app.whisp.data.*
 import java.util.LinkedHashMap
+import java.util.Locale
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
@@ -180,6 +185,7 @@ sealed interface WorkDetailTarget {
 }
 
 /** Unified detail screen handling both indexed library works and unsaved ASMR.ONE previews. */
+@OptIn(ExperimentalFoundationApi::class)
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 internal fun WorkDetailScreen(
@@ -189,6 +195,7 @@ internal fun WorkDetailScreen(
     player: () -> Unit,
     filter: ((AsmrFacet) -> Unit)? = null,
 ) {
+    val bg = MaterialTheme.colorScheme.background
     val isPreview = target is WorkDetailTarget.AsmrPreview
     val libraryWorkId =
         when (target) {
@@ -235,6 +242,7 @@ internal fun WorkDetailScreen(
     if (effectiveDetail == null) {
         Box(
             Modifier.fillMaxSize()
+                .statusBarsPadding()
                 .then(if (isPreview) Modifier.testTag("asmr-preview") else Modifier),
             contentAlignment = Alignment.Center,
         ) {
@@ -246,11 +254,14 @@ internal fun WorkDetailScreen(
                 )
             }
             when {
-                previewLoading -> CircularProgressIndicator()
+                previewLoading -> CircularProgressIndicator(color = Rose)
                 previewError != null ->
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(previewError!!, color = Muted)
-                        TextButton(onClick = { previewReload++ }) { Text("重试") }
+                    WhispEmptyState(
+                        icon = Icons.Outlined.CloudOff,
+                        title = "加载失败",
+                        subtitle = previewError,
+                    ) {
+                        FilledTonalButton(onClick = { previewReload++ }) { Text("重试") }
                     }
             }
         }
@@ -297,6 +308,8 @@ internal fun WorkDetailScreen(
             .collectAsStateWithLifecycle(initialValue = graph.offline.isOffline(detail))
 
     val sections = remember(detail.tracks) { TrackSections.groups(detail.tracks) }
+    val totalDurationMs =
+        remember(detail.tracks) { detail.tracks.sumOf { it.durationMs.coerceAtLeast(0L) } }
     val remembered =
         remember(history, detail.work.id) { history.firstOrNull { it.workId == detail.work.id } }
     val resume = inLibrary && remembered != null
@@ -359,8 +372,13 @@ internal fun WorkDetailScreen(
     LazyColumn(
         Modifier.fillMaxSize().then(if (isPreview) Modifier.testTag("asmr-preview") else Modifier),
     ) {
-        item {
-            Box(Modifier.fillMaxWidth().aspectRatio(.92f).background(Surface)) {
+        item(key = "detail-header") {
+            Box(
+                Modifier.fillMaxWidth()
+                    .heightIn(min = 260.dp, max = 420.dp)
+                    .aspectRatio(1.16f)
+                    .background(MaterialTheme.colorScheme.surface),
+            ) {
                 Artwork(
                     image = coverImage,
                     description = detail.work.title,
@@ -371,13 +389,19 @@ internal fun WorkDetailScreen(
                     Modifier.matchParentSize()
                         .background(
                             Brush.verticalGradient(
-                                listOf(Ink.copy(alpha = .2f), Color.Transparent, Ink),
+                                0.0f to bg.copy(alpha = .50f),
+                                0.28f to Color.Transparent,
+                                0.54f to bg.copy(alpha = .52f),
+                                0.84f to bg.copy(alpha = .94f),
+                                1.0f to bg,
                             ),
                         ),
                 )
                 CompositionLocalProvider(LocalCoverControls provides true) {
                     Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                        Modifier.fillMaxWidth()
+                            .statusBarsPadding()
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         IconAction(
@@ -386,9 +410,9 @@ internal fun WorkDetailScreen(
                             action = back,
                         )
                         if (inLibrary) {
-                            Row {
+                            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                                 IconAction(
-                                    if (detail.work.favorite) Icons.Outlined.Favorite
+                                    if (detail.work.favorite) Icons.Filled.Favorite
                                     else Icons.Outlined.FavoriteBorder,
                                     stringResource(R.string.action_favorite),
                                     if (detail.work.favorite) Rose else Cream,
@@ -422,27 +446,51 @@ internal fun WorkDetailScreen(
                 }
                 Column(
                     Modifier.align(Alignment.BottomStart)
-                        .padding(horizontal = 24.dp, vertical = 18.dp),
+                        .padding(horizontal = 20.dp, vertical = 14.dp),
                 ) {
                     Text(
                         detail.work.title,
-                        fontFamily = FontFamily.Serif,
-                        fontSize = 32.sp,
-                        lineHeight = 40.sp,
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = Cream,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     if (detail.work.artist.isNotBlank()) {
                         Text(
                             detail.work.artist,
-                            color = Muted,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Cream.copy(alpha = 0.80f),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.padding(top = 6.dp),
-                            fontSize = 14.sp,
                         )
                     }
                 }
             }
+            val metaParts =
+                remember(detail.tracks.size, totalDurationMs, detail.work.rj, official.details) {
+                    buildList {
+                        if (detail.tracks.isNotEmpty()) add("${detail.tracks.size} 曲")
+                        if (totalDurationMs > 0L) add(clock(totalDurationMs))
+                        detail.work.rj?.let { add(it) }
+                        official.details?.statistics?.rating?.let {
+                            add("★ " + String.format(Locale.ROOT, "%.2f", it))
+                        }
+                    }
+                }
+            if (metaParts.isNotEmpty()) {
+                Text(
+                    metaParts.joinToString(" · "),
+                    style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                    color = Muted,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
+                )
+            }
+            OfficialCircle(official.details, filter)
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp),
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 if (inLibrary) {
                     Button(
@@ -451,7 +499,7 @@ internal fun WorkDetailScreen(
                             player()
                         },
                         modifier = Modifier.weight(1f).height(52.dp),
-                        shape = RoundedCornerShape(17.dp),
+                        shape = RoundedCornerShape(16.dp),
                     ) {
                         Icon(Icons.Filled.PlayArrow, null)
                         Spacer(Modifier.width(8.dp))
@@ -461,46 +509,113 @@ internal fun WorkDetailScreen(
                                 resume -> stringResource(R.string.action_resume_work)
                                 else -> stringResource(R.string.action_play_work)
                             },
-                            fontSize = 16.sp,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
                         )
                     }
-                    Spacer(Modifier.width(10.dp))
-                    IconAction(Icons.Outlined.Shuffle, stringResource(R.string.action_shuffle)) {
-                        graph.playback.playWork(detail, shuffle = true)
-                        player()
+                    Box(
+                        Modifier.size(52.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(MaterialTheme.colorScheme.surface)
+                            .border(
+                                0.5.dp,
+                                MaterialTheme.colorScheme.outlineVariant,
+                                RoundedCornerShape(16.dp),
+                            ),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        IconAction(
+                            Icons.Outlined.Shuffle,
+                            stringResource(R.string.action_shuffle),
+                            Cream,
+                        ) {
+                            graph.playback.playWork(detail, shuffle = true)
+                            player()
+                        }
                     }
                 } else {
                     Button(
                         onClick = { commitPreview(playAfter = false) },
                         enabled = !savingPreview,
                         modifier = Modifier.weight(1f).height(52.dp),
-                        shape = RoundedCornerShape(17.dp),
+                        shape = RoundedCornerShape(16.dp),
                     ) {
                         Icon(Icons.Outlined.Add, null)
                         Spacer(Modifier.width(8.dp))
-                        Text(if (savingPreview) "加入中" else "加入作品库", fontSize = 16.sp)
+                        Text(
+                            if (savingPreview) "加入中" else "加入作品库",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
                     }
                 }
             }
-            OfficialCircle(official.details, filter)
-            WorkContentTabs(tab) { tab = it }
+        }
+        stickyHeader(key = "detail-tabs") {
+            Column(Modifier.fillMaxWidth().background(bg)) {
+                WorkContentTabs(
+                    tab = tab,
+                    select = { tab = it },
+                    onRefresh =
+                        if (tab != "曲目" && detail.work.rj != null) {
+                            {
+                                val rj = detail.work.rj
+                                val part = if (tab == "介绍") "description" else "statistics"
+                                graph.dlsiteLoader.load(
+                                    detail.work.id,
+                                    rj,
+                                    "product",
+                                    seedDetails,
+                                    true,
+                                )
+                                graph.dlsiteLoader.load(detail.work.id, rj, part, seedDetails, true)
+                            }
+                        } else null,
+                )
+                HorizontalDivider(
+                    thickness = 0.5.dp,
+                    color = MaterialTheme.colorScheme.outlineVariant,
+                )
+            }
         }
         when (tab) {
             "曲目" ->
                 sections.forEach { section ->
                     if (sections.size > 1) {
                         item(key = "section:${section.key}") {
+                            val sectionDuration =
+                                remember(section.tracks) {
+                                    section.tracks.sumOf { it.durationMs.coerceAtLeast(0L) }
+                                }
                             Row(
                                 Modifier.fillMaxWidth()
-                                    .padding(start = 28.dp, end = 16.dp, top = 8.dp),
+                                    .padding(
+                                        start = 20.dp,
+                                        end = 12.dp,
+                                        top = 14.dp,
+                                        bottom = 4.dp,
+                                    ),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Text(
-                                    section.title,
-                                    color = Muted,
-                                    fontSize = 18.sp,
-                                    modifier = Modifier.weight(1f),
-                                )
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        section.title,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = Cream,
+                                    )
+                                    val sub =
+                                        if (sectionDuration > 0L)
+                                            "${section.tracks.size} 曲 · ${clock(sectionDuration)}"
+                                        else "${section.tracks.size} 曲"
+                                    Text(
+                                        sub,
+                                        style =
+                                            MaterialTheme.typography.bodySmall.merge(
+                                                TabularNumeralStyle,
+                                            ),
+                                        color = Muted,
+                                    )
+                                }
                                 IconAction(Icons.Outlined.PlayArrow, "播放${section.title}", Rose) {
                                     if (inLibrary) {
                                         graph.playback.playWork(
@@ -548,9 +663,15 @@ internal fun WorkDetailScreen(
                         item(key = "header-scripts") {
                             Text(
                                 "台本",
-                                Modifier.padding(24.dp),
-                                fontSize = 22.sp,
-                                fontFamily = FontFamily.Serif,
+                                style = MaterialTheme.typography.titleLarge,
+                                color = Cream,
+                                modifier =
+                                    Modifier.padding(
+                                        start = 20.dp,
+                                        end = 20.dp,
+                                        top = 20.dp,
+                                        bottom = 8.dp,
+                                    ),
                             )
                         }
                     }
@@ -561,9 +682,15 @@ internal fun WorkDetailScreen(
                         item(key = "header-extras") {
                             Text(
                                 "附赠",
-                                Modifier.padding(24.dp),
-                                fontSize = 22.sp,
-                                fontFamily = FontFamily.Serif,
+                                style = MaterialTheme.typography.titleLarge,
+                                color = Cream,
+                                modifier =
+                                    Modifier.padding(
+                                        start = 20.dp,
+                                        end = 20.dp,
+                                        top = 20.dp,
+                                        bottom = 8.dp,
+                                    ),
                             )
                         }
                     }
@@ -579,25 +706,47 @@ internal fun WorkDetailScreen(
                 }
             }
         }
-        item(key = "detail-footer") { Spacer(Modifier.height(24.dp)) }
+        item(key = "detail-footer") { Spacer(Modifier.height(28.dp)) }
     }
     if (information && inLibrary) {
         InfoDialog(detail, graph, onRemoved = back) { information = false }
     }
-    attachment?.let { AttachmentDialog(it, graph) { attachment = null } }
+    attachment?.let { item ->
+        if (item.kind == "image") {
+            WhispImageLightbox(
+                image = WhispImage.Asset(item.id),
+                title = item.title,
+                onDismiss = { attachment = null },
+            )
+        } else {
+            AttachmentDialog(item, graph) { attachment = null }
+        }
+    }
 }
 
 @Composable
 private fun ResourceRow(title: String, icon: ImageVector, click: () -> Unit) {
     Row(
         Modifier.fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 3.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(14.dp))
             .clickable(onClick = click)
-            .padding(horizontal = 28.dp, vertical = 18.dp),
+            .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(icon, null, tint = Muted, modifier = Modifier.size(21.dp))
-        Text(title, modifier = Modifier.weight(1f).padding(horizontal = 14.dp), fontSize = 15.sp)
-        Icon(Icons.Outlined.ChevronRight, null, tint = Muted)
+        Icon(icon, null, tint = Rose.copy(alpha = 0.85f), modifier = Modifier.size(20.dp))
+        Text(
+            title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = Cream,
+            fontSize = 15.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f).padding(horizontal = 14.dp),
+        )
+        Icon(Icons.Outlined.ChevronRight, null, tint = Muted, modifier = Modifier.size(18.dp))
     }
 }
 
@@ -611,9 +760,8 @@ private fun AttachmentDialog(
     var encoding by remember(attachment.id) { mutableStateOf(settings.textEncoding) }
     var rawBytes by remember(attachment.id) { mutableStateOf<ByteArray?>(null) }
     var text by remember(attachment.id) { mutableStateOf<String?>(null) }
-    var loading by remember(attachment.id) { mutableStateOf(attachment.kind != "image") }
+    var loading by remember(attachment.id) { mutableStateOf(true) }
     LaunchedEffect(attachment.id) {
-        if (attachment.kind == "image") return@LaunchedEffect
         try {
             rawBytes = graph.library.readAsset(attachment.id, 64 * 1024 * 1024)
         } catch (e: CancellationException) {
@@ -632,7 +780,8 @@ private fun AttachmentDialog(
     WhispSheet(onDismissRequest = dismiss) { _ ->
         Text(
             attachment.title,
-            fontSize = 20.sp,
+            style = MaterialTheme.typography.titleLarge,
+            color = Cream,
             modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
         )
         if (rawBytes != null) {
@@ -642,20 +791,16 @@ private fun AttachmentDialog(
                 horizontalPadding = 24.dp,
             )
         }
-        if (loading) CircularProgressIndicator(Modifier.padding(32.dp))
-        if (attachment.kind == "image") {
-            Artwork(
-                image = WhispImage.Asset(attachment.id),
-                description = attachment.title,
-                modifier =
-                    Modifier.fillMaxWidth().heightIn(min = 240.dp, max = 600.dp).padding(16.dp),
-                scale = ContentScale.Fit,
-            )
+        if (loading) {
+            Box(Modifier.fillMaxWidth().padding(36.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = Rose)
+            }
         }
         text?.let {
             Text(
                 it,
-                fontSize = 17.sp,
+                style = MaterialTheme.typography.bodyLarge,
+                color = Cream,
                 lineHeight = 28.sp,
                 modifier =
                     Modifier.fillMaxWidth()
@@ -692,9 +837,9 @@ private fun InfoDialog(
     if (confirmingRemoval) {
         AlertDialog(
             onDismissRequest = { if (!loading) confirmingRemoval = false },
-            containerColor = Surface,
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
             title = { Text("删除作品") },
-            text = { Text("删除该作品及其下载、书签和播放进度。") },
+            text = { Text("删除该作品及其下载、书签和播放进度。", color = Muted) },
             confirmButton = {
                 TextButton(
                     enabled = !loading,
@@ -715,7 +860,10 @@ private fun InfoDialog(
                         }
                     },
                 ) {
-                    Text(if (loading) "删除中" else "删除", color = Rose)
+                    Text(
+                        if (loading) "删除中" else "删除",
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
             },
             dismissButton = {
@@ -729,7 +877,7 @@ private fun InfoDialog(
     AlertDialog(
         onDismissRequest = dismiss,
         title = { Text(stringResource(R.string.action_work_info)) },
-        containerColor = Surface,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedTextField(title, { title = it }, label = { Text("作品名") })
@@ -758,10 +906,16 @@ private fun InfoDialog(
                 }
                 if (detail.work.isRemovableOnline) {
                     TextButton(enabled = !loading, onClick = { confirmingRemoval = true }) {
-                        Text("删除作品", color = Rose)
+                        Text("删除作品", color = MaterialTheme.colorScheme.error)
                     }
                 }
-                detail.work.rj?.let { Text(it, color = Muted) }
+                detail.work.rj?.let {
+                    Text(
+                        it,
+                        color = Muted,
+                        style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                    )
+                }
             }
         },
         confirmButton = {

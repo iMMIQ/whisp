@@ -5,19 +5,22 @@ import android.app.Activity
 import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.whisp.AppGraph
@@ -30,6 +33,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun DlsiteLibraryPage(
     graph: AppGraph,
@@ -65,16 +69,25 @@ internal fun DlsiteLibraryPage(
             }
             if (sortByTitle) filtered.sortedBy { it.title } else filtered
         }
-    Column(Modifier.fillMaxSize().testTag("dlsite-library")) {
+    Column(Modifier.fillMaxSize().statusBarsPadding().testTag("dlsite-library")) {
         Row(
-            Modifier.fillMaxWidth().padding(12.dp),
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconAction(Icons.AutoMirrored.Outlined.ArrowBack, "返回来源", action = back)
-            Text("已购作品", Modifier.weight(1f), fontFamily = FontFamily.Serif, fontSize = 28.sp)
+            Text(
+                "已购作品",
+                Modifier.weight(1f).padding(start = 4.dp),
+                style = MaterialTheme.typography.headlineLarge,
+                color = Cream,
+            )
             Box {
                 IconAction(Icons.Outlined.MoreVert, "管理 DLsite 账号") { menu = true }
-                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenu(
+                    expanded = menu,
+                    onDismissRequest = { menu = false },
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                ) {
                     DropdownMenuItem(
                         text = { Text("同步") },
                         onClick = {
@@ -121,7 +134,7 @@ internal fun DlsiteLibraryPage(
                         },
                     )
                     DropdownMenuItem(
-                        text = { Text("退出账号") },
+                        text = { Text("退出账号", color = MaterialTheme.colorScheme.error) },
                         onClick = {
                             menu = false
                             scope.launch { graph.sync.removeSource(sourceId) }
@@ -131,21 +144,35 @@ internal fun DlsiteLibraryPage(
                 }
             }
         }
-        OutlinedTextField(
-            query,
-            { query = it },
-            Modifier.fillMaxWidth().padding(horizontal = 20.dp).testTag("dlsite-search"),
-            placeholder = { Text("搜索作品、声优、社团或编号") },
-            singleLine = true,
-            leadingIcon = { Icon(Icons.Outlined.Search, null) },
+        WhispSearchBar(
+            value = query,
+            onValueChange = { query = it },
+            placeholder = "搜索作品、声优、社团或编号",
+            modifier =
+                Modifier.padding(horizontal = 16.dp, vertical = 4.dp).testTag("dlsite-search"),
         )
-        if (synchronizing) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 12.dp))
+        if (synchronizing && works.isEmpty()) {
+            LinearProgressIndicator(
+                Modifier.fillMaxWidth().padding(top = 8.dp),
+                color = Rose,
+                trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+            )
+        }
         source?.error?.let { message ->
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                Modifier.fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f))
+                    .padding(horizontal = 14.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(message, Modifier.weight(1f), color = Rose)
+                Text(
+                    message,
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
                 TextButton(
                     onClick = {
                         if (message.contains("登录"))
@@ -160,7 +187,11 @@ internal fun DlsiteLibraryPage(
                 }
             }
         }
-        Box(Modifier.weight(1f)) {
+        PullToRefreshBox(
+            isRefreshing = synchronizing && works.isNotEmpty(),
+            onRefresh = { graph.sync.scheduleScan(sourceId) },
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+        ) {
             WorkGrid(
                 items = visible,
                 key = { it.workno },
@@ -192,21 +223,47 @@ internal fun DlsiteLibraryPage(
                     }
                 },
             )
-            if (opening != null) CircularProgressIndicator(Modifier.align(Alignment.Center))
+            if (opening != null) {
+                Box(
+                    Modifier.fillMaxSize().background(ScrimDark.copy(alpha = 0.55f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    val cardShape = RoundedCornerShape(18.dp)
+                    Row(
+                        Modifier.clip(cardShape)
+                            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, cardShape)
+                            .padding(horizontal = 22.dp, vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        CircularProgressIndicator(
+                            Modifier.size(22.dp),
+                            color = Rose,
+                            strokeWidth = 2.dp,
+                        )
+                        Text("正在读取曲目目录", style = MaterialTheme.typography.bodyMedium, color = Cream)
+                    }
+                }
+            }
             if (visible.isEmpty() && !synchronizing) {
-                Text(
-                    if (query.isBlank()) "暂无已购音声" else "没有匹配的作品",
-                    Modifier.align(Alignment.Center),
-                    color = Muted,
-                )
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    WhispEmptyState(
+                        icon =
+                            if (query.isBlank()) Icons.Outlined.AccountCircle
+                            else Icons.Outlined.Search,
+                        title = if (query.isBlank()) "暂无已购音声" else "没有匹配的作品",
+                    )
+                }
             }
         }
     }
     officialPlayer?.let { work ->
         AlertDialog(
             onDismissRequest = { officialPlayer = null },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
             title = { Text("使用官方播放器") },
-            text = { Text("该作品可在 DLsite Play 中播放。") },
+            text = { Text("该作品可在 DLsite Play 中播放。", color = Muted) },
             confirmButton = {
                 TextButton(
                     onClick = {

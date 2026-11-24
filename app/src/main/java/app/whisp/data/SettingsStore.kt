@@ -25,6 +25,7 @@ data class Settings(
     val textEncoding: String = TextEncoding.AUTO,
     val playbackSpeed: Float = 1f,
     val legacyImagesMigrated: Boolean = false,
+    val amoledBlack: Boolean = false,
 ) {
     fun normalized(): Settings =
         copy(

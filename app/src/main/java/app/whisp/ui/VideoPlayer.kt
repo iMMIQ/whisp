@@ -10,15 +10,22 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.*
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -152,22 +159,24 @@ internal fun FullScreenVideo(
         AnimatedVisibility(
             controls || !state.playing,
             Modifier.align(Alignment.TopCenter),
-            enter = fadeIn(tween(if (reduced) 0 else 120)),
-            exit = fadeOut(tween(if (reduced) 0 else 120)),
+            enter = fadeIn(tween(if (reduced) 0 else 140)),
+            exit = fadeOut(tween(if (reduced) 0 else 140)),
         ) {
             Row(
                 Modifier.fillMaxWidth()
                     .background(
-                        Brush.verticalGradient(listOf(Ink.copy(alpha = .8f), Color.Transparent)),
+                        Brush.verticalGradient(listOf(Ink.copy(alpha = .78f), Color.Transparent)),
                     )
                     .displayCutoutPadding()
-                    .padding(8.dp),
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconAction(Icons.Outlined.FullscreenExit, "退出全屏", action = exit)
                 Text(
                     title,
-                    Modifier.weight(1f).padding(horizontal = 8.dp),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Cream,
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -178,48 +187,73 @@ internal fun FullScreenVideo(
             }
         }
         Column(
-            Modifier.align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(listOf(Color.Transparent, Ink.copy(alpha = .7f))),
-                )
-                .displayCutoutPadding(),
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             if (caption.isNotBlank()) {
-                Text(
-                    caption,
-                    Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
-                    fontSize = subtitleSize.sp,
-                    textAlign = TextAlign.Center,
-                    maxLines = 4,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Box(
+                    Modifier.padding(horizontal = 24.dp, vertical = 10.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Ink.copy(alpha = 0.66f))
+                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                ) {
+                    Text(
+                        caption,
+                        color = Cream,
+                        fontSize = subtitleSize.sp,
+                        lineHeight = (subtitleSize + 8).sp,
+                        textAlign = TextAlign.Center,
+                        maxLines = 4,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             AnimatedVisibility(
                 controls || !state.playing,
-                enter = fadeIn(tween(if (reduced) 0 else 120)),
-                exit = fadeOut(tween(if (reduced) 0 else 120)),
+                enter = fadeIn(tween(if (reduced) 0 else 140)),
+                exit = fadeOut(tween(if (reduced) 0 else 140)),
             ) {
-                Column {
+                Column(
+                    Modifier.fillMaxWidth()
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Transparent, Ink.copy(alpha = .82f)),
+                            ),
+                        )
+                        .displayCutoutPadding()
+                        .padding(top = 6.dp, bottom = 10.dp),
+                ) {
                     timeline()
                     Row(
-                        Modifier.fillMaxWidth().padding(bottom = 6.dp),
-                        horizontalArrangement = Arrangement.Center,
+                        Modifier.fillMaxWidth().padding(top = 4.dp),
+                        horizontalArrangement =
+                            Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         IconAction(Icons.Outlined.Replay10, "后退十秒", enabled = active) {
                             playback.skip(-10_000)
                             interaction++
                         }
-                        IconAction(
-                            if (state.playWhenReady) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            if (state.playWhenReady) "暂停" else "播放",
-                            Rose,
+                        FilledIconButton(
+                            onClick = {
+                                playback.togglePlay()
+                                interaction++
+                            },
                             enabled = active,
+                            modifier = Modifier.size(48.dp),
+                            shape = CircleShape,
+                            colors =
+                                IconButtonDefaults.filledIconButtonColors(
+                                    containerColor = Rose,
+                                    contentColor = Ink,
+                                ),
                         ) {
-                            playback.togglePlay()
-                            interaction++
+                            Icon(
+                                if (state.playWhenReady) Icons.Filled.Pause
+                                else Icons.Filled.PlayArrow,
+                                if (state.playWhenReady) "暂停" else "播放",
+                                modifier = Modifier.size(26.dp),
+                            )
                         }
                         IconAction(Icons.Outlined.Forward10, "前进十秒", enabled = active) {
                             playback.skip(10_000)

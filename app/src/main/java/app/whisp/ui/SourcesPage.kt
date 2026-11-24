@@ -18,10 +18,12 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -31,9 +33,32 @@ import app.whisp.AppGraph
 import app.whisp.DlsiteLoginActivity
 import app.whisp.R
 import app.whisp.data.SourceKind
+import app.whisp.data.WhispImage
 import app.whisp.data.kindType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+
+private fun sourceIcon(kind: SourceKind?): ImageVector =
+    when (kind) {
+        SourceKind.LOCAL -> Icons.Outlined.FolderOpen
+        SourceKind.SMB -> Icons.Outlined.Dns
+        SourceKind.NFS -> Icons.Outlined.Storage
+        SourceKind.WEBDAV -> Icons.Outlined.CloudQueue
+        SourceKind.ASMRONE -> Icons.Outlined.Headphones
+        SourceKind.DLSITE -> Icons.Outlined.AccountCircle
+        null -> Icons.Outlined.CloudQueue
+    }
+
+private fun sourceLabel(kind: SourceKind?): String =
+    when (kind) {
+        SourceKind.LOCAL -> "本地目录"
+        SourceKind.SMB -> "SMB 共享"
+        SourceKind.NFS -> "NFS 网络文件"
+        SourceKind.WEBDAV -> "WebDAV"
+        SourceKind.ASMRONE -> "在线目录"
+        SourceKind.DLSITE -> "官方已购"
+        null -> "来源"
+    }
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -42,6 +67,7 @@ internal fun SourcesPage(
     online: (String) -> Unit,
     dlsite: (String) -> Unit,
     storage: () -> Unit,
+    openWork: (String) -> Unit = {},
 ) {
     val sources by graph.library.sourceList.collectAsStateWithLifecycle()
     val busy by graph.sync.busy.collectAsStateWithLifecycle()
@@ -94,182 +120,288 @@ internal fun SourcesPage(
         }
 
     val trackIdsByWork = remember(trackPairs) { trackPairs.groupBy({ it.workId }, { it.id }) }
+    val workCountsBySource =
+        remember(works) { works.mapNotNull { it.sourceId }.groupingBy { it }.eachCount() }
     val offlineWorks =
         remember(works, trackIdsByWork, downloads) {
             works.filter { work -> trackIdsByWork[work.id].orEmpty().any { it in downloads } }
         }
 
-    LazyColumn(
-        Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        item {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    stringResource(R.string.title_sources),
-                    fontFamily = FontFamily.Serif,
-                    fontSize = 30.sp,
-                    modifier = Modifier.weight(1f),
-                )
-                IconAction(Icons.Outlined.Storage, "存储管理", Muted, action = storage)
-                IconAction(Icons.Outlined.Add, "添加来源") { adding = true }
-            }
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                stringResource(R.string.title_sources),
+                style = MaterialTheme.typography.headlineLarge,
+                color = Cream,
+                modifier = Modifier.weight(1f),
+            )
+            IconAction(Icons.Outlined.Storage, "存储管理", Muted, action = storage)
+            IconAction(Icons.Outlined.Add, "添加来源", Cream) { adding = true }
         }
-        items(sources, key = { it.id }) { source ->
-            Row(
-                Modifier.fillMaxWidth()
-                    .background(Surface, RoundedCornerShape(18.dp))
-                    .clickable {
-                        when (source.kindType) {
-                            SourceKind.ASMRONE -> online(source.id)
-                            SourceKind.DLSITE -> dlsite(source.id)
-                            else -> selectedId = source.id
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            items(sources, key = { it.id }) { source ->
+                val shape = RoundedCornerShape(18.dp)
+                val count = workCountsBySource[source.id] ?: 0
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clip(shape)
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+                        .clickable {
+                            when (source.kindType) {
+                                SourceKind.ASMRONE -> online(source.id)
+                                SourceKind.DLSITE -> dlsite(source.id)
+                                else -> selectedId = source.id
+                            }
+                        }
+                        .padding(start = 14.dp, top = 12.dp, bottom = 12.dp, end = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(42.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Rose.copy(alpha = 0.14f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            sourceIcon(source.kindType),
+                            null,
+                            tint = Rose,
+                            modifier = Modifier.size(21.dp),
+                        )
+                    }
+                    Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
+                        Text(
+                            source.name,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Cream,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        val statusText =
+                            when {
+                                source.id in busy ->
+                                    if (source.kindType == SourceKind.DLSITE) "同步中" else "扫描中"
+                                source.error != null ->
+                                    if (source.kindType == SourceKind.DLSITE) "同步失败" else "扫描失败"
+                                count > 0 -> "${sourceLabel(source.kindType)} · $count 部作品"
+                                else -> sourceLabel(source.kindType)
+                            }
+                        Text(
+                            statusText,
+                            style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                            color =
+                                if (source.error != null && source.id !in busy)
+                                    MaterialTheme.colorScheme.error
+                                else Muted,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
+                    if (source.id in busy) {
+                        CircularProgressIndicator(
+                            Modifier.padding(end = 10.dp).size(22.dp),
+                            color = Rose,
+                            strokeWidth = 2.dp,
+                        )
+                    } else if (source.kindType in setOf(SourceKind.ASMRONE, SourceKind.DLSITE)) {
+                        IconAction(Icons.Outlined.MoreVert, "管理${source.name}", Muted) {
+                            selectedId = source.id
+                        }
+                    } else {
+                        IconAction(Icons.Outlined.Refresh, "刷新${source.name}", Muted) {
+                            graph.sync.scheduleScan(source.id)
                         }
                     }
-                    .padding(start = 18.dp, top = 10.dp, bottom = 10.dp, end = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(
-                    if (source.kindType == SourceKind.LOCAL) Icons.Outlined.FolderOpen
-                    else Icons.Outlined.CloudQueue,
-                    null,
-                    tint = Rose,
-                )
-                Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
-                    Text(source.name, fontSize = 17.sp)
-                    if (source.id in busy) {
-                        Text(
-                            if (source.kindType == SourceKind.DLSITE) "同步中" else "扫描中",
-                            color = Muted,
-                            fontSize = 13.sp,
-                        )
-                    } else if (source.error != null) {
-                        Text(
-                            if (source.kindType == SourceKind.DLSITE) "同步失败" else "扫描失败",
-                            color = Rose,
-                            fontSize = 13.sp,
-                        )
-                    }
-                }
-                if (source.id in busy) {
-                    CircularProgressIndicator(
-                        Modifier.size(22.dp).padding(3.dp),
-                        strokeWidth = 2.dp,
-                    )
-                } else if (source.kindType in setOf(SourceKind.ASMRONE, SourceKind.DLSITE)) {
-                    IconAction(Icons.Outlined.MoreVert, "管理${source.name}", Muted) {
-                        selectedId = source.id
-                    }
-                } else {
-                    IconAction(Icons.Outlined.Refresh, "刷新${source.name}", Muted) {
-                        graph.sync.scheduleScan(source.id)
-                    }
                 }
             }
-        }
-        if (sources.isEmpty()) {
-            item {
-                FilledTonalButton(
-                    onClick = { adding = true },
-                    Modifier.fillMaxWidth().padding(vertical = 28.dp),
-                ) {
-                    Icon(Icons.Outlined.CreateNewFolder, null)
-                    Spacer(Modifier.width(10.dp))
-                    Text("添加作品")
-                }
-            }
-        }
-        if (offlineWorks.isNotEmpty()) {
-            item {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("离线", fontSize = 20.sp, modifier = Modifier.weight(1f))
-                    IconAction(Icons.Outlined.PlayArrow, "继续下载", Rose) {
-                        graph.offline.resumeDownloads()
-                    }
-                    IconAction(Icons.Outlined.Pause, "暂停下载", Muted) {
-                        graph.offline.pauseDownloads()
-                    }
-                }
-            }
-        }
-        items(offlineWorks, key = { it.id }) { work ->
-            val trackIds = trackIdsByWork[work.id].orEmpty()
-            val states = trackIds.mapNotNull { downloads[it] }
-            val complete =
-                work.offlineAttachments &&
-                    trackIds.all { downloads[it]?.state == Download.STATE_COMPLETED }
-            val failed = states.any { it.state == Download.STATE_FAILED }
-            val percentage =
-                states.map { it.percentDownloaded.takeIf { value -> value >= 0 } ?: 0f }.sum() /
-                    trackIds.size.coerceAtLeast(1)
-            Column(
-                Modifier.fillMaxWidth()
-                    .background(Surface, RoundedCornerShape(18.dp))
-                    .padding(18.dp),
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(work.title, Modifier.weight(1f), maxLines = 2, fontSize = 15.sp)
-                    IconAction(
-                        if (complete) Icons.Outlined.DeleteOutline else Icons.Outlined.Refresh,
-                        if (complete) "移除离线副本" else "重试下载",
-                        Muted,
+            if (sources.isEmpty()) {
+                item {
+                    WhispEmptyState(
+                        icon = Icons.Outlined.CreateNewFolder,
+                        title = "尚未配置媒体来源",
+                        subtitle = "支持本地目录、SMB、NFS、WebDAV、ASMR.ONE 与 DLsite",
+                        modifier = Modifier.padding(top = 36.dp),
                     ) {
-                        if (complete) runAction { graph.offline.removeOffline(work.id) }
-                        else runAction { graph.offline.downloadWork(work.id) }
+                        FilledTonalButton(onClick = { adding = true }) {
+                            Icon(Icons.Outlined.CreateNewFolder, null)
+                            Spacer(Modifier.width(10.dp))
+                            Text("添加作品")
+                        }
                     }
                 }
-                if (!complete) {
-                    LinearProgressIndicator(
-                        progress = { (percentage / 100).coerceIn(0f, 1f) },
-                        Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                        trackColor = Raised,
-                    )
-                    Text(
-                        if (failed) "下载失败" else "${percentage.toInt()}%",
-                        color = Muted,
-                        fontSize = 13.sp,
-                    )
+            }
+            if (offlineWorks.isNotEmpty()) {
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 8.dp, start = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "离线",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = Cream,
+                            modifier = Modifier.weight(1f),
+                        )
+                        IconAction(Icons.Outlined.PlayArrow, "继续下载", Rose) {
+                            graph.offline.resumeDownloads()
+                        }
+                        IconAction(Icons.Outlined.Pause, "暂停下载", Muted) {
+                            graph.offline.pauseDownloads()
+                        }
+                    }
+                }
+            }
+            items(offlineWorks, key = { it.id }) { work ->
+                val trackIds = trackIdsByWork[work.id].orEmpty()
+                val states = trackIds.mapNotNull { downloads[it] }
+                val complete =
+                    work.offlineAttachments &&
+                        trackIds.all { downloads[it]?.state == Download.STATE_COMPLETED }
+                val failed = states.any { it.state == Download.STATE_FAILED }
+                val percentage =
+                    states.map { it.percentDownloaded.takeIf { value -> value >= 0 } ?: 0f }.sum() /
+                        trackIds.size.coerceAtLeast(1)
+                val shape = RoundedCornerShape(18.dp)
+                Column(
+                    Modifier.fillMaxWidth()
+                        .clip(shape)
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+                        .clickable { openWork(work.id) }
+                        .padding(12.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Artwork(
+                            image = work.coverId?.let { WhispImage.Asset(it) },
+                            description = null,
+                            modifier =
+                                Modifier.size(width = 50.dp, height = 40.dp)
+                                    .clip(RoundedCornerShape(10.dp)),
+                        )
+                        Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                            Text(
+                                shortTitle(work.title).ifBlank { work.title },
+                                style = MaterialTheme.typography.titleSmall,
+                                color = Cream,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                when {
+                                    complete -> "已离线保存"
+                                    failed -> "下载失败"
+                                    else -> "下载中 · ${percentage.toInt()}%"
+                                },
+                                style =
+                                    MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                                color =
+                                    when {
+                                        failed -> MaterialTheme.colorScheme.error
+                                        complete -> Rose.copy(alpha = 0.85f)
+                                        else -> Muted
+                                    },
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                        IconAction(
+                            if (complete) Icons.Outlined.DeleteOutline else Icons.Outlined.Refresh,
+                            if (complete) "移除离线副本" else "重试下载",
+                            Muted,
+                        ) {
+                            if (complete) runAction { graph.offline.removeOffline(work.id) }
+                            else runAction { graph.offline.downloadWork(work.id) }
+                        }
+                    }
+                    if (!complete) {
+                        LinearProgressIndicator(
+                            progress = { (percentage / 100).coerceIn(0f, 1f) },
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .padding(top = 10.dp)
+                                    .height(4.dp)
+                                    .clip(RoundedCornerShape(999.dp)),
+                            color = if (failed) MaterialTheme.colorScheme.error else Rose,
+                            trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        )
+                    }
                 }
             }
         }
     }
 
     if (adding) {
-        AlertDialog(
-            onDismissRequest = { adding = false },
-            containerColor = Surface,
-            title = { Text("添加来源") },
-            text = {
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    AddSourceRow(Icons.Outlined.AccountCircle, "DLsite") {
-                        adding = false
+        WhispSheet(onDismissRequest = { adding = false }) { dismiss ->
+            Text(
+                "添加来源",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+            )
+            Column(Modifier.verticalScroll(rememberScrollState()).navigationBarsPadding()) {
+                WhispSheetRow(
+                    icon = Icons.Outlined.AccountCircle,
+                    title = "DLsite",
+                    subtitle = "登录 viviON ID 同步已购音声",
+                    onClick = {
+                        dismiss()
                         login.launch(Intent(graph.context, DlsiteLoginActivity::class.java))
-                    }
-                    AddSourceRow(Icons.Outlined.Headphones, "ASMR.ONE") {
-                        adding = false
+                    },
+                )
+                WhispSheetRow(
+                    icon = Icons.Outlined.Headphones,
+                    title = "ASMR.ONE",
+                    subtitle = "浏览公开作品目录与在线字幕",
+                    onClick = {
+                        dismiss()
                         runAction { online(graph.library.addAsmrOne()) }
-                    }
-                    AddSourceRow(Icons.Outlined.FolderOpen, "本地目录") {
-                        adding = false
+                    },
+                )
+                WhispSheetRow(
+                    icon = Icons.Outlined.FolderOpen,
+                    title = "本地目录",
+                    subtitle = "授权扫描设备中的音频与视频文件夹",
+                    onClick = {
+                        dismiss()
                         folder.launch(null)
-                    }
-                    AddSourceRow(Icons.Outlined.Storage, "SMB") {
-                        adding = false
+                    },
+                )
+                WhispSheetRow(
+                    icon = Icons.Outlined.Dns,
+                    title = "SMB",
+                    subtitle = "连接局域网 SMB 2/3 文件共享",
+                    onClick = {
+                        dismiss()
                         remoteKind = SourceKind.SMB.raw
-                    }
-                    AddSourceRow(Icons.Outlined.CloudQueue, "WebDAV") {
-                        adding = false
+                    },
+                )
+                WhispSheetRow(
+                    icon = Icons.Outlined.CloudQueue,
+                    title = "WebDAV",
+                    subtitle = "通过 HTTPS 挂载远程媒体库",
+                    onClick = {
+                        dismiss()
                         remoteKind = SourceKind.WEBDAV.raw
-                    }
-                    AddSourceRow(Icons.Outlined.Storage, "NFS") {
-                        adding = false
+                    },
+                )
+                WhispSheetRow(
+                    icon = Icons.Outlined.Storage,
+                    title = "NFS",
+                    subtitle = "直连 NAS 导出目录（NFS 3 / 4.0 / 4.2）",
+                    onClick = {
+                        dismiss()
                         remoteKind = SourceKind.NFS.raw
-                    }
-                }
-            },
-            confirmButton = { TextButton(onClick = { adding = false }) { Text("取消") } },
-        )
+                    },
+                )
+                Spacer(Modifier.height(10.dp))
+            }
+        }
     }
 
     sources
@@ -277,13 +409,13 @@ internal fun SourcesPage(
         ?.let { source ->
             AlertDialog(
                 onDismissRequest = { selectedId = null },
-                containerColor = Surface,
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                 title = { Text(source.name) },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         if (source.kindType !in setOf(SourceKind.ASMRONE, SourceKind.DLSITE))
                             Text(source.root, color = Muted, fontSize = 13.sp)
-                        source.error?.let { Text(it, color = Rose) }
+                        source.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                         if (source.kindType == SourceKind.ASMRONE) {
                             TextButton(
                                 onClick = {
@@ -342,7 +474,10 @@ internal fun SourcesPage(
                             selectedId = null
                         },
                     ) {
-                        Text(if (source.kindType == SourceKind.DLSITE) "退出账号" else "移除来源")
+                        Text(
+                            if (source.kindType == SourceKind.DLSITE) "退出账号" else "移除来源",
+                            color = MaterialTheme.colorScheme.error,
+                        )
                     }
                 },
             )
@@ -350,19 +485,6 @@ internal fun SourcesPage(
 
     remoteKind?.let { raw ->
         SourceKind.of(raw)?.let { kind -> RemoteDialog(graph, kind) { remoteKind = null } }
-    }
-}
-
-@Composable
-private fun AddSourceRow(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    label: String,
-    onClick: () -> Unit,
-) {
-    TextButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Icon(icon, null)
-        Spacer(Modifier.width(12.dp))
-        Text(label)
     }
 }
 
@@ -387,7 +509,7 @@ private fun RemoteDialog(graph: AppGraph, kind: SourceKind, dismiss: () -> Unit)
         }
     AlertDialog(
         onDismissRequest = { if (!connecting) dismiss() },
-        containerColor = Surface,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
         title = { Text(title) },
         text = {
             Column(
@@ -476,7 +598,7 @@ private fun RemoteDialog(graph: AppGraph, kind: SourceKind, dismiss: () -> Unit)
                         }
                     }
                 }
-                error?.let { Text(it, color = Rose) }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
         },
         confirmButton = {
