@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 import java.util.Properties
+import org.gradle.api.file.FileCollection
+import org.gradle.api.tasks.InputFiles
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.process.CommandLineArgumentProvider
 
 plugins {
     alias(libs.plugins.android.application)
@@ -106,25 +111,42 @@ android {
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
 }
 
-// Unit test classes are independent (no fixed ports or shared dirs),
-// so spread them across forks instead of Gradle's single-fork default.
-tasks.withType<org.gradle.api.tasks.testing.Test> {
-    maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceIn(2, 8)
-    maxHeapSize = "2g"
+// Resolve Robolectric's pre-instrumented SDK jar via Gradle instead of MavenArtifactFetcher at
+// test runtime so it uses Gradle's dependency cache and retries, avoiding Maven Central flakes.
+val robolectricSdk =
+    configurations.create("robolectricSdk") {
+        isCanBeResolved = true
+        isCanBeConsumed = false
+        isTransitive = false
+    }
+
+class RobolectricOfflineSdkArgumentProvider(
+    @get:InputFiles @get:PathSensitive(PathSensitivity.NAME_ONLY) val sdkJars: FileCollection,
+) : CommandLineArgumentProvider {
+    override fun asArguments(): Iterable<String> =
+        listOf(
+            "-Drobolectric.offline=true",
+            "-Drobolectric.dependency.dir=${sdkJars.singleFile.parentFile.absolutePath}",
+        )
 }
 
-kotlin { compilerOptions { allWarningsAsErrors.set(true) } }
-
-ksp { arg("room.schemaLocation", "$projectDir/schemas") }
-
+// Unit test classes are independent (no fixed ports or shared dirs),
+// so spread them across forks instead of Gradle's single-fork default.
 val liveSmbTests = providers.environmentVariable("WHISP_SMB_TEST_CONFIG").isPresent
 
 tasks.withType<Test>().configureEach {
+    maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceIn(2, 8)
+    maxHeapSize = "2g"
+    jvmArgumentProviders.add(RobolectricOfflineSdkArgumentProvider(robolectricSdk))
     if (liveSmbTests) {
         outputs.upToDateWhen { false }
         outputs.doNotCacheIf("Live SMB tests depend on the current server state") { true }
     }
 }
+
+kotlin { compilerOptions { allWarningsAsErrors.set(true) } }
+
+ksp { arg("room.schemaLocation", "$projectDir/schemas") }
 
 dependencies {
     constraints {
@@ -165,6 +187,7 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.robolectric)
+    robolectricSdk(libs.robolectric.android.all)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.compose.ui.test.junit4)
