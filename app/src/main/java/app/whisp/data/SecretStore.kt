@@ -16,15 +16,21 @@ class SecretStoreException(message: String, cause: Throwable? = null) : IOExcept
 
 class SecretStore {
     private val alias = "whisp-source-credentials"
+    private var cachedKey: SecretKey? = null
     private val cache =
         object : LinkedHashMap<String, String>(32, 0.75f, true) {
             override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 32
         }
 
     @Synchronized
-    private fun key(): SecretKey {
+    private fun key(forceReload: Boolean = false): SecretKey {
+        if (!forceReload)
+            cachedKey?.let {
+                return it
+            }
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey(alias, null) as? SecretKey)?.let {
+            cachedKey = it
             return it
         }
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
@@ -40,18 +46,27 @@ class SecretStore {
                 )
             }
             .generateKey()
+            .also { cachedKey = it }
     }
 
     fun encrypt(value: String): String {
         if (value.isEmpty()) return ""
         return try {
-            val cipher =
-                Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key()) }
-            val bytes = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
-            Base64.encodeToString(bytes, Base64.NO_WRAP)
-        } catch (e: GeneralSecurityException) {
-            throw SecretStoreException("无法加密保存来源凭据", e)
+            encryptWith(value, key())
+        } catch (_: GeneralSecurityException) {
+            try {
+                encryptWith(value, key(forceReload = true))
+            } catch (e: GeneralSecurityException) {
+                throw SecretStoreException("无法加密保存来源凭据", e)
+            }
         }
+    }
+
+    private fun encryptWith(value: String, secretKey: SecretKey): String {
+        val cipher =
+            Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, secretKey) }
+        val bytes = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+        return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
     fun decrypt(value: String): String {
@@ -65,20 +80,27 @@ class SecretStore {
         // AES-GCM requires a 12-byte IV plus at least a 16-byte authentication tag.
         if (bytes.size < 28) throw SecretStoreException("来源凭据已损坏，请重新配置或登录")
         return try {
-            Cipher.getInstance("AES/GCM/NoPadding")
-                .apply {
-                    init(
-                        Cipher.DECRYPT_MODE,
-                        key(),
-                        GCMParameterSpec(128, bytes.copyOfRange(0, 12)),
-                    )
-                }
-                .doFinal(bytes.copyOfRange(12, bytes.size))
-                .toString(Charsets.UTF_8)
-        } catch (e: GeneralSecurityException) {
-            throw SecretStoreException("来源凭据已失效，请重新配置或登录", e)
+            decryptWith(bytes, key())
+        } catch (_: GeneralSecurityException) {
+            try {
+                decryptWith(bytes, key(forceReload = true))
+            } catch (e: GeneralSecurityException) {
+                throw SecretStoreException("来源凭据已失效，请重新配置或登录", e)
+            }
         }
     }
+
+    private fun decryptWith(bytes: ByteArray, secretKey: SecretKey): String =
+        Cipher.getInstance("AES/GCM/NoPadding")
+            .apply {
+                init(
+                    Cipher.DECRYPT_MODE,
+                    secretKey,
+                    GCMParameterSpec(128, bytes.copyOfRange(0, 12)),
+                )
+            }
+            .doFinal(bytes.copyOfRange(12, bytes.size))
+            .toString(Charsets.UTF_8)
 
     /** Key carries the ciphertext so password rotations never return stale entries. */
     fun decryptCached(source: SourceEntity): String =

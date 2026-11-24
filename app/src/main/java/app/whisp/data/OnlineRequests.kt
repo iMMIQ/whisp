@@ -6,6 +6,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.*
+import okio.BufferedSink
 
 internal class OnlineHttpException(val code: Int) : IOException("请求失败（$code）")
 
@@ -33,3 +34,31 @@ internal suspend fun OkHttpClient.onlineBytes(request: Request, limit: Int): Byt
             },
         )
     }
+
+internal suspend fun OkHttpClient.onlineCopyToSink(
+    request: Request,
+    sink: BufferedSink,
+    limit: Int,
+): Long = suspendCancellableCoroutine { continuation ->
+    val call = newCall(request)
+    continuation.invokeOnCancellation { call.cancel() }
+    call.enqueue(
+        object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (continuation.isActive) continuation.resumeWithException(e)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    val written = response.use {
+                        if (!it.isSuccessful) throw OnlineHttpException(it.code)
+                        copyBounded(it.body.byteStream(), sink, limit)
+                    }
+                    if (continuation.isActive) continuation.resume(written)
+                } catch (e: Exception) {
+                    if (continuation.isActive) continuation.resumeWithException(e)
+                }
+            }
+        },
+    )
+}

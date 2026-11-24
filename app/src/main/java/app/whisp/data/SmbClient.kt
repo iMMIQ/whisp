@@ -14,14 +14,46 @@ import com.hierynomus.smbj.share.DiskShare
 import java.io.Closeable
 import java.io.IOException
 import java.util.EnumSet
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import okio.ByteString.Companion.encodeUtf8
 
 /**
- * Each operation owns its session; playback, scans and downloads cannot close each other's handles.
+ * Pool-backed SMB client: reuses authenticated TCP/NTLM/SMB3 sessions across concurrent file reads
+ * and short-lived cache fragments with automatic idle eviction, while each operation still owns and
+ * closes its individual file handle independently.
  */
-class SmbClient(private val report: (String) -> Unit = {}) {
+class SmbClient(
+    private val idleTimeoutMs: Long = 45_000L,
+    private val report: (String) -> Unit = {},
+) {
+    constructor(report: (String) -> Unit) : this(idleTimeoutMs = 45_000L, report = report)
+
     private val encryptedConfig = buildConfig(encrypt = true)
     private val compatibleConfig = buildConfig(encrypt = false)
+
+    private data class PoolKey(
+        val sourceId: String,
+        val root: String,
+        val username: String,
+        val secretDigest: String,
+    )
+
+    private inner class PooledDisk(val key: PoolKey, val disk: Disk) {
+        var refCount: Int = 1
+        var closed: Boolean = false
+        var invalidated: Boolean = false
+        var idleFuture: ScheduledFuture<*>? = null
+    }
+
+    private val poolLock = Any()
+    private val pool = mutableMapOf<PoolKey, PooledDisk>()
+    private val cleaner by lazy {
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "whisp-smb-pool-idle").apply { isDaemon = true }
+        }
+    }
 
     private fun buildConfig(encrypt: Boolean): SmbConfig =
         SmbConfig.builder()
@@ -32,6 +64,155 @@ class SmbClient(private val report: (String) -> Unit = {}) {
             .withDfsEnabled(false)
             .withEncryptData(encrypt)
             .build()
+
+    private fun poolKey(source: SourceEntity, password: String): PoolKey =
+        PoolKey(
+            source.id,
+            source.root,
+            source.username,
+            password.encodeUtf8().sha256().hex(),
+        )
+
+    private fun acquireDisk(source: SourceEntity, password: String): PooledDisk {
+        val key = poolKey(source, password)
+        if (idleTimeoutMs > 0L) {
+            synchronized(poolLock) {
+                val existing = pool[key]
+                if (existing != null && !existing.closed && !existing.invalidated) {
+                    existing.idleFuture?.cancel(false)
+                    existing.idleFuture = null
+                    existing.refCount++
+                    return existing
+                }
+            }
+        }
+        val created = PooledDisk(key, Disk(source, password))
+        if (idleTimeoutMs <= 0L) return created
+        val stale = mutableListOf<PooledDisk>()
+        var adopted: PooledDisk? = null
+        synchronized(poolLock) {
+            val raced = pool[key]
+            if (raced != null && !raced.closed && !raced.invalidated) {
+                raced.idleFuture?.cancel(false)
+                raced.idleFuture = null
+                raced.refCount++
+                adopted = raced
+            } else {
+                // Evict older sessions for the same source (e.g., rotated password or changed
+                // root).
+                val iterator = pool.entries.iterator()
+                while (iterator.hasNext()) {
+                    val entry = iterator.next()
+                    if (entry.key.sourceId == source.id) {
+                        val old = entry.value
+                        old.invalidated = true
+                        old.idleFuture?.cancel(false)
+                        old.idleFuture = null
+                        iterator.remove()
+                        if (old.refCount == 0 && !old.closed) {
+                            old.closed = true
+                            stale += old
+                        }
+                    }
+                }
+                pool[key] = created
+            }
+        }
+        stale.forEach { it.disk.close() }
+        if (adopted != null) {
+            created.disk.close()
+            return adopted
+        }
+        return created
+    }
+
+    private fun releaseDisk(pooled: PooledDisk, broken: Boolean = false) {
+        if (idleTimeoutMs <= 0L) {
+            pooled.disk.close()
+            return
+        }
+        var shouldCloseNow = false
+        synchronized(poolLock) {
+            if (broken) {
+                pooled.invalidated = true
+                if (pool[pooled.key] === pooled) pool.remove(pooled.key)
+            }
+            pooled.refCount = (pooled.refCount - 1).coerceAtLeast(0)
+            if (pooled.refCount == 0) {
+                if (pooled.invalidated || pool[pooled.key] !== pooled) {
+                    if (!pooled.closed) {
+                        pooled.closed = true
+                        shouldCloseNow = true
+                    }
+                } else {
+                    pooled.idleFuture?.cancel(false)
+                    pooled.idleFuture =
+                        cleaner.schedule(
+                            { closeIfIdle(pooled) },
+                            idleTimeoutMs,
+                            TimeUnit.MILLISECONDS,
+                        )
+                }
+            }
+        }
+        if (shouldCloseNow) pooled.disk.close()
+    }
+
+    private fun closeIfIdle(pooled: PooledDisk) {
+        var shouldClose = false
+        synchronized(poolLock) {
+            if (pooled.refCount == 0 && !pooled.closed) {
+                if (pool[pooled.key] === pooled) pool.remove(pooled.key)
+                pooled.idleFuture = null
+                pooled.closed = true
+                shouldClose = true
+            }
+        }
+        if (shouldClose) pooled.disk.close()
+    }
+
+    fun evict(sourceId: String) {
+        val toClose = mutableListOf<PooledDisk>()
+        synchronized(poolLock) {
+            val iterator = pool.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.key.sourceId == sourceId) {
+                    val item = entry.value
+                    item.invalidated = true
+                    item.idleFuture?.cancel(false)
+                    item.idleFuture = null
+                    iterator.remove()
+                    if (item.refCount == 0 && !item.closed) {
+                        item.closed = true
+                        toClose += item
+                    }
+                }
+            }
+        }
+        toClose.forEach { it.disk.close() }
+    }
+
+    fun closeIdle() {
+        val toClose = mutableListOf<PooledDisk>()
+        synchronized(poolLock) {
+            val iterator = pool.entries.iterator()
+            while (iterator.hasNext()) {
+                val item = iterator.next().value
+                if (item.refCount == 0) {
+                    item.invalidated = true
+                    item.idleFuture?.cancel(false)
+                    item.idleFuture = null
+                    iterator.remove()
+                    if (!item.closed) {
+                        item.closed = true
+                        toClose += item
+                    }
+                }
+            }
+        }
+        toClose.forEach { it.disk.close() }
+    }
 
     private inner class Disk(source: SourceEntity, password: String) : Closeable {
         val address = SmbAddress.parse(source.root)
@@ -79,20 +260,22 @@ class SmbClient(private val report: (String) -> Unit = {}) {
         }
     }
 
-    suspend fun walk(source: SourceEntity, password: String): List<FileEntry> =
-        Disk(source, password).use { disk ->
+    suspend fun walk(source: SourceEntity, password: String): List<FileEntry> {
+        val pooled = acquireDisk(source, password)
+        var broken = false
+        try {
+            val disk = pooled.disk
             report("SMB session ready")
             val files = mutableListOf<FileEntry>()
-            walkTree(
+            walkTreeConcurrent(
                 root = "",
                 concurrency = 4,
-                listBatch = { batch ->
-                    parallelList(batch) { _, parent ->
-                        try {
-                            disk.share!!.list(disk.address.filePath(parent))
-                        } catch (e: Exception) {
-                            throw failure(e)
-                        }
+                listOne = { _, parent ->
+                    try {
+                        disk.share!!.list(disk.address.filePath(parent))
+                    } catch (e: Exception) {
+                        broken = true
+                        throw failure(e)
                     }
                 },
                 onDirectory = { parent, entries, enqueue ->
@@ -115,10 +298,15 @@ class SmbClient(private val report: (String) -> Unit = {}) {
                         if (directory) enqueue(path)
                     }
                 },
-                onLevel = { dirs -> report("SMB listed $dirs directories; ${files.size} entries") },
+                onProgress = { dirs ->
+                    report("SMB listed $dirs directories; ${files.size} entries")
+                },
             )
-            files
+            return files
+        } finally {
+            releaseDisk(pooled, broken = broken)
         }
+    }
 
     private fun openFile(disk: Disk, relative: String): com.hierynomus.smbj.share.File =
         disk.share!!.openFile(
@@ -139,7 +327,7 @@ class SmbClient(private val report: (String) -> Unit = {}) {
         uri: String,
     ) : RemoteReadHandle {
         private val relative = SmbAddress.assetPath(uri, source.id)
-        private var disk: Disk? = null
+        private var pooled: PooledDisk? = null
         private var file: com.hierynomus.smbj.share.File? = null
         override var length: Long = 0
             private set
@@ -149,13 +337,21 @@ class SmbClient(private val report: (String) -> Unit = {}) {
         }
 
         private fun connect() {
-            try {
-                disk = Disk(source, password)
-                file = openFile(disk!!, relative)
-                length = file!!.length
-            } catch (e: Exception) {
-                close()
-                throw failure(e)
+            for (attempt in 0..1) {
+                val acquired = acquireDisk(source, password)
+                try {
+                    pooled = acquired
+                    file = openFile(acquired.disk, relative)
+                    length = file!!.length
+                    return
+                } catch (e: Exception) {
+                    closeInternal(broken = true)
+                    if (
+                        attempt == 1 || e is SMBApiException || Thread.currentThread().isInterrupted
+                    ) {
+                        throw failure(e)
+                    }
+                }
             }
         }
 
@@ -165,23 +361,27 @@ class SmbClient(private val report: (String) -> Unit = {}) {
             } catch (e: Exception) {
                 if (Thread.currentThread().isInterrupted) throw failure(e)
                 val previousLength = length
-                close()
+                closeInternal(broken = true)
                 connect()
                 if (length != previousLength) throw IOException("SMB：文件已改变，请重新扫描")
                 return try {
                     file!!.read(buffer, offset, bufferOffset, count)
                 } catch (retry: Exception) {
+                    closeInternal(broken = true)
                     throw failure(retry)
                 }
             }
         }
 
-        override fun close() {
+        private fun closeInternal(broken: Boolean) {
             runCatching { file?.close() }
             file = null
-            disk?.close()
-            disk = null
+            val current = pooled
+            pooled = null
+            if (current != null) releaseDisk(current, broken = broken)
         }
+
+        override fun close() = closeInternal(broken = false)
     }
 
     fun range(

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import android.content.Context
+import android.os.PowerManager
 import android.util.LruCache
 import app.whisp.data.Cue
 import app.whisp.data.LibraryStore
@@ -14,8 +16,10 @@ import kotlinx.coroutines.flow.map
 
 /**
  * Subtitle loading, encoding-aware decoding, and bounded LRU caching owned by PlaybackCoordinator.
+ * Defers remote subtitle fetches while the screen is off with no active subtitle UI observers.
  */
 class SubtitleLoader(
+    private val context: Context,
     private val scope: CoroutineScope,
     private val library: LibraryStore,
     settings: SettingsStore,
@@ -27,8 +31,10 @@ class SubtitleLoader(
     var currentTrackId: String? = null
         private set
 
+    private val powerManager by lazy { context.getSystemService(PowerManager::class.java) }
     private val cache = LruCache<String, List<Cue>>(16)
     private var job: Job? = null
+    private var deferredTrackId: String? = null
     private var encoding: String = settings.settings.value.textEncoding
 
     init {
@@ -37,6 +43,11 @@ class SubtitleLoader(
                 .map { it.textEncoding }
                 .distinctUntilChanged()
                 .collect(::onEncodingChanged)
+        }
+        scope.launch {
+            cues.subscriptionCount.collect { count ->
+                if (count > 0) ensureLoaded()
+            }
         }
     }
 
@@ -52,15 +63,36 @@ class SubtitleLoader(
         ids.forEach { cache.remove(it) }
     }
 
-    fun load(id: String?, force: Boolean = false) {
-        if (!force && id != null && id == currentTrackId && job?.isActive == true) return
+    fun ensureLoaded() {
+        val pending = deferredTrackId ?: return
+        if (pending == currentTrackId && job?.isActive != true) {
+            deferredTrackId = null
+            load(pending, force = false, allowDeferred = false)
+        }
+    }
+
+    fun load(id: String?, force: Boolean = false, allowDeferred: Boolean = true) {
+        if (
+            !force &&
+                id != null &&
+                id == currentTrackId &&
+                (job?.isActive == true || (allowDeferred && deferredTrackId == id))
+        ) {
+            return
+        }
         job?.cancel()
+        deferredTrackId = null
         currentTrackId = id
         val cached = if (force || id == null) null else cache[id]
         cues.value = cached.orEmpty()
         loading.value = false
         error.value = null
         if (id == null || cached != null) return
+        val interactive = runCatching { powerManager?.isInteractive != false }.getOrDefault(true)
+        if (allowDeferred && !force && !interactive && cues.subscriptionCount.value == 0) {
+            deferredTrackId = id
+            return
+        }
         val requestedEncoding = encoding
         val nextJob =
             scope.launch(start = CoroutineStart.LAZY) {
@@ -100,7 +132,7 @@ class SubtitleLoader(
 
     fun retry(id: String? = currentTrackId) {
         if (id != null && id == currentTrackId && error.value != null && job?.isActive != true) {
-            load(id)
+            load(id, allowDeferred = false)
         }
     }
 }

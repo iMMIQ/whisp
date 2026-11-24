@@ -16,6 +16,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -369,7 +370,9 @@ internal fun WorkDetailScreen(
     val official = dlsiteStates[detail.work.id] ?: DlsiteUiState(seedDetails)
 
     val playback by graph.playback.state.collectAsStateWithLifecycle()
-    val history by graph.library.progress.collectAsStateWithLifecycle()
+    val remembered by
+        remember(detail.work.id) { graph.library.observeProgress(detail.work.id) }
+            .collectAsStateWithLifecycle(initialValue = null)
     val downloadSnapshot by
         remember(detail.work.id, detail.work.offlineAttachments, detail.tracks) {
                 graph.media.downloads
@@ -405,8 +408,6 @@ internal fun WorkDetailScreen(
     val sections = remember(detail.tracks) { TrackSections.groups(detail.tracks) }
     val totalDurationMs =
         remember(detail.tracks) { detail.tracks.sumOf { it.durationMs.coerceAtLeast(0L) } }
-    val remembered =
-        remember(history, detail.work.id) { history.firstOrNull { it.workId == detail.work.id } }
     val resume = inLibrary && remembered != null
     val finished =
         if (detail.tracks.any { it.id == playback.trackId }) playback.ended
@@ -1063,7 +1064,7 @@ private fun AttachmentDialog(
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
     var encoding by remember(attachment.id) { mutableStateOf(settings.textEncoding) }
     var rawBytes by remember(attachment.id) { mutableStateOf<ByteArray?>(null) }
-    var text by remember(attachment.id) { mutableStateOf<String?>(null) }
+    var chunks by remember(attachment.id) { mutableStateOf<List<String>?>(null) }
     var loading by remember(attachment.id) { mutableStateOf(true) }
     LaunchedEffect(attachment.id) {
         try {
@@ -1079,7 +1080,10 @@ private fun AttachmentDialog(
     }
     LaunchedEffect(rawBytes, encoding) {
         val bytes = rawBytes ?: return@LaunchedEffect
-        text = withContext(Dispatchers.Default) { TextEncoding.decode(bytes, encoding) }
+        chunks =
+            withContext(Dispatchers.Default) {
+                chunkLongText(TextEncoding.decode(bytes, encoding))
+            }
     }
     WhispSheet(onDismissRequest = dismiss) { _ ->
         Text(
@@ -1100,18 +1104,21 @@ private fun AttachmentDialog(
                 CircularProgressIndicator(color = Rose)
             }
         }
-        text?.let {
-            Text(
-                it,
-                style = MaterialTheme.typography.bodyLarge,
-                color = Cream,
-                lineHeight = 28.sp,
-                modifier =
-                    Modifier.fillMaxWidth()
-                        .heightIn(max = 550.dp)
-                        .verticalScroll(rememberScrollState())
-                        .padding(24.dp),
-            )
+        chunks?.let { parts ->
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 550.dp),
+                contentPadding = PaddingValues(24.dp),
+            ) {
+                itemsIndexed(parts, key = { idx, _ -> idx }) { _, chunk ->
+                    Text(
+                        chunk,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = Cream,
+                        lineHeight = 28.sp,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
         }
         Spacer(Modifier.navigationBarsPadding())
     }

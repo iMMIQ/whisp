@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.util.Log
+import android.util.LruCache
 import coil3.ImageLoader
 import coil3.decode.DataSource
 import coil3.decode.ImageSource
@@ -14,6 +15,7 @@ import coil3.fetch.FetchResult
 import coil3.fetch.Fetcher
 import coil3.fetch.SourceFetchResult
 import coil3.key.Keyer
+import coil3.memory.MemoryCache
 import coil3.request.Options
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -24,10 +26,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okio.Buffer
+import okio.BufferedSink
 import okio.FileSystem
 import okio.Path.Companion.toOkioPath
+import okio.buffer
 
 /** Typed Coil 3 image model replacing the custom ArtworkStore / ImageFileCache / Singleflight. */
 sealed interface WhispImage {
@@ -76,24 +82,53 @@ class WhispImages(
     private val offlineDir: File,
     private val customArtworkDir: File,
     private val readAsset: suspend (String, Int) -> ByteArray,
+    private val streamAsset: suspend (String, BufferedSink, Int) -> Long,
+    private val streamingCacheBytes: () -> Long,
+    private val downloadCacheBytes: () -> Long,
     private val storageChanged: () -> Unit,
 ) {
     val cacheEpoch = MutableStateFlow(0)
 
-    val diskCache: DiskCache =
+    private val thumbnailCache = LruCache<String, ByteArray>(32)
+
+    private class FetchLockEntry {
+        val mutex = Mutex()
+        var waiters = 0
+    }
+
+    private val fetchLocks = mutableMapOf<String, FetchLockEntry>()
+
+    private suspend fun <T> withFetchLock(key: String, block: suspend () -> T): T {
+        val entry =
+            synchronized(fetchLocks) {
+                fetchLocks.getOrPut(key) { FetchLockEntry() }.also { it.waiters++ }
+            }
+        return try {
+            entry.mutex.withLock { block() }
+        } finally {
+            synchronized(fetchLocks) {
+                entry.waiters--
+                if (entry.waiters == 0 && fetchLocks[key] === entry) fetchLocks.remove(key)
+            }
+        }
+    }
+
+    val diskCache: DiskCache by lazy {
         DiskCache.Builder()
             .directory(File(context.cacheDir, "images").toOkioPath())
             .maxSizeBytes(88L * MIB)
             .build()
+    }
 
-    val imageLoader: ImageLoader =
+    val imageLoader: ImageLoader by lazy {
         ImageLoader.Builder(context)
-            .diskCache(diskCache)
+            .diskCache { diskCache }
             .components {
                 add(Keyer<WhispImage> { data, _ -> "${data.diskKey}#${data.epoch}" })
                 add(WhispImageFetcherFactory())
             }
             .build()
+    }
 
     init {
         scope.launch(Dispatchers.IO) {
@@ -138,32 +173,51 @@ class WhispImages(
         try {
             diskCache.fileSystem.write(editor.data) { write(bytes) }
             editor.commit()
+            thumbnailCache.remove(id)
             storageChanged()
         } catch (_: Exception) {
             editor.abort()
         }
     }
 
+    private fun evictMemoryKey(id: String) {
+        thumbnailCache.remove(id)
+        val mem = imageLoader.memoryCache ?: return
+        val prefix = "img:$id#"
+        val exact = MemoryCache.Key("$prefix${cacheEpoch.value}")
+        mem.remove(exact)
+        mem.keys.filter { it.key.startsWith(prefix) }.forEach(mem::remove)
+    }
+
     fun removeFromMemoryAndDisk(id: String) {
         diskCache.remove("img:$id")
-        imageLoader.memoryCache?.clear()
+        evictMemoryKey(id)
     }
 
     suspend fun purgeWorkAssets(workId: String, assets: Set<String>) =
+        purgeBatch(listOf(workId to assets))
+
+    suspend fun purgeBatch(workAssets: List<Pair<String, Set<String>>>) =
         withContext(Dispatchers.IO) {
-            for (asset in assets) {
-                if (!dao.otherOfflineCover(asset, workId)) File(offlineDir, asset).delete()
-                if (!dao.otherCover(asset, workId)) {
-                    File(customArtworkDir, asset).delete()
-                    diskCache.remove("img:$asset")
+            if (workAssets.isEmpty()) return@withContext
+            val removedIds = mutableSetOf<String>()
+            for ((workId, assets) in workAssets) {
+                for (asset in assets) {
+                    if (!dao.otherOfflineCover(asset, workId)) File(offlineDir, asset).delete()
+                    if (!dao.otherCover(asset, workId)) {
+                        File(customArtworkDir, asset).delete()
+                        diskCache.remove("img:$asset")
+                        removedIds += asset
+                    }
                 }
             }
-            imageLoader.memoryCache?.clear()
+            removedIds.forEach(::evictMemoryKey)
             storageChanged()
         }
 
     suspend fun clearCaches(clearStreaming: () -> Unit) =
         withContext(Dispatchers.IO) {
+            thumbnailCache.evictAll()
             imageLoader.memoryCache?.clear()
             diskCache.clear()
             File(context.cacheDir, "diagnostics").listFiles()?.forEach { it.delete() }
@@ -178,8 +232,8 @@ class WhispImages(
                 if (file.isFile) file.length() else file.listFiles()?.sumOf { size(it) } ?: 0L
             StorageUsage(
                 images = diskCache.size,
-                streaming = size(File(context.cacheDir, "streaming")),
-                offline = size(File(context.filesDir, "offline/audio")) + size(offlineDir),
+                streaming = streamingCacheBytes(),
+                offline = downloadCacheBytes() + size(offlineDir),
                 customArtwork = size(customArtworkDir),
                 library =
                     size(File(context.dataDir, "databases")) +
@@ -189,22 +243,32 @@ class WhispImages(
             )
         }
 
-    /** Generates a <=64 KiB 320px WebP thumbnail for SystemUI notifications & MediaBrowser. */
+    /**
+     * Generates a cached <=64 KiB 320px WebP thumbnail for SystemUI notifications & MediaBrowser.
+     */
     fun thumbnailBytes(id: String?): ByteArray? {
         if (id == null) return null
-        durableFile(id)?.let {
-            return decodeThumbnail(it.path)
+        thumbnailCache[id]?.let {
+            return it
         }
-        return diskCache.openSnapshot("img:$id")?.use { snapshot ->
-            decodeThumbnail(snapshot.data.toFile().path)
-        }
+        val encoded =
+            durableFile(id)?.let { decodeThumbnail(it.path) }
+                ?: diskCache.openSnapshot("img:$id")?.use { snapshot ->
+                    decodeThumbnail(snapshot.data.toFile().path)
+                }
+        if (encoded != null) thumbnailCache.put(id, encoded)
+        return encoded
     }
 
     private fun decodeThumbnail(path: String): ByteArray? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        val options = BitmapFactory.Options().apply { inSampleSize = 1 }
+        val options =
+            BitmapFactory.Options().apply {
+                inSampleSize = 1
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
         while (maxOf(bounds.outWidth, bounds.outHeight) / options.inSampleSize > 320) {
             options.inSampleSize *= 2
         }
@@ -236,58 +300,92 @@ class WhispImages(
                     dataSource = DataSource.DISK,
                 )
             }
-            diskCache.openSnapshot(data.diskKey)?.let { snapshot ->
-                return SourceFetchResult(
+            openCached(data.diskKey)?.let {
+                return it
+            }
+            return withFetchLock(data.diskKey) {
+                durableFile(data.id)?.let { file ->
+                    return@withFetchLock SourceFetchResult(
+                        source =
+                            ImageSource(file = file.toOkioPath(), fileSystem = FileSystem.SYSTEM),
+                        mimeType = null,
+                        dataSource = DataSource.DISK,
+                    )
+                }
+                openCached(data.diskKey)?.let {
+                    return@withFetchLock it
+                }
+                val editor = diskCache.openEditor(data.diskKey)
+                if (editor != null) {
+                    val snapshot =
+                        try {
+                            val written =
+                                withContext(Dispatchers.IO) {
+                                    diskCache.fileSystem.sink(editor.data).buffer().use { sink ->
+                                        streamDataToSink(data, sink)
+                                    }
+                                }
+                            if (written <= 0L) throw IOException("图片不可读")
+                            editor.commitAndOpenSnapshot()
+                        } catch (e: Exception) {
+                            editor.abort()
+                            throw e
+                        }
+                    if (snapshot != null) {
+                        storageChanged()
+                        return@withFetchLock SourceFetchResult(
+                            source =
+                                ImageSource(
+                                    file = snapshot.data,
+                                    fileSystem = diskCache.fileSystem,
+                                    diskCacheKey = data.diskKey,
+                                    closeable = snapshot,
+                                ),
+                            mimeType = null,
+                            dataSource = DataSource.NETWORK,
+                        )
+                    }
+                }
+                val bytes =
+                    when (data) {
+                        is WhispImage.Official ->
+                            sources.fetchDlsiteBytes(data.url, 16 * 1024 * 1024)
+                        is WhispImage.Catalog ->
+                            sources.fetchCatalogBytes(data.url, data.sourceId, 16 * 1024 * 1024)
+                        is WhispImage.Asset -> readAsset(data.id, 64 * 1024 * 1024)
+                    }
+                if (bytes.isEmpty()) throw IOException("图片不可读")
+                SourceFetchResult(
+                    source =
+                        ImageSource(source = Buffer().write(bytes), fileSystem = FileSystem.SYSTEM),
+                    mimeType = null,
+                    dataSource = DataSource.NETWORK,
+                )
+            }
+        }
+
+        private fun openCached(diskKey: String): SourceFetchResult? =
+            diskCache.openSnapshot(diskKey)?.let { snapshot ->
+                SourceFetchResult(
                     source =
                         ImageSource(
                             file = snapshot.data,
                             fileSystem = diskCache.fileSystem,
-                            diskCacheKey = data.diskKey,
+                            diskCacheKey = diskKey,
                             closeable = snapshot,
                         ),
                     mimeType = null,
                     dataSource = DataSource.DISK,
                 )
             }
-            val bytes =
-                when (data) {
-                    is WhispImage.Official -> sources.fetchDlsiteBytes(data.url, 16 * 1024 * 1024)
-                    is WhispImage.Catalog ->
-                        sources.fetchCatalogBytes(data.url, data.sourceId, 16 * 1024 * 1024)
-                    is WhispImage.Asset -> readAsset(data.id, 64 * 1024 * 1024)
-                }
-            if (bytes.isEmpty()) throw IOException("图片不可读")
-            val editor = diskCache.openEditor(data.diskKey)
-            if (editor != null) {
-                val snapshot =
-                    try {
-                        diskCache.fileSystem.write(editor.data) { write(bytes) }
-                        editor.commitAndOpenSnapshot()
-                    } catch (e: Exception) {
-                        editor.abort()
-                        throw e
-                    }
-                if (snapshot != null) {
-                    storageChanged()
-                    return SourceFetchResult(
-                        source =
-                            ImageSource(
-                                file = snapshot.data,
-                                fileSystem = diskCache.fileSystem,
-                                diskCacheKey = data.diskKey,
-                                closeable = snapshot,
-                            ),
-                        mimeType = null,
-                        dataSource = DataSource.NETWORK,
-                    )
-                }
+
+        private suspend fun streamDataToSink(data: WhispImage, sink: BufferedSink): Long =
+            when (data) {
+                is WhispImage.Official ->
+                    sources.streamDlsiteToSink(data.url, sink, 16 * 1024 * 1024)
+                is WhispImage.Catalog ->
+                    sources.streamCatalogToSink(data.url, data.sourceId, sink, 16 * 1024 * 1024)
+                is WhispImage.Asset -> streamAsset(data.id, sink, 64 * 1024 * 1024)
             }
-            return SourceFetchResult(
-                source =
-                    ImageSource(source = Buffer().write(bytes), fileSystem = FileSystem.SYSTEM),
-                mimeType = null,
-                dataSource = DataSource.NETWORK,
-            )
-        }
     }
 }

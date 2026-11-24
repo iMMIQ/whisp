@@ -53,6 +53,9 @@ struct FakeJniState {
     std::string exception_class;
     std::string exception_message;
     int calls_while_exception_pending = 0;
+    int find_class_calls = 0;
+    int new_global_ref_calls = 0;
+    int delete_global_ref_calls = 0;
     std::vector<FakeByteArray *> byte_arrays;
     std::vector<FakeLongArray *> long_arrays;
     std::vector<FakeObjectArray *> object_arrays;
@@ -90,7 +93,26 @@ jboolean jni_exception_check(JNIEnv *) { return g_jni.has_exception ? JNI_TRUE :
 
 jclass jni_find_class(JNIEnv *, const char *name) {
     check_no_pending_exception();
+    g_jni.find_class_calls++;
     return reinterpret_cast<jclass>(const_cast<char *>(name));
+}
+
+jobject jni_new_global_ref(JNIEnv *, jobject obj) {
+    check_no_pending_exception();
+    g_jni.new_global_ref_calls++;
+    return obj;
+}
+
+void jni_delete_global_ref(JNIEnv *, jobject) {
+    check_no_pending_exception();
+    g_jni.delete_global_ref_calls++;
+}
+
+JNIEnv *g_vm_env = nullptr;
+
+jint jvm_get_env(JavaVM *, void **penv, jint) {
+    *penv = g_vm_env;
+    return g_vm_env ? JNI_OK : JNI_EDETACHED;
 }
 
 jint jni_throw_new(JNIEnv *, jclass cls, const char *msg) {
@@ -276,8 +298,20 @@ int main() {
     table.NewObjectV = jni_new_object_v;
     table.SetObjectArrayElement = jni_set_object_array_element;
     table.DeleteLocalRef = jni_delete_local_ref;
+    table.NewGlobalRef = jni_new_global_ref;
+    table.DeleteGlobalRef = jni_delete_global_ref;
 
     JNIEnv env{&table};
+    g_vm_env = &env;
+    JNIInvokeInterface_ vm_table{};
+    vm_table.GetEnv = jvm_get_env;
+    JavaVM vm{&vm_table};
+
+    // 0. JNI_OnLoad caches NfsNativeEntry class/ctor so entries() skips FindClass lookups.
+    assert(JNI_OnLoad(&vm, nullptr) == JNI_VERSION_1_6);
+    assert(g_entry_class != nullptr);
+    assert(g_entry_ctor != nullptr);
+    assert(g_jni.new_global_ref_calls == 1);
 
     // 1. Embedded NUL in host must fail without issuing a second JNI call under pending exception.
     g_jni.reset();
@@ -312,12 +346,25 @@ int main() {
         {nullptr, 1, 0, {0}},
         {"future.flac", 1, 1024, {4102444800LL}}, // Year 2100 (> 32-bit signed max)
     };
+    const int find_calls_before_entries = g_jni.find_class_calls;
     auto *entries_obj = reinterpret_cast<FakeObjectArray *>(
         Java_app_whisp_data_NfsNative_entries(&env, nullptr, ptr, make_bytes("/")));
     assert(entries_obj != nullptr);
+    assert(g_jni.find_class_calls == find_calls_before_entries);
     assert(entries_obj->items.size() == 1);
     assert(entries_obj->items[0]->name == "future.flac");
     assert(entries_obj->items[0]->modified == 4102444800LL);
+
+    // Unload clears cached refs; fallback lookup must still work without crashing.
+    JNI_OnUnload(&vm, nullptr);
+    assert(g_entry_class == nullptr);
+    assert(g_entry_ctor == nullptr);
+    assert(g_jni.delete_global_ref_calls == 1);
+    auto *entries_after_unload = reinterpret_cast<FakeObjectArray *>(
+        Java_app_whisp_data_NfsNative_entries(&env, nullptr, ptr, make_bytes("/")));
+    assert(entries_after_unload != nullptr);
+    assert(entries_after_unload->items.size() == 1);
+    assert(g_jni.find_class_calls == find_calls_before_entries + 1);
 
     // Oversized file must report -EFBIG (not -EISDIR).
     g_jni.reset();

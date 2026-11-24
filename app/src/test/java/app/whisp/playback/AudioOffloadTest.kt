@@ -21,8 +21,19 @@ class AudioOffloadTest {
             TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED,
             preferences.audioOffloadMode,
         )
-        assertTrue(preferences.isGaplessSupportRequired)
+        assertFalse(preferences.isGaplessSupportRequired)
         assertFalse(preferences.isSpeedChangeSupportRequired)
+        assertTrue(AudioOffload.preferences(gaplessRequired = true).isGaplessSupportRequired)
+    }
+
+    @Test
+    fun whispLoadControlProvidesBurstHysteresis() {
+        assertNotNull(WhispLoadControl.create())
+        assertTrue(
+            WhispLoadControl.STREAMING_MAX_BUFFER_MS > WhispLoadControl.STREAMING_MIN_BUFFER_MS,
+        )
+        assertTrue(WhispLoadControl.LOCAL_MAX_BUFFER_MS > WhispLoadControl.LOCAL_MIN_BUFFER_MS)
+        assertTrue(WhispLoadControl.TARGET_BUFFER_BYTES >= 16 * 1024 * 1024)
     }
 
     @Test

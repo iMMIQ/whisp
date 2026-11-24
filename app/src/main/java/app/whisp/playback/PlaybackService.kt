@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.os.Bundle
 import androidx.media3.common.*
+import androidx.media3.common.util.ExperimentalApi
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -25,7 +26,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
 /** Thin MediaLibraryService owning ExoPlayer lifecycle, SystemUI media session, and progress IO. */
-@androidx.annotation.OptIn(UnstableApi::class)
+@androidx.annotation.OptIn(UnstableApi::class, ExperimentalApi::class)
 class PlaybackService : MediaLibraryService() {
     companion object {
         const val TIMER = "whisp.timer"
@@ -43,12 +44,17 @@ class PlaybackService : MediaLibraryService() {
     private var session: MediaLibrarySession? = null
     private var currentTrackId: String? = null
     private var checkpointJob: Job? = null
+    private var currentWakeMode: Int = C.WAKE_MODE_LOCAL
+    private var sleepingForOffload: Boolean = false
+    private var videoTrackEnabled: Boolean = false
+    private var textTrackEnabled: Boolean = false
 
     override fun onCreate() {
         super.onCreate()
         player =
             ExoPlayer.Builder(this)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(graph.media.playbackFactory))
+                .setLoadControl(WhispLoadControl.create())
                 .setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(C.USAGE_MEDIA)
@@ -57,11 +63,12 @@ class PlaybackService : MediaLibraryService() {
                     true,
                 )
                 .setHandleAudioBecomingNoisy(true)
-                .setWakeMode(C.WAKE_MODE_NETWORK)
+                .setWakeMode(C.WAKE_MODE_LOCAL)
+                .experimentalSetDynamicSchedulingEnabled(true)
                 .setSeekBackIncrementMs(10_000)
                 .setSeekForwardIncrementMs(10_000)
                 .build()
-        setVideoEnabled(false)
+        applyTrackDisables(videoEnabled = false, textEnabled = false, force = true)
         loop = AbLoopController(player, ::publishSessionState)
         timer =
             SleepTimerController(
@@ -79,16 +86,31 @@ class PlaybackService : MediaLibraryService() {
         AudioOffload.apply(player, loop, timer)
         installPlayerListener()
         session = buildMediaSession()
-        graph.playback.attach(player, loop, timer, ::setVideoEnabled)
+        graph.playback.attach(player, loop, timer, ::setVideoEnabled, ::setTextEnabled)
         observeSettings()
     }
 
     private fun installPlayerListener() {
+        player.addAudioOffloadListener(
+            object : ExoPlayer.AudioOffloadListener {
+                override fun onSleepingForOffloadChanged(sleeping: Boolean) {
+                    if (sleepingForOffload == sleeping) return
+                    sleepingForOffload = sleeping
+                    if (sleeping) saveProgress()
+                    reconcileCheckpoint()
+                }
+            },
+        )
         player.addListener(
             object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     if (isPlaying) loop.onReady()
+                    reconcileWakeMode()
                     saveProgress()
+                }
+
+                override fun onIsLoadingChanged(isLoading: Boolean) {
+                    reconcileWakeMode()
                 }
 
                 override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -103,12 +125,14 @@ class PlaybackService : MediaLibraryService() {
                         loop.onPauseRequested()
                         saveProgress()
                     }
+                    reconcileWakeMode()
                 }
 
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                     if (mediaItem?.mediaId != currentTrackId) {
                         currentTrackId = mediaItem?.mediaId
                         loop.onTrackTransition()
+                        reconcileWakeMode()
                         saveProgress()
                     }
                 }
@@ -116,6 +140,7 @@ class PlaybackService : MediaLibraryService() {
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     if (playbackState == Player.STATE_ENDED && player.playWhenReady) player.pause()
                     if (playbackState == Player.STATE_READY) loop.onReady()
+                    reconcileWakeMode()
                     val id = player.currentMediaItem?.mediaId ?: return
                     val duration = player.duration
                     if (
@@ -146,6 +171,7 @@ class PlaybackService : MediaLibraryService() {
                     if (oldPosition.mediaItem?.mediaId != newPosition.mediaItem?.mediaId) {
                         savePosition(oldPosition.mediaItem, oldPosition.positionMs)
                     }
+                    reconcileWakeMode()
                     if (!loopSeek) saveProgress()
                 }
 
@@ -299,10 +325,7 @@ class PlaybackService : MediaLibraryService() {
                     ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.ioResult {
                         val snapshot = catalog.snapshot() ?: error("暂无播放记录")
                         if (isForPlayback) {
-                            val items =
-                                snapshot.tracks.map {
-                                    graph.playback.mediaItem(it, snapshot.work)
-                                }
+                            val items = graph.playback.mediaItems(snapshot.tracks, snapshot.work)
                             MediaSession.MediaItemsWithStartPosition(
                                 items,
                                 snapshot.position.index,
@@ -363,11 +386,28 @@ class PlaybackService : MediaLibraryService() {
                                         .chunked(500)
                                         .flatMap { graph.library.dao.worksByIds(it) }
                                         .associateBy { it.id }
+                                val artworkByCover =
+                                    if (hide) emptyMap()
+                                    else
+                                        works.values
+                                            .mapNotNull { it.coverId }
+                                            .distinct()
+                                            .mapNotNull { coverId ->
+                                                graph.images.thumbnailBytes(coverId)?.let {
+                                                    coverId to it
+                                                }
+                                            }
+                                            .toMap()
                                 tracks
                                     .mapNotNull { track ->
                                         works[track.workId]?.let { work ->
                                             track.id to
-                                                graph.playback.mediaMetadata(track, work, hide)
+                                                graph.playback.mediaMetadata(
+                                                    track,
+                                                    work,
+                                                    hide,
+                                                    work.coverId?.let(artworkByCover::get),
+                                                )
                                         }
                                     }
                                     .toMap()
@@ -394,11 +434,49 @@ class PlaybackService : MediaLibraryService() {
     }
 
     private fun setVideoEnabled(enabled: Boolean) {
+        applyTrackDisables(videoEnabled = enabled, textEnabled = textTrackEnabled)
+    }
+
+    private fun setTextEnabled(enabled: Boolean) {
+        applyTrackDisables(videoEnabled = videoTrackEnabled, textEnabled = enabled)
+    }
+
+    private fun applyTrackDisables(
+        videoEnabled: Boolean,
+        textEnabled: Boolean,
+        force: Boolean = false,
+    ) {
+        if (!force && videoTrackEnabled == videoEnabled && textTrackEnabled == textEnabled) return
+        videoTrackEnabled = videoEnabled
+        textTrackEnabled = textEnabled
         player.trackSelectionParameters =
             player.trackSelectionParameters
                 .buildUpon()
-                .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, !enabled)
+                .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, !videoEnabled)
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, !textEnabled)
+                // Metadata renderer is unused and keeping it active blocks Media3 offload sleep.
+                .setTrackTypeDisabled(C.TRACK_TYPE_METADATA, true)
                 .build()
+    }
+
+    private fun reconcileWakeMode() {
+        val item = player.currentMediaItem
+        val scheme = item?.localConfiguration?.uri?.scheme?.lowercase()
+        val trackId = item?.mediaId
+        val isLocal =
+            scheme == null ||
+                scheme == "file" ||
+                scheme == "content" ||
+                (trackId != null && trackId in graph.media.completedDownloads.value)
+        val fullyBuffered =
+            !player.isLoading &&
+                player.playbackState == Player.STATE_READY &&
+                player.bufferedPercentage >= 100
+        val desired = if (isLocal || fullyBuffered) C.WAKE_MODE_LOCAL else C.WAKE_MODE_NETWORK
+        if (desired != currentWakeMode) {
+            currentWakeMode = desired
+            player.setWakeMode(desired)
+        }
     }
 
     private fun publishSessionState() {
@@ -417,15 +495,16 @@ class PlaybackService : MediaLibraryService() {
 
     private fun reconcileCheckpoint() {
         val playbackState = player.playbackState
-        if (
-            player.playWhenReady &&
+        val shouldRun =
+            !sleepingForOffload &&
+                player.playWhenReady &&
                 (playbackState == Player.STATE_READY || playbackState == Player.STATE_BUFFERING)
-        ) {
+        if (shouldRun) {
             if (checkpointJob?.isActive != true) {
                 checkpointJob = scope.launch {
                     while (isActive) {
                         delay(15_000)
-                        if (player.isPlaying) saveProgress()
+                        if (player.isPlaying && !sleepingForOffload) saveProgress()
                     }
                 }
             }

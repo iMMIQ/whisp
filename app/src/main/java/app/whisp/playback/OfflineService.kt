@@ -21,6 +21,8 @@ class OfflineService :
     private val media
         get() = (application as WhispApp).graph.media
 
+    private val notificationHelper by lazy { DownloadNotificationHelper(this, "offline") }
+
     override fun getDownloadManager(): DownloadManager = media.downloadManager
 
     override fun getScheduler(): Scheduler = PlatformScheduler(this, 1701)
@@ -29,15 +31,14 @@ class OfflineService :
         downloads: MutableList<Download>,
         notMetRequirements: Int,
     ): Notification =
-        DownloadNotificationHelper(this, "offline")
-            .buildProgressNotification(
-                this,
-                R.drawable.ic_whisp,
-                null,
-                "离线保存",
-                downloads,
-                notMetRequirements,
-            )
+        notificationHelper.buildProgressNotification(
+            this,
+            R.drawable.ic_whisp,
+            null,
+            "离线保存",
+            downloads,
+            notMetRequirements,
+        )
 
     override fun onTimeout(startId: Int, fgsType: Int) {
         media.downloadManager.pauseDownloads()

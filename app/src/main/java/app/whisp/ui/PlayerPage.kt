@@ -42,12 +42,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
@@ -59,7 +57,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.media3.common.Player
 import app.whisp.AppGraph
 import app.whisp.R
@@ -72,6 +74,7 @@ import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -122,8 +125,11 @@ internal fun PlayerPage(
     val embeddedSubtitle by playback.embeddedSubtitle.collectAsStateWithLifecycle()
     val markA by playback.loopDraftStart.collectAsStateWithLifecycle()
     val lastClearedLoop by playback.lastClearedLoop.collectAsStateWithLifecycle()
-    val bookmarks by graph.library.bookmarks.collectAsStateWithLifecycle()
-    val history by graph.library.progress.collectAsStateWithLifecycle()
+    val workProgress by
+        remember(detail?.work?.id) {
+                detail?.work?.id?.let { graph.library.observeProgress(it) } ?: flowOf(null)
+            }
+            .collectAsStateWithLifecycle(initialValue = null)
 
     var fullscreen by rememberSaveable { mutableStateOf(false) }
     var queue by rememberSaveable { mutableStateOf(false) }
@@ -146,8 +152,8 @@ internal fun PlayerPage(
     val reduced = LocalReducedMotion.current
 
     val fallbackPosition =
-        remember(history, track?.id) {
-            history.firstOrNull { it.trackId == track?.id }?.positionMs ?: 0L
+        remember(workProgress, track?.id) {
+            workProgress?.takeIf { it.trackId == track?.id }?.positionMs ?: 0L
         }
     LaunchedEffect(track?.id, state.trackId) {
         if (state.trackId == null) playback.subtitles.load(track?.id)
@@ -158,6 +164,15 @@ internal fun PlayerPage(
             IconAction(Icons.AutoMirrored.Outlined.ArrowBack, "返回", action = back)
         }
         return
+    }
+
+    // Only keep Media3's embedded text renderer active while the player screen is visible and no
+    // external subtitle file is bound; disabling it in background/screen-off unlocks audio offload.
+    val subtitleOwner = remember { Any() }
+    val wantsEmbeddedSubtitles = track.subtitleId == null
+    LifecycleResumeEffect(playback, subtitleOwner, wantsEmbeddedSubtitles) {
+        playback.subtitleVisibility(subtitleOwner, wantsEmbeddedSubtitles)
+        onPauseOrDispose { playback.subtitleVisibility(subtitleOwner, false) }
     }
 
     val scripts =
@@ -306,34 +321,35 @@ internal fun PlayerPage(
             },
         )
     } else {
-        val dragFraction = (dismissOffsetY.value / with(density) { 260.dp.toPx() }).coerceIn(0f, 1f)
-        val dismissScale = 1f - dragFraction * 0.06f
-        val dismissCorner = (dragFraction * 28f).dp
+        val dismissRangePx = with(density) { 260.dp.toPx() }
         BoxWithConstraints(
             Modifier.fillMaxSize()
                 .graphicsLayer {
-                    translationY = dismissOffsetY.value
+                    val offsetY = dismissOffsetY.value
+                    val dragFraction = (offsetY / dismissRangePx).coerceIn(0f, 1f)
+                    val dismissScale = 1f - dragFraction * 0.06f
+                    translationY = offsetY
                     scaleX = dismissScale
                     scaleY = dismissScale
-                    if (dismissOffsetY.value > 1f) {
+                    if (offsetY > 1f) {
+                        val dismissCorner = (dragFraction * 28f).dp
                         shape = RoundedCornerShape(topStart = dismissCorner, topEnd = dismissCorner)
                         clip = true
                     }
                 }
                 .background(bg)
-                .drawBehind {
-                    drawRect(
-                        brush =
-                            Brush.radialGradient(
-                                colors =
-                                    listOf(
-                                        ambient.copy(alpha = if (amoled) 0.18f else 0.34f),
-                                        Color.Transparent,
-                                    ),
-                                center = Offset(size.width * 0.5f, size.height * 0.18f),
-                                radius = maxOf(size.width, size.height) * 0.72f,
-                            ),
-                    )
+                .drawWithCache {
+                    val brush =
+                        Brush.radialGradient(
+                            colors =
+                                listOf(
+                                    ambient.copy(alpha = if (amoled) 0.18f else 0.34f),
+                                    Color.Transparent,
+                                ),
+                            center = Offset(size.width * 0.5f, size.height * 0.18f),
+                            radius = maxOf(size.width, size.height) * 0.72f,
+                        )
+                    onDrawBehind { drawRect(brush = brush) }
                 }
                 .navigationBarsPadding(),
         ) {
@@ -538,6 +554,9 @@ internal fun PlayerPage(
         )
     }
     if (fragments) {
+        val workBookmarks by
+            remember(detail.work.id) { graph.library.observeBookmarks(detail.work.id) }
+                .collectAsStateWithLifecycle(initialValue = emptyList())
         PlayerFragmentsSheet(
             detail = detail,
             track = track,
@@ -546,7 +565,7 @@ internal fun PlayerPage(
             shownTrack = shownTrack,
             cues = cues,
             settings = settings,
-            bookmarks = bookmarks,
+            bookmarks = workBookmarks,
             playback = playback,
             onDeleteBookmark = { item ->
                 scope.launch {
@@ -994,10 +1013,9 @@ private fun EmbeddedScriptPane(
         }
     val selected = scripts.firstOrNull { it.id == selectedId } ?: scripts.first()
     var rawBytes by remember(selected.id) { mutableStateOf<ByteArray?>(null) }
-    var text by remember(selected.id) { mutableStateOf<String?>(null) }
+    var chunks by remember(selected.id) { mutableStateOf<List<String>?>(null) }
     var loading by remember(selected.id) { mutableStateOf(true) }
     var error by remember(selected.id) { mutableStateOf<String?>(null) }
-    val scroll = rememberScrollState()
 
     LaunchedEffect(selected.id) {
         loading = true
@@ -1014,7 +1032,10 @@ private fun EmbeddedScriptPane(
     }
     LaunchedEffect(rawBytes, encoding) {
         val bytes = rawBytes ?: return@LaunchedEffect
-        text = withContext(Dispatchers.Default) { TextEncoding.decode(bytes, encoding) }
+        chunks =
+            withContext(Dispatchers.Default) {
+                chunkLongText(TextEncoding.decode(bytes, encoding))
+            }
     }
 
     Column(modifier.testTag("script-pane")) {
@@ -1054,17 +1075,21 @@ private fun EmbeddedScriptPane(
                         color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                text != null ->
-                    Text(
-                        text!!,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = Cream.copy(alpha = 0.92f),
-                        lineHeight = 28.sp,
-                        modifier =
-                            Modifier.fillMaxSize()
-                                .verticalScroll(scroll)
-                                .padding(horizontal = 24.dp, vertical = 12.dp),
-                    )
+                chunks != null ->
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp),
+                    ) {
+                        itemsIndexed(chunks!!, key = { idx, _ -> idx }) { _, chunk ->
+                            Text(
+                                chunk,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = Cream.copy(alpha = 0.92f),
+                                lineHeight = 28.sp,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
             }
         }
     }
@@ -1161,12 +1186,14 @@ private fun PlayerTimeline(
     var fineBounds by remember(track.id) { mutableStateOf<LongRange?>(null) }
     val duration =
         state.durationMs.takeIf { state.trackId == track.id && it > 0 } ?: track.durationMs
-    val positionProvider: () -> Long = {
-        if (state.trackId == track.id) timeline.value else fallbackPosition
-    }
-    val bufferedProvider: () -> Long = {
-        if (state.trackId == track.id) buffered.value else 0L
-    }
+    val positionProvider: () -> Long =
+        remember(state.trackId, track.id, fallbackPosition) {
+            { if (state.trackId == track.id) timeline.value else fallbackPosition }
+        }
+    val bufferedProvider: () -> Long =
+        remember(state.trackId, track.id) {
+            { if (state.trackId == track.id) buffered.value else 0L }
+        }
     val previewCaptionProvider: ((Long) -> String?)? =
         remember(cues, subtitleOffsetMs) {
             if (cues.isEmpty()) null
@@ -1196,24 +1223,42 @@ private fun PlayerTimeline(
                 onScrubbingChange = onScrubbingChange,
             )
         }
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            val leftLabel =
-                fineBounds?.let { clock(it.first) } ?: clock(dragging ?: positionProvider())
-            val rightLabel = fineBounds?.let { clock(it.last) } ?: clock(duration)
-            Text(
-                leftLabel,
-                color = if (fineBounds != null) Rose.copy(alpha = 0.8f) else Muted,
-                style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
-            )
-            Text(
-                rightLabel,
-                color = if (fineBounds != null) Rose.copy(alpha = 0.8f) else Muted,
-                style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
-            )
+        TimelineLabels(
+            positionProvider = positionProvider,
+            dragging = dragging,
+            fineBounds = fineBounds,
+            duration = duration,
+        )
+    }
+}
+
+@Composable
+private fun TimelineLabels(
+    positionProvider: () -> Long,
+    dragging: Long?,
+    fineBounds: LongRange?,
+    duration: Long,
+) {
+    val displaySeconds by
+        remember(positionProvider, dragging) {
+            derivedStateOf { (dragging ?: positionProvider()).coerceAtLeast(0L) / 1000L }
         }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        val leftLabel = fineBounds?.let { clock(it.first) } ?: clock(displaySeconds * 1000L)
+        val rightLabel = fineBounds?.let { clock(it.last) } ?: clock(duration)
+        Text(
+            leftLabel,
+            color = if (fineBounds != null) Rose.copy(alpha = 0.8f) else Muted,
+            style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+        )
+        Text(
+            rightLabel,
+            color = if (fineBounds != null) Rose.copy(alpha = 0.8f) else Muted,
+            style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+        )
     }
 }
 
@@ -1225,12 +1270,19 @@ private fun ActiveModifiersRow(
     onOpenTimer: () -> Unit,
     onToggleInlineAb: () -> Unit,
 ) {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     var nowElapsed by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-    LaunchedEffect(state.timerEnd) {
+    LaunchedEffect(state.timerEnd, lifecycle) {
         if (state.timerEnd > 0L) {
-            while (true) {
-                nowElapsed = SystemClock.elapsedRealtime()
-                delay(15_000L)
+            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    val now = SystemClock.elapsedRealtime()
+                    nowElapsed = now
+                    val remainingMs = state.timerEnd - now
+                    if (remainingMs <= 0L) break
+                    val delayMs = ((remainingMs - 1L) % 60_000L) + 1L
+                    delay(delayMs.coerceAtLeast(1_000L))
+                }
             }
         }
     }
@@ -1846,22 +1898,10 @@ private fun SubtitlePane(
                 FilledTonalButton(onClick = onRetry) { Text("重试字幕", fontSize = 15.sp) }
             else Text("暂无字幕", color = Muted.copy(alpha = 0.7f), fontSize = 16.sp)
         } else {
+            val bg = MaterialTheme.colorScheme.background
+            val cueShape = remember { RoundedCornerShape(12.dp) }
             LazyColumn(
-                Modifier.fillMaxSize()
-                    .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
-                    .drawWithContent {
-                        drawContent()
-                        drawRect(
-                            brush =
-                                Brush.verticalGradient(
-                                    0.0f to Color.Transparent,
-                                    0.12f to Color.Black,
-                                    0.88f to Color.Black,
-                                    1.0f to Color.Transparent,
-                                ),
-                            blendMode = BlendMode.DstIn,
-                        )
-                    },
+                Modifier.fillMaxSize(),
                 state = list,
                 contentPadding =
                     PaddingValues(
@@ -1872,9 +1912,7 @@ private fun SubtitlePane(
                     ),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                itemsIndexed(cues, key = { index, cue -> "$index|${cue.startMs}|${cue.endMs}" }) {
-                    index,
-                    cue ->
+                itemsIndexed(cues, key = { index, _ -> index }) { index, cue ->
                     val isActive = index == active
                     val targetColor =
                         when {
@@ -1888,17 +1926,19 @@ private fun SubtitlePane(
                             tween(if (reduced) 0 else 140),
                             label = "subtitle-highlight",
                         )
-                    val highlightAlpha by
+                    val highlightAlphaState =
                         animateFloatAsState(
                             if (isActive) 0.11f else 0f,
                             tween(if (reduced) 0 else 160),
                             label = "subtitle-bg",
                         )
-                    val cueShape = RoundedCornerShape(12.dp)
                     Box(
                         Modifier.fillMaxWidth()
                             .clip(cueShape)
-                            .background(Rose.copy(alpha = highlightAlpha))
+                            .drawBehind {
+                                val alpha = highlightAlphaState.value
+                                if (alpha > 0.001f) drawRect(Rose.copy(alpha = alpha))
+                            }
                             .combinedClickable(
                                 hapticFeedbackEnabled = LocalTouchFeedback.current,
                                 onClickLabel = "跳转到这句",
@@ -1919,6 +1959,18 @@ private fun SubtitlePane(
                     }
                 }
             }
+            Box(
+                Modifier.align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .height(36.dp)
+                    .background(Brush.verticalGradient(listOf(bg, Color.Transparent))),
+            )
+            Box(
+                Modifier.align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .height(36.dp)
+                    .background(Brush.verticalGradient(listOf(Color.Transparent, bg))),
+            )
         }
         AnimatedVisibility(
             visible = !following && !previewing && cues.isNotEmpty(),

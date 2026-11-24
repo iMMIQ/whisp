@@ -52,7 +52,7 @@ data class SourceEntity(
                 onDelete = ForeignKey.SET_NULL,
             ),
         ],
-    indices = [Index("sourceId")],
+    indices = [Index("sourceId"), Index("coverId"), Index("addedAt")],
 )
 data class WorkEntity(
     @PrimaryKey val id: String,
@@ -117,7 +117,7 @@ data class DlsitePurchaseEntity(
                 onDelete = ForeignKey.CASCADE,
             ),
         ],
-    indices = [Index("workId")],
+    indices = [Index("workId"), Index(value = ["workId", "order", "id"])],
 )
 data class TrackEntity(
     @PrimaryKey val id: String,
@@ -169,6 +169,7 @@ data class AttachmentEntity(
                 onDelete = ForeignKey.CASCADE,
             ),
         ],
+    indices = [Index("updatedAt")],
 )
 data class ProgressEntity(
     @PrimaryKey val workId: String,
@@ -188,7 +189,7 @@ data class ProgressEntity(
                 onDelete = ForeignKey.CASCADE,
             ),
         ],
-    indices = [Index("workId")],
+    indices = [Index("workId"), Index("positionMs")],
 )
 data class BookmarkEntity(
     @PrimaryKey val id: String,
@@ -224,6 +225,9 @@ interface LibraryDao {
     @Query("SELECT * FROM dlsite_purchases WHERE sourceId = :sourceId AND workno = :workno")
     suspend fun dlsitePurchase(sourceId: String, workno: String): DlsitePurchaseEntity?
 
+    @Query("SELECT * FROM dlsite_purchases WHERE sourceId = :sourceId")
+    suspend fun dlsitePurchasesForSource(sourceId: String): List<DlsitePurchaseEntity>
+
     @Upsert suspend fun putDlsitePurchases(values: List<DlsitePurchaseEntity>)
 
     @Query("SELECT * FROM dlsite_metadata WHERE workId = :id")
@@ -254,6 +258,15 @@ interface LibraryDao {
 
     @Query("SELECT id, workId FROM tracks") fun observeTrackWorkPairs(): Flow<List<TrackWorkPair>>
 
+    @Query(
+        """
+        SELECT tracks.id, tracks.workId FROM tracks
+        INNER JOIN works ON works.id = tracks.workId
+        WHERE works.sourceId IS NULL AND works.offlineAttachments = 0
+        """,
+    )
+    fun observeOrphanTrackWorkPairs(): Flow<List<TrackWorkPair>>
+
     @Query("SELECT id, workId, `order`, durationMs FROM tracks ORDER BY `order`, id")
     fun observeTrackSummaries(): Flow<List<TrackSummary>>
 
@@ -267,16 +280,18 @@ interface LibraryDao {
 
     @Query(
         """
-        SELECT DISTINCT works.id FROM works
-        LEFT JOIN tracks ON tracks.workId = works.id
-        LEFT JOIN attachments ON attachments.workId = works.id
-        WHERE works.title LIKE :pattern
-           OR works.rj LIKE :pattern
-           OR works.artist LIKE :pattern
-           OR works.originalTitle LIKE :pattern
-           OR tracks.title LIKE :pattern
-           OR tracks.fileName LIKE :pattern
-           OR attachments.fileName LIKE :pattern
+        SELECT id FROM works
+        WHERE title LIKE :pattern
+           OR rj LIKE :pattern
+           OR artist LIKE :pattern
+           OR originalTitle LIKE :pattern
+        UNION
+        SELECT workId FROM tracks
+        WHERE title LIKE :pattern
+           OR fileName LIKE :pattern
+        UNION
+        SELECT workId FROM attachments
+        WHERE fileName LIKE :pattern
         """,
     )
     suspend fun searchWorkIds(pattern: String): List<String>
@@ -331,6 +346,12 @@ interface LibraryDao {
     @Query("SELECT * FROM tracks WHERE workId = :workId")
     suspend fun tracksForWork(workId: String): List<TrackEntity>
 
+    @Query("SELECT * FROM tracks WHERE workId IN (:workIds)")
+    suspend fun tracksForWorks(workIds: List<String>): List<TrackEntity>
+
+    @Query("SELECT * FROM attachments WHERE workId IN (:workIds)")
+    suspend fun attachmentsForWorks(workIds: List<String>): List<AttachmentEntity>
+
     @Query("SELECT id FROM attachments WHERE workId = :workId")
     suspend fun attachmentIdsForWork(workId: String): List<String>
 
@@ -352,6 +373,12 @@ interface LibraryDao {
     @Query("SELECT * FROM progress ORDER BY updatedAt DESC")
     fun observeProgress(): Flow<List<ProgressEntity>>
 
+    @Query("SELECT * FROM progress ORDER BY updatedAt DESC LIMIT 1")
+    fun observeLatestProgress(): Flow<ProgressEntity?>
+
+    @Query("SELECT * FROM progress WHERE workId = :id")
+    fun observeProgressForWork(id: String): Flow<ProgressEntity?>
+
     @Query("SELECT * FROM progress WHERE workId = :id")
     suspend fun progress(id: String): ProgressEntity?
 
@@ -360,8 +387,25 @@ interface LibraryDao {
 
     @Upsert suspend fun saveProgress(progress: ProgressEntity)
 
+    @Query(
+        """
+        INSERT OR REPLACE INTO progress (workId, trackId, positionMs, updatedAt)
+        SELECT :workId, :trackId, :positionMs, :updatedAt
+        WHERE EXISTS (SELECT 1 FROM tracks WHERE id = :trackId AND workId = :workId)
+        """,
+    )
+    suspend fun saveProgressIfValid(
+        workId: String,
+        trackId: String,
+        positionMs: Long,
+        updatedAt: Long,
+    )
+
     @Query("SELECT * FROM bookmarks ORDER BY positionMs")
     fun observeBookmarks(): Flow<List<BookmarkEntity>>
+
+    @Query("SELECT * FROM bookmarks WHERE workId = :workId ORDER BY positionMs")
+    fun observeBookmarksForWork(workId: String): Flow<List<BookmarkEntity>>
 
     @Upsert suspend fun saveBookmark(bookmark: BookmarkEntity)
 
@@ -547,6 +591,21 @@ val MIGRATION_4_5 =
         }
     }
 
+val MIGRATION_5_6 =
+    object : Migration(5, 6) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_works_coverId ON works(coverId)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_works_addedAt ON works(addedAt)")
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_tracks_workId_order_id ON tracks(workId, `order`, id)",
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_progress_updatedAt ON progress(updatedAt)")
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_bookmarks_positionMs ON bookmarks(positionMs)",
+            )
+        }
+    }
+
 @Database(
     entities =
         [
@@ -559,7 +618,7 @@ val MIGRATION_4_5 =
             DlsiteMetadataEntity::class,
             DlsitePurchaseEntity::class,
         ],
-    version = 5,
+    version = 6,
     autoMigrations =
         [
             AutoMigration(from = 1, to = 2),

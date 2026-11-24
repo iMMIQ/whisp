@@ -57,40 +57,45 @@ class LibraryStore(
     val dao: LibraryDao = database.library()
     private val workLocks = WorkLocks()
 
-    val sourceList: StateFlow<List<SourceEntity>> =
+    val sourceList: StateFlow<List<SourceEntity>> by lazy {
         dao.observeSources().stateIn(scope, SharingStarted.Eagerly, emptyList())
+    }
 
-    val works: StateFlow<List<WorkEntity>> =
-        combine(dao.observeWorks(), dao.observeTrackWorkPairs(), media.completedDownloads) {
-                allWorks,
-                trackPairs,
-                completed ->
+    val works: StateFlow<List<WorkEntity>> by lazy {
+        combine(
+                dao.observeWorks(),
+                dao.observeOrphanTrackWorkPairs(),
+                media.completedDownloads,
+            ) { allWorks, orphanTrackPairs, completed ->
                 val offlineWorkIds =
-                    trackPairs.filter { it.id in completed }.map { it.workId }.toSet()
+                    if (orphanTrackPairs.isEmpty() || completed.isEmpty()) emptySet()
+                    else orphanTrackPairs.filter { it.id in completed }.map { it.workId }.toSet()
                 allWorks.filter { work ->
                     work.sourceId != null || work.offlineAttachments || work.id in offlineWorkIds
                 }
             }
+            .distinctUntilChanged()
             .stateIn(scope, SharingStarted.Eagerly, emptyList())
+    }
 
-    val progress: StateFlow<List<ProgressEntity>> =
+    val progress: StateFlow<List<ProgressEntity>> by lazy {
         dao.observeProgress().stateIn(scope, SharingStarted.Eagerly, emptyList())
+    }
 
-    val trackSummaries: StateFlow<List<TrackSummary>> =
-        dao.observeTrackSummaries().stateIn(scope, SharingStarted.Eagerly, emptyList())
+    val trackSummaries: StateFlow<List<TrackSummary>> by lazy {
+        dao.observeTrackSummaries()
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+    }
 
-    val bookmarks: StateFlow<List<BookmarkEntity>> =
+    val bookmarks: StateFlow<List<BookmarkEntity>> by lazy {
         dao.observeBookmarks().stateIn(scope, SharingStarted.Eagerly, emptyList())
+    }
 
     private val progressWriter =
         ProgressWriter(
             scope,
             {
-                database.withTransaction {
-                    if (dao.work(it.workId) != null && dao.track(it.trackId)?.workId == it.workId)
-                        dao.saveProgress(it)
-                }
-                storageChanged()
+                dao.saveProgressIfValid(it.workId, it.trackId, it.positionMs, it.updatedAt)
             },
             { Log.w("WhispProgress", "Progress write deferred: ${it.javaClass.simpleName}") },
         )
@@ -111,6 +116,13 @@ class LibraryStore(
     suspend fun flushPlaybackProgress() = progressWriter.flush()
 
     fun observeDetails(workId: String): Flow<WorkDetails?> = dao.observeDetails(workId)
+
+    fun observeLatestProgress(): Flow<ProgressEntity?> = dao.observeLatestProgress()
+
+    fun observeProgress(workId: String): Flow<ProgressEntity?> = dao.observeProgressForWork(workId)
+
+    fun observeBookmarks(workId: String): Flow<List<BookmarkEntity>> =
+        dao.observeBookmarksForWork(workId)
 
     suspend fun workDetails(id: String): WorkDetails? = dao.details(id)
 
@@ -156,10 +168,26 @@ class LibraryStore(
             }
         }
 
-    fun dlsitePurchases(sourceId: String): Flow<List<DlsiteOwnedWork>> =
-        dao.observeDlsitePurchases(sourceId)
-            .map { rows -> rows.mapNotNull { decodeOwnedWork(it.snapshot) } }
+    fun dlsitePurchases(sourceId: String): Flow<List<DlsiteOwnedWork>> {
+        var previousDecoded = emptyMap<String, Pair<String, DlsiteOwnedWork>>()
+        return dao.observeDlsitePurchases(sourceId)
+            .map { rows ->
+                val nextDecoded = HashMap<String, Pair<String, DlsiteOwnedWork>>(rows.size)
+                val list = rows.mapNotNull { row ->
+                    val cached = previousDecoded[row.workno]
+                    val decoded =
+                        if (cached != null && cached.first == row.snapshot) cached.second
+                        else decodeOwnedWork(row.snapshot)
+                    if (decoded != null) {
+                        nextDecoded[row.workno] = row.snapshot to decoded
+                    }
+                    decoded
+                }
+                previousDecoded = nextDecoded
+                list
+            }
             .flowOn(Dispatchers.Default)
+    }
 
     suspend fun availableTracks(work: WorkEntity, tracks: List<TrackEntity>): List<TrackEntity> =
         withContext(Dispatchers.IO) {
@@ -199,6 +227,43 @@ class LibraryStore(
             val track = dao.track(id) ?: throw IOException("文件已移动或来源已移除")
             val work = dao.work(track.workId) ?: throw IOException("作品已移除")
             sources.readRemoteBytes(work.sourceId, id, track.uri, limit)
+        }
+
+    suspend fun streamAssetToSink(
+        id: String,
+        sink: okio.BufferedSink,
+        limit: Int = 64 * 1024 * 1024,
+    ): Long =
+        withContext(Dispatchers.IO) {
+            offlineFile(id)?.let {
+                return@withContext it.inputStream().use { stream ->
+                    copyBounded(stream, sink, limit)
+                }
+            }
+            File(customArtworkDir, id)
+                .takeIf { it.isFile }
+                ?.let {
+                    return@withContext it.inputStream().use { stream ->
+                        copyBounded(stream, sink, limit)
+                    }
+                }
+            dao.workByCover(id)?.coverUrl?.let { url ->
+                return@withContext sources.streamDlsiteToSink(url, sink, limit)
+            }
+            val attachment = dao.attachment(id)
+            if (attachment != null) {
+                val work = dao.work(attachment.workId) ?: throw IOException("作品已移除")
+                return@withContext sources.streamRemoteToSink(
+                    work.sourceId,
+                    id,
+                    attachment.uri,
+                    sink,
+                    limit,
+                )
+            }
+            val track = dao.track(id) ?: throw IOException("文件已移动或来源已移除")
+            val work = dao.work(track.workId) ?: throw IOException("作品已移除")
+            sources.streamRemoteToSink(work.sourceId, id, track.uri, sink, limit)
         }
 
     suspend fun addLocal(root: String, name: String): String {

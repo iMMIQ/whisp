@@ -47,13 +47,15 @@ class PlaybackCoordinator(
     val lastClearedLoop = MutableStateFlow<LoopState?>(null)
     val audioOnly = MutableStateFlow(false)
     val error = MutableStateFlow<String?>(null)
-    val subtitles = SubtitleLoader(scope, library, settings)
+    val subtitles = SubtitleLoader(context, scope, library, settings)
 
     private var activePlayer: ExoPlayer? = null
     private var activeLoop: AbLoopController? = null
     private var activeTimer: SleepTimerController? = null
     private var videoToggle: ((Boolean) -> Unit)? = null
+    private var textToggle: ((Boolean) -> Unit)? = null
     private val videoOwners = mutableSetOf<Any>()
+    private val subtitleOwners = mutableSetOf<Any>()
 
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var openJob: Job? = null
@@ -80,15 +82,18 @@ class PlaybackCoordinator(
         loop: AbLoopController,
         timer: SleepTimerController,
         setVideoEnabled: (Boolean) -> Unit,
+        setTextEnabled: (Boolean) -> Unit = {},
     ) {
         activePlayer?.removeListener(playerListener)
         activePlayer = player
         activeLoop = loop
         activeTimer = timer
         videoToggle = setVideoEnabled
+        textToggle = setTextEnabled
         player.addListener(playerListener)
         playerFlow.value = player
         setVideoEnabled(videoOwners.isNotEmpty() && !audioOnly.value)
+        setTextEnabled(subtitleOwners.isNotEmpty())
         refreshFromPlayer(player)
     }
 
@@ -99,6 +104,7 @@ class PlaybackCoordinator(
         activeLoop = null
         activeTimer = null
         videoToggle = null
+        textToggle = null
         playerFlow.value = null
         state.value = PlaybackState()
         positionMs.value = 0L
@@ -116,6 +122,7 @@ class PlaybackCoordinator(
 
     fun refreshPlayer() {
         activePlayer?.let(::refreshFromPlayer)
+        subtitles.ensureLoaded()
     }
 
     fun currentPosition(): Long =
@@ -153,18 +160,35 @@ class PlaybackCoordinator(
         return activePlayer ?: playerFlow.filterNotNull().first() as ExoPlayer
     }
 
-    /** Ticks live playback position ONLY while collected by a visible foreground PlayerPage. */
+    /**
+     * Ticks live playback position ONLY while collected by a visible foreground PlayerPage AND the
+     * player is actively playing or buffering. Suspends with zero wakeups while paused.
+     */
     suspend fun observeTimeline() {
-        while (currentCoroutineContext().isActive) {
-            val player = activePlayer
-            if (player != null) {
-                val pos = player.currentPosition.coerceAtLeast(0L)
-                if (positionMs.value != pos) positionMs.value = pos
-                val buf = player.bufferedPosition.coerceAtLeast(0L)
-                if (bufferedMs.value != buf) bufferedMs.value = buf
+        combine(
+                state.map { it.playing || it.buffering }.distinctUntilChanged(),
+                subtitles.cues.map { it.isNotEmpty() }.distinctUntilChanged(),
+            ) { active, hasSubtitles ->
+                active to hasSubtitles
             }
-            delay(if (state.value.playing) 150L else 500L)
-        }
+            .distinctUntilChanged()
+            .collectLatest { (active, hasSubtitles) ->
+                syncTimelineOnce()
+                if (!active) return@collectLatest
+                val intervalMs = if (hasSubtitles) 150L else 350L
+                while (currentCoroutineContext().isActive) {
+                    delay(intervalMs)
+                    syncTimelineOnce()
+                }
+            }
+    }
+
+    private fun syncTimelineOnce() {
+        val player = activePlayer ?: return
+        val pos = player.currentPosition.coerceAtLeast(0L)
+        if (positionMs.value != pos) positionMs.value = pos
+        val buf = player.bufferedPosition.coerceAtLeast(0L)
+        if (bufferedMs.value != buf) bufferedMs.value = buf
     }
 
     fun playWork(
@@ -237,10 +261,7 @@ class PlaybackCoordinator(
                 val resumePosition =
                     if (continuingSame) player.currentPosition.coerceAtLeast(0L)
                     else resume.positionMs
-                val items =
-                    withContext(Dispatchers.IO) {
-                        ordered.map { mediaItem(it, detail.work) }
-                    }
+                val items = withContext(Dispatchers.IO) { mediaItems(ordered, detail.work) }
                 ordered.forEach { queueSnapshot[it.id] = it }
                 player.shuffleModeEnabled = shuffle
                 player.setMediaItems(items, resume.index, resumePosition)
@@ -421,6 +442,12 @@ class PlaybackCoordinator(
         videoToggle?.invoke(videoOwners.isNotEmpty() && !audioOnly.value)
     }
 
+    fun subtitleVisibility(owner: Any, visible: Boolean) {
+        if (visible) subtitleOwners += owner else subtitleOwners -= owner
+        textToggle?.invoke(subtitleOwners.isNotEmpty())
+        if (visible) subtitles.ensureLoaded()
+    }
+
     fun setAudioOnly(enabled: Boolean) {
         audioOnly.value = enabled
         videoToggle?.invoke(videoOwners.isNotEmpty() && !enabled)
@@ -446,7 +473,12 @@ class PlaybackCoordinator(
         refreshFromPlayer(player)
     }
 
-    fun mediaMetadata(track: TrackEntity, work: WorkEntity, hide: Boolean): MediaMetadata {
+    fun mediaMetadata(
+        track: TrackEntity,
+        work: WorkEntity,
+        hide: Boolean,
+        artworkBytes: ByteArray? = if (hide) null else images.thumbnailBytes(work.coverId),
+    ): MediaMetadata {
         val extras = Bundle().apply { putString("workId", work.id) }
         val builder =
             MediaMetadata.Builder()
@@ -460,7 +492,7 @@ class PlaybackCoordinator(
             builder.setTitle(track.title)
             if (work.artist.isNotBlank()) builder.setArtist(work.artist)
             builder.setAlbumTitle(work.title)
-            images.thumbnailBytes(work.coverId)?.let {
+            artworkBytes?.let {
                 builder.setArtworkData(it, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
             }
         }
@@ -469,13 +501,31 @@ class PlaybackCoordinator(
 
     suspend fun mediaItem(track: TrackEntity, work: WorkEntity): MediaItem {
         val hide = settings.settingsUpdates.first().hideArtwork
+        val artwork = if (hide) null else images.thumbnailBytes(work.coverId)
+        return buildMediaItem(track, work, hide, artwork)
+    }
+
+    /** Builds a queue sharing a single hideArtwork preference lookup & cover thumbnail encode. */
+    suspend fun mediaItems(tracks: List<TrackEntity>, work: WorkEntity): List<MediaItem> {
+        if (tracks.isEmpty()) return emptyList()
+        val hide = settings.settingsUpdates.first().hideArtwork
+        val artwork = if (hide) null else images.thumbnailBytes(work.coverId)
+        return tracks.map { buildMediaItem(it, work, hide, artwork) }
+    }
+
+    private suspend fun buildMediaItem(
+        track: TrackEntity,
+        work: WorkEntity,
+        hide: Boolean,
+        artwork: ByteArray?,
+    ): MediaItem {
         val uri = library.resolveTrackUri(track, work)
         return MediaItem.Builder()
             .setMediaId(track.id)
             .setUri(uri.toUri())
             .setMimeType(MediaFormats.videoMimeType(track.fileName))
             .setCustomCacheKey(track.id)
-            .setMediaMetadata(mediaMetadata(track, work, hide))
+            .setMediaMetadata(mediaMetadata(track, work, hide, artwork))
             .build()
     }
 

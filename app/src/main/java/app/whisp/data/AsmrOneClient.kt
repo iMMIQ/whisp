@@ -280,6 +280,9 @@ class AsmrOneClient(
     suspend fun bytes(url: String, limit: Int): ByteArray =
         http.onlineBytes(request(resourceUrl(url)), limit)
 
+    suspend fun copyToSink(url: String, sink: okio.BufferedSink, limit: Int): Long =
+        http.onlineCopyToSink(request(resourceUrl(url)), sink, limit)
+
     private suspend inline fun <reified T> decode(url: HttpUrl): T =
         try {
             val bytes = http.onlineBytes(request(url), 4 * 1024 * 1024)

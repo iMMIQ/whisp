@@ -13,6 +13,9 @@
 #include <vector>
 
 namespace {
+jclass g_entry_class = nullptr;
+jmethodID g_entry_ctor = nullptr;
+
 struct Connection {
     nfs_context *nfs;
     std::unordered_set<nfsfh *> files;
@@ -179,25 +182,41 @@ extern "C" JNIEXPORT jobjectArray JNICALL Java_app_whisp_data_NfsNative_entries(
             entries.push_back(
                 {item->name, item->type, item->size, static_cast<int64_t>(item->mtime.tv_sec)});
         }
-        auto cls = env->FindClass("app/whisp/data/NfsNativeEntry");
-        if (!cls)
-            return nullptr;
-        auto ctor = env->GetMethodID(cls, "<init>", "([BIJJ)V");
-        if (!ctor)
-            return nullptr;
+        jclass local_cls = nullptr;
+        jclass cls = g_entry_class;
+        jmethodID ctor = g_entry_ctor;
+        if (!cls || !ctor) {
+            local_cls = env->FindClass("app/whisp/data/NfsNativeEntry");
+            if (!local_cls)
+                return nullptr;
+            ctor = env->GetMethodID(local_cls, "<init>", "([BIJJ)V");
+            if (!ctor) {
+                env->DeleteLocalRef(local_cls);
+                return nullptr;
+            }
+            cls = local_cls;
+        }
         auto result = env->NewObjectArray(static_cast<jsize>(entries.size()), cls, nullptr);
-        if (!result)
+        if (!result) {
+            if (local_cls)
+                env->DeleteLocalRef(local_cls);
             return nullptr;
+        }
         for (size_t index = 0; index < entries.size(); ++index) {
             const auto &item = entries[index];
             auto name = env->NewByteArray(static_cast<jsize>(item.name.size()));
-            if (!name)
+            if (!name) {
+                if (local_cls)
+                    env->DeleteLocalRef(local_cls);
                 return nullptr;
+            }
             if (!item.name.empty()) {
                 env->SetByteArrayRegion(name, 0, static_cast<jsize>(item.name.size()),
                                         reinterpret_cast<const jbyte *>(item.name.data()));
                 if (env->ExceptionCheck()) {
                     env->DeleteLocalRef(name);
+                    if (local_cls)
+                        env->DeleteLocalRef(local_cls);
                     return nullptr;
                 }
             }
@@ -205,13 +224,21 @@ extern "C" JNIEXPORT jobjectArray JNICALL Java_app_whisp_data_NfsNative_entries(
                 env->NewObject(cls, ctor, name, static_cast<jint>(item.type),
                                static_cast<jlong>(item.size), static_cast<jlong>(item.modified));
             env->DeleteLocalRef(name);
-            if (!entry)
+            if (!entry) {
+                if (local_cls)
+                    env->DeleteLocalRef(local_cls);
                 return nullptr;
+            }
             env->SetObjectArrayElement(result, static_cast<jsize>(index), entry);
             env->DeleteLocalRef(entry);
-            if (env->ExceptionCheck())
+            if (env->ExceptionCheck()) {
+                if (local_cls)
+                    env->DeleteLocalRef(local_cls);
                 return nullptr;
+            }
         }
+        if (local_cls)
+            env->DeleteLocalRef(local_cls);
         return result;
     } catch (const std::bad_alloc &) {
         oom(env);
@@ -337,4 +364,35 @@ extern "C" JNIEXPORT void JNICALL Java_app_whisp_data_NfsNative_close(JNIEnv *, 
     nfs_umount(ctx->nfs);
     nfs_destroy_context(ctx->nfs);
     delete ctx;
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+    JNIEnv *env = nullptr;
+    if (!vm || vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK || !env)
+        return JNI_ERR;
+    auto local = env->FindClass("app/whisp/data/NfsNativeEntry");
+    if (!local)
+        return JNI_ERR;
+    auto ctor = env->GetMethodID(local, "<init>", "([BIJJ)V");
+    if (!ctor) {
+        env->DeleteLocalRef(local);
+        return JNI_ERR;
+    }
+    auto global = reinterpret_cast<jclass>(env->NewGlobalRef(local));
+    env->DeleteLocalRef(local);
+    if (!global)
+        return JNI_ERR;
+    g_entry_class = global;
+    g_entry_ctor = ctor;
+    return JNI_VERSION_1_6;
+}
+
+extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *) {
+    JNIEnv *env = nullptr;
+    if (vm && vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) == JNI_OK && env &&
+        g_entry_class) {
+        env->DeleteGlobalRef(g_entry_class);
+    }
+    g_entry_class = nullptr;
+    g_entry_ctor = nullptr;
 }

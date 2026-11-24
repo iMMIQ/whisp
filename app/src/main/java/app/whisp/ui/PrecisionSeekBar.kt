@@ -224,6 +224,9 @@ internal fun PrecisionSeekBar(
                 }
             }
         }
+        val semanticPositionMs by remember {
+            derivedStateOf { (positionLookup().coerceAtLeast(0L) / 1000L) * 1000L }
+        }
         Canvas(
             Modifier.fillMaxSize()
                 .testTag("seek-bar")
@@ -231,7 +234,7 @@ internal fun PrecisionSeekBar(
                     contentDescription = "播放进度"
                     progressBarRangeInfo =
                         ProgressBarRangeInfo(
-                            positionProvider().toFloat(),
+                            semanticPositionMs.toFloat(),
                             0f..duration.coerceAtLeast(1).toFloat(),
                         )
                     if (!enabled) disabled()

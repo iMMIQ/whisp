@@ -39,7 +39,7 @@ class SourceRegistry(
 ) {
     val dav = WebDavClient(http)
     val smb = SmbClient { Log.i("WhispScan", it) }
-    val nfs = NfsClient(report = { Log.i("WhispScan", it) })
+    val nfs = NfsClient(poolIdleTimeoutMs = 45_000L, report = { Log.i("WhispScan", it) })
     val dlsite = DlsiteClient(onlineHttp)
     internal val dlsiteClients = ConcurrentHashMap<String, DlsiteAccountClient>()
     internal val dlsiteCookieWrites = Mutex()
@@ -81,6 +81,8 @@ class SourceRegistry(
     }
 
     suspend fun evictSource(sourceId: String) {
+        smb.evict(sourceId)
+        nfs.evict(sourceId)
         dlsiteCookieWrites.withLock {
             dlsiteClients.remove(sourceId)?.close()
             secrets.evict(sourceId)
@@ -163,6 +165,17 @@ class SourceRegistry(
             limit,
         )
 
+    suspend fun streamDlsiteToSink(
+        url: String,
+        sink: okio.BufferedSink,
+        limit: Int = 16 * 1024 * 1024,
+    ): Long =
+        onlineHttp.onlineCopyToSink(
+            Request.Builder().url(url).header("Referer", "https://www.dlsite.com/").build(),
+            sink,
+            limit,
+        )
+
     suspend fun fetchCatalogBytes(
         url: String,
         sourceId: String,
@@ -171,6 +184,17 @@ class SourceRegistry(
         val source = dao.source(sourceId) ?: error("来源已移除")
         return if (source.kindType == SourceKind.DLSITE) fetchDlsiteBytes(url, limit)
         else asmrClient(source).bytes(url, limit)
+    }
+
+    suspend fun streamCatalogToSink(
+        url: String,
+        sourceId: String,
+        sink: okio.BufferedSink,
+        limit: Int = 16 * 1024 * 1024,
+    ): Long {
+        val source = dao.source(sourceId) ?: error("来源已移除")
+        return if (source.kindType == SourceKind.DLSITE) streamDlsiteToSink(url, sink, limit)
+        else asmrClient(source).copyToSink(url, sink, limit)
     }
 
     /**
@@ -207,6 +231,40 @@ class SourceRegistry(
             SourceKind.SMB -> smb.bytes(rawUri, source, secrets.decryptCached(source), limit)
             SourceKind.NFS -> nfs.bytes(source, rawUri, limit)
             SourceKind.WEBDAV -> dav.bytes(rawUri, source, secrets.decryptCached(source), limit)
+            else -> throw IOException("不支持的来源类型")
+        }
+    }
+
+    suspend fun streamRemoteToSink(
+        sourceId: String?,
+        assetId: String,
+        rawUri: String,
+        sink: okio.BufferedSink,
+        limit: Int,
+    ): Long {
+        val parsed = rawUri.toUri()
+        if (parsed.scheme == "content" || parsed.scheme == "file") {
+            return context.contentResolver.openInputStream(parsed)?.use {
+                copyBounded(it, sink, limit)
+            } ?: throw IOException("文件不可读")
+        }
+        val source = sourceId?.let { dao.source(it) } ?: throw IOException("来源已移除")
+        return when (source.kindType) {
+            SourceKind.ASMRONE -> asmrClient(source).copyToSink(rawUri, sink, limit)
+            SourceKind.DLSITE -> {
+                val res = dlsiteResource(source.id, assetId)
+                val bytes = res.client.resourceBytes(res.workno, res.path, limit)
+                sink.write(bytes)
+                bytes.size.toLong()
+            }
+            SourceKind.SMB ->
+                smb.open(source, secrets.decryptCached(source), rawUri).use {
+                    it.copyToSink(sink, limit)
+                }
+            SourceKind.NFS ->
+                nfs.open(source, rawUri).use { it.copyToSink(sink, limit, "NFS 文件读取中断") }
+            SourceKind.WEBDAV ->
+                dav.copyToSink(rawUri, source, secrets.decryptCached(source), sink, limit)
             else -> throw IOException("不支持的来源类型")
         }
     }

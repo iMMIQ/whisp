@@ -41,7 +41,9 @@ import app.whisp.data.WhispImage
 import app.whisp.data.WorkEntity
 import app.whisp.data.kindType
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private fun sourceIcon(kind: SourceKind?): ImageVector =
     when (kind) {
@@ -79,9 +81,6 @@ internal fun SourcesPage(
     val busy by graph.sync.busy.collectAsStateWithLifecycle()
     val downloads by graph.media.downloads.collectAsStateWithLifecycle()
     val works by graph.library.works.collectAsStateWithLifecycle()
-    val trackPairs by
-        remember(graph) { graph.library.dao.observeTrackWorkPairs() }
-            .collectAsStateWithLifecycle(emptyList())
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
@@ -132,7 +131,26 @@ internal fun SourcesPage(
             }
         }
 
-    val trackIdsByWork = remember(trackPairs) { trackPairs.groupBy({ it.workId }, { it.id }) }
+    val trackIdsByWork by
+        produceState(emptyMap<String, List<String>>(), graph, downloads.keys) {
+            val ids = downloads.keys.toList()
+            value =
+                if (ids.isEmpty()) emptyMap()
+                else
+                    withContext(Dispatchers.IO) {
+                        val workIds =
+                            ids.chunked(500)
+                                .flatMap { graph.library.dao.tracksByIds(it) }
+                                .mapTo(LinkedHashSet()) { it.workId }
+                                .toList()
+                        if (workIds.isEmpty()) emptyMap()
+                        else
+                            workIds
+                                .chunked(500)
+                                .flatMap { graph.library.dao.tracksForWorks(it) }
+                                .groupBy({ it.workId }, { it.id })
+                    }
+        }
     val workCountsBySource =
         remember(works) { works.mapNotNull { it.sourceId }.groupingBy { it }.eachCount() }
     val offlineWorks =

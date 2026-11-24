@@ -84,7 +84,9 @@ internal class NativeNfsSession(address: NfsAddress) : NfsSession {
         override fun read(buffer: ByteArray, offset: Long, bufferOffset: Int, count: Int): Int =
             synchronized(this@NativeNfsSession) {
                 if (file == 0L) throw IOException("NFS 文件已关闭")
-                val n = NfsNative.read(current(), file, offset, buffer, bufferOffset, count)
+                // Clamp each JNI pread call to the 1 MiB native limit so >1 MiB full reads succeed.
+                val boundedCount = minOf(count, 1024 * 1024)
+                val n = NfsNative.read(current(), file, offset, buffer, bufferOffset, boundedCount)
                 if (n <= 0) throw IOException("NFS 文件已改变，请重新扫描")
                 n
             }

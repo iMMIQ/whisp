@@ -7,6 +7,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.whisp.data.LibraryDatabase
 import app.whisp.data.MIGRATION_4_5
+import app.whisp.data.MIGRATION_5_6
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -71,7 +72,7 @@ class LibraryMigrationIntegrationTest {
         }
         val database =
             Room.databaseBuilder(context, LibraryDatabase::class.java, name)
-                .addMigrations(MIGRATION_4_5)
+                .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
                 .build()
         try {
             val work = database.library().details("migration-work")!!
@@ -90,7 +91,7 @@ class LibraryMigrationIntegrationTest {
                 assertTrue(cursor.moveToFirst())
                 assertEquals(1, cursor.getInt(0))
             }
-            assertEquals(5, database.openHelper.readableDatabase.version)
+            assertEquals(6, database.openHelper.readableDatabase.version)
             assertEquals("local", work.work.origin)
             assertNull(database.library().dlsiteMetadata("migration-work"))
         } finally {

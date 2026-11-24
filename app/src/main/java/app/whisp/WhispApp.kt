@@ -28,7 +28,7 @@ class AppGraph(val context: Context) {
 
     val database: LibraryDatabase =
         Room.databaseBuilder(context, LibraryDatabase::class.java, "whisp.db")
-            .addMigrations(MIGRATION_4_5)
+            .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
             .build()
 
     val secrets = SecretStore()
@@ -41,8 +41,10 @@ class AppGraph(val context: Context) {
             .readTimeout(20, TimeUnit.SECONDS)
             .build()
 
+    // Share underlying ConnectionPool & Dispatcher threads with [http] to cut memory and TLS churn.
     val onlineHttp: OkHttpClient =
-        OkHttpClient.Builder()
+        http
+            .newBuilder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
@@ -69,9 +71,28 @@ class AppGraph(val context: Context) {
     val images: WhispImages
     val offline: OfflineStore
     val playback: PlaybackCoordinator
-    val sync: LibrarySync
-    val dlsiteLoader: app.whisp.ui.DlsiteDetailsLoader
-    val asmrCatalog: app.whisp.ui.AsmrCatalogController
+    val sync: LibrarySync by lazy {
+        LibrarySync(
+            context = context,
+            library = library,
+            sources = sources,
+            media = media,
+            offline = offline,
+            images = images,
+            messages = messages,
+            detachTracks = { playback.detachTracks(it) },
+        )
+    }
+    val dlsiteLoader: app.whisp.ui.DlsiteDetailsLoader by lazy {
+        app.whisp.ui.DlsiteDetailsLoader(mainScope, library, sources.dlsite)
+    }
+    val asmrCatalog: app.whisp.ui.AsmrCatalogController by lazy {
+        app.whisp.ui.AsmrCatalogController(
+            scope = mainScope,
+            fetchPage = sync::asmrPage,
+            rememberSearch = settings::rememberAsmrSearch,
+        )
+    }
     private val scopedAsmrCatalogs =
         object : LinkedHashMap<String, app.whisp.ui.AsmrCatalogController>(8, 0.75f, true) {
             override fun removeEldestEntry(
@@ -128,28 +149,13 @@ class AppGraph(val context: Context) {
                 offlineDir = offlineDir,
                 customArtworkDir = customArtworkDir,
                 readAsset = { id, limit -> library.readAsset(id, limit) },
+                streamAsset = { id, sink, limit -> library.streamAssetToSink(id, sink, limit) },
+                streamingCacheBytes = { media.streamingCache.cacheSpace },
+                downloadCacheBytes = { media.downloadCache.cacheSpace },
                 storageChanged = { storageChanges.tryEmit(Unit) },
             )
         offline = OfflineStore(context, library, media, images)
         playback = PlaybackCoordinator(context, mainScope, library, images, settings, messages)
-        sync =
-            LibrarySync(
-                context = context,
-                library = library,
-                sources = sources,
-                media = media,
-                offline = offline,
-                images = images,
-                messages = messages,
-                detachTracks = { playback.detachTracks(it) },
-            )
-        dlsiteLoader = app.whisp.ui.DlsiteDetailsLoader(mainScope, library, sources.dlsite)
-        asmrCatalog =
-            app.whisp.ui.AsmrCatalogController(
-                scope = mainScope,
-                fetchPage = sync::asmrPage,
-                rememberSearch = settings::rememberAsmrSearch,
-            )
     }
 }
 

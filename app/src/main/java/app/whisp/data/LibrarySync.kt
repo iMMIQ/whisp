@@ -110,45 +110,86 @@ class LibrarySync(
             currentCoroutineContext().ensureActive()
             val obsoleteTracks = mutableListOf<String>()
             val generation = System.currentTimeMillis()
+            val completedDownloads = media.snapshotCompletedDownloads()
+            val offlineFiles = library.offlineDir.list()?.toHashSet().orEmpty()
+            val customArtworkFiles = library.customArtworkDir.list()?.toHashSet().orEmpty()
             library.database.withTransaction {
                 val latestSource = library.dao.source(id) ?: throw IOException("来源已移除")
                 val existingSourceWorks = library.dao.sourceWorks(id)
-                val incomingIds = indexed.works.map { it.id }.toSet()
+                val incomingIds = indexed.works.mapTo(HashSet()) { it.id }
+                val allWorkIds = (existingSourceWorks.map { it.id } + incomingIds).distinct()
+                val existingWorksById =
+                    allWorkIds
+                        .chunked(500)
+                        .flatMap { library.dao.worksByIds(it) }
+                        .associateBy { it.id }
+                val existingTracksByWork =
+                    allWorkIds
+                        .chunked(500)
+                        .flatMap { library.dao.tracksForWorks(it) }
+                        .groupBy { it.workId }
+                val existingAttachmentsByWork =
+                    allWorkIds
+                        .chunked(500)
+                        .flatMap { library.dao.attachmentsForWorks(it) }
+                        .groupBy { it.workId }
                 val tracksByWork = indexed.tracks.groupBy { it.workId }
                 val attachmentsByWork = indexed.attachments.groupBy { it.workId }
+                val worksToUpsert = mutableListOf<WorkEntity>()
+                val tracksToUpsert = mutableListOf<TrackEntity>()
+                val attachmentsToUpsert = mutableListOf<AttachmentEntity>()
+                val tracksToDelete = mutableListOf<String>()
+                val attachmentsToDelete = mutableListOf<String>()
                 for (work in indexed.works) {
-                    obsoleteTracks +=
-                        mergeWorkInTransaction(
+                    val oldWork = existingWorksById[work.id]
+                    val oldDetail = oldWork?.let {
+                        WorkDetails(
+                            it,
+                            existingTracksByWork[work.id].orEmpty(),
+                            existingAttachmentsByWork[work.id].orEmpty(),
+                        )
+                    }
+                    val plan =
+                        planWorkMerge(
+                            old = oldDetail,
                             freshWork = work,
                             tracks = tracksByWork[work.id].orEmpty(),
                             attachments = attachmentsByWork[work.id].orEmpty(),
                             preserveAnyLocalTitle = true,
+                            completedDownloads = completedDownloads,
+                            offlineFiles = offlineFiles,
+                            customArtworkFiles = customArtworkFiles,
                         )
+                    worksToUpsert += plan.work
+                    tracksToUpsert += plan.tracks
+                    attachmentsToUpsert += plan.attachments
+                    tracksToDelete += plan.obsoleteTracks
+                    attachmentsToDelete += plan.staleAttachments
+                    obsoleteTracks += plan.obsoleteTracks
                 }
                 // Reclaim tracks/works removed from this source unless pinned offline.
                 for (missing in existingSourceWorks) {
                     if (missing.id in incomingIds) continue
-                    val detail = library.dao.details(missing.id) ?: continue
-                    val keepTracks =
-                        detail.tracks.filter {
-                            media.isCompleted(it.id) || library.offlineFile(it.id) != null
-                        }
-                    val removedTracks =
-                        detail.tracks.map { it.id } - keepTracks.map { it.id }.toSet()
-                    removedTracks.chunked(500).forEach { library.dao.deleteTracks(it) }
+                    val oldTracks = existingTracksByWork[missing.id].orEmpty()
+                    val oldAttachments = existingAttachmentsByWork[missing.id].orEmpty()
+                    val keepTracks = oldTracks.filter {
+                        it.id in completedDownloads || it.id in offlineFiles
+                    }
+                    val keepTrackIds = keepTracks.mapTo(HashSet()) { it.id }
+                    val removedTracks = oldTracks.map { it.id }.filter { it !in keepTrackIds }
+                    tracksToDelete += removedTracks
                     obsoleteTracks += removedTracks
-                    val removedAttachments =
-                        detail.attachments
-                            .filter { library.offlineFile(it.id) == null }
-                            .map { it.id }
-                    removedAttachments.chunked(500).forEach { library.dao.deleteAttachments(it) }
-                    if (keepTracks.isEmpty() && !detail.work.offlineAttachments) {
-                        // Detach sourceId so work hides until re-added, keeping favorite/progress
-                        // if desired?
-                        // Detaching sourceId hides it from visible library cleanly.
-                        library.dao.putWorks(listOf(detail.work.copy(sourceId = null)))
+                    attachmentsToDelete +=
+                        oldAttachments.filter { it.id !in offlineFiles }.map { it.id }
+                    if (keepTracks.isEmpty() && !missing.offlineAttachments) {
+                        worksToUpsert += missing.copy(sourceId = null)
                     }
                 }
+                tracksToDelete.chunked(500).forEach { library.dao.deleteTracks(it) }
+                attachmentsToDelete.chunked(500).forEach { library.dao.deleteAttachments(it) }
+                worksToUpsert.chunked(500).forEach { library.dao.putWorks(it) }
+                tracksToUpsert.chunked(500).forEach { library.dao.putTracks(it) }
+                attachmentsToUpsert.chunked(500).forEach { library.dao.putAttachments(it) }
                 library.dao.putSource(latestSource.copy(lastScan = generation, error = null))
             }
             removeObsoleteDownloads(obsoleteTracks)
@@ -222,12 +263,13 @@ class LibrarySync(
             sources.requireDlsiteClient(sourceId, activeClient)
             library.database.withTransaction {
                 val latest = library.dao.source(sourceId) ?: throw CancellationException("来源已移除")
+                val existingByWorkno =
+                    library.dao.dlsitePurchasesForSource(sourceId).associate {
+                        it.workno to decodeOwnedWork(it.snapshot)
+                    }
                 library.dao.putDlsitePurchases(
                     synced.works.map {
-                        val old =
-                            decodeOwnedWork(
-                                library.dao.dlsitePurchase(sourceId, it.workno)?.snapshot.orEmpty(),
-                            )
+                        val old = existingByWorkno[it.workno]
                         val merged =
                             it.copy(
                                 artist = it.artist.ifBlank { old?.artist.orEmpty() },
@@ -287,15 +329,13 @@ class LibrarySync(
                     sources.requireDlsiteClient(sourceId, client)
                     library.database.withTransaction {
                         if (library.dao.source(sourceId) == null) return@withTransaction
+                        val existingByWorkno =
+                            library.dao.dlsitePurchasesForSource(sourceId).associate {
+                                it.workno to decodeOwnedWork(it.snapshot)
+                            }
                         val updates = mutableListOf<DlsitePurchaseEntity>()
                         for ((workno, metadata, attemptTime) in results) {
-                            val current =
-                                decodeOwnedWork(
-                                    library.dao
-                                        .dlsitePurchase(sourceId, workno)
-                                        ?.snapshot
-                                        .orEmpty(),
-                                ) ?: continue
+                            val current = existingByWorkno[workno] ?: continue
                             val enriched =
                                 if (metadata != null) {
                                     val voices =
@@ -577,14 +617,20 @@ class LibrarySync(
 
     suspend fun removeSource(id: String) {
         WorkManager.getInstance(context).cancelUniqueWork("scan-$id")
-        val affectedWorks = library.dao.sourceWorkIds(id)
+        val affectedWorks = library.dao.sourceWorks(id)
+        val affectedIds = affectedWorks.map { it.id }
+        val tracksByWork =
+            affectedIds
+                .chunked(500)
+                .flatMap { library.dao.tracksForWorks(it) }
+                .groupBy { it.workId }
+        val completedDownloads = media.completedDownloads.value
         val tracksToDetach = mutableSetOf<String>()
-        for (workId in affectedWorks) {
+        for (workId in affectedIds) {
             WorkManager.getInstance(context).cancelUniqueWork("attachments-$workId")
-            val detail = library.dao.details(workId) ?: continue
-            for (track in detail.tracks) {
+            for (track in tracksByWork[workId].orEmpty()) {
                 media.streamingCache.removeResource(track.id)
-                if (!media.isCompleted(track.id)) {
+                if (track.id !in completedDownloads && !media.isCompleted(track.id)) {
                     offline.removeTrackDownload(track.id)
                     tracksToDetach += track.id
                 }
@@ -594,24 +640,37 @@ class LibrarySync(
             withContext(Dispatchers.Main.immediate) { detachTracks(tracksToDetach) }
         }
         val purgedWorkAssets = mutableListOf<Pair<String, Set<String>>>()
+        val offlineFiles = library.offlineDir.list()?.toHashSet().orEmpty()
+        sources.evictSource(id)
         sources.dlsiteCookieWrites.withLock {
-            sources.dlsiteClients.remove(id)?.close()
-            sources.secrets.evict(id)
             library.database.withTransaction {
-                for (workId in affectedWorks) {
-                    val detail = library.dao.details(workId) ?: continue
-                    val hasPinnedAudio =
-                        detail.tracks.any {
-                            media.isCompleted(it.id) || library.offlineFile(it.id) != null
-                        }
-                    if (!hasPinnedAudio && !detail.work.offlineAttachments) {
+                val latestWorks = affectedIds.chunked(500).flatMap { library.dao.worksByIds(it) }
+                val latestTracks =
+                    affectedIds
+                        .chunked(500)
+                        .flatMap { library.dao.tracksForWorks(it) }
+                        .groupBy { it.workId }
+                val latestAttachments =
+                    affectedIds
+                        .chunked(500)
+                        .flatMap { library.dao.attachmentsForWorks(it) }
+                        .groupBy { it.workId }
+                for (work in latestWorks) {
+                    val workTracks = latestTracks[work.id].orEmpty()
+                    val workAttachments = latestAttachments[work.id].orEmpty()
+                    val hasPinnedAudio = workTracks.any {
+                        it.id in completedDownloads ||
+                            it.id in offlineFiles ||
+                            media.isCompleted(it.id)
+                    }
+                    if (!hasPinnedAudio && !work.offlineAttachments) {
                         val assets =
-                            (detail.tracks.map { it.id } +
-                                    detail.attachments.map { it.id } +
-                                    listOfNotNull(detail.work.coverId))
+                            (workTracks.map { it.id } +
+                                    workAttachments.map { it.id } +
+                                    listOfNotNull(work.coverId))
                                 .toSet()
-                        library.dao.deleteWork(workId)
-                        purgedWorkAssets += workId to assets
+                        library.dao.deleteWork(work.id)
+                        purgedWorkAssets += work.id to assets
                     }
                 }
                 // ForeignKey SET_NULL automatically detaches surviving offline works; CASCADE drops
@@ -619,34 +678,41 @@ class LibrarySync(
                 library.dao.deleteSource(id)
             }
         }
-        for ((workId, assets) in purgedWorkAssets) {
-            images.purgeWorkAssets(workId, assets)
+        if (purgedWorkAssets.isNotEmpty()) {
+            images.purgeBatch(purgedWorkAssets)
         }
-        if (purgedWorkAssets.isNotEmpty()) library.storageChanged()
     }
 
-    /** Single unified merge helper shared by local/NAS scans and ASMR.ONE/DLsite imports. */
-    private suspend fun mergeWorkInTransaction(
+    private data class WorkMergePlan(
+        val work: WorkEntity,
+        val tracks: List<TrackEntity>,
+        val attachments: List<AttachmentEntity>,
+        val obsoleteTracks: List<String>,
+        val staleAttachments: List<String>,
+    )
+
+    private fun planWorkMerge(
+        old: WorkDetails?,
         freshWork: WorkEntity,
         tracks: List<TrackEntity>,
         attachments: List<AttachmentEntity>,
         preserveAnyLocalTitle: Boolean = false,
         catalogArtistFallback: String = "",
-        metadata: DlsiteDetails? = null,
-    ): List<String> {
-        val old = library.dao.details(freshWork.id)
-        val attachmentIds = attachments.map { it.id }.toSet()
+        completedDownloads: Set<String>,
+        offlineFiles: Set<String>,
+        customArtworkFiles: Set<String>,
+    ): WorkMergePlan {
+        val attachmentIds = attachments.mapTo(HashSet()) { it.id }
         val mergedWork =
             old?.work?.let { prev ->
-                val hasCustomCover =
-                    prev.coverId?.let { File(library.customArtworkDir, it).isFile } == true
+                val hasCustomCover = prev.coverId != null && prev.coverId in customArtworkFiles
                 val keptCover =
                     prev.coverId?.takeIf { cover ->
                         hasCustomCover ||
                             (preserveAnyLocalTitle &&
                                 (prev.coverUrl != null ||
                                     cover in attachmentIds ||
-                                    library.offlineFile(cover) != null))
+                                    cover in offlineFiles))
                     } ?: freshWork.coverId
                 freshWork.copy(
                     title =
@@ -677,43 +743,76 @@ class LibrarySync(
                     offlineAttachments = prev.offlineAttachments,
                 )
             } ?: freshWork
+        val offlinePresent =
+            attachments.all { it.id in offlineFiles } &&
+                (mergedWork.coverId == null || mergedWork.coverId in offlineFiles)
         val retainedWork =
             mergedWork.copy(
-                offlineAttachments =
-                    mergedWork.offlineAttachments &&
-                        library.offlineFilesPresent(mergedWork, attachments),
+                offlineAttachments = mergedWork.offlineAttachments && offlinePresent,
             )
-        library.dao.putWorks(listOf(retainedWork))
         val oldTracks = old?.tracks.orEmpty().associateBy { it.id }
         val pinnedTracks =
             oldTracks.values
-                .filter { media.isCompleted(it.id) || library.offlineFile(it.id) != null }
+                .filter { it.id in completedDownloads || it.id in offlineFiles }
                 .map { it.id }
         val keepTracks = (tracks.map { it.id } + pinnedTracks).toSet()
         val obsoleteTracks = oldTracks.keys.filter { it !in keepTracks }
-        obsoleteTracks.chunked(500).forEach { library.dao.deleteTracks(it) }
-        library.dao.putTracks(
-            tracks.map { track ->
-                track.copy(
-                    durationMs =
-                        track.durationMs.takeIf { it > 0 } ?: oldTracks[track.id]?.durationMs ?: 0,
-                )
-            },
-        )
-        val pinnedAttachments =
-            old?.attachments.orEmpty().filter { library.offlineFile(it.id) != null }.map { it.id }
+        val mergedTracks = tracks.map { track ->
+            track.copy(
+                durationMs =
+                    track.durationMs.takeIf { it > 0 } ?: oldTracks[track.id]?.durationMs ?: 0,
+            )
+        }
+        val oldAttachments = old?.attachments.orEmpty()
+        val pinnedAttachments = oldAttachments.filter { it.id in offlineFiles }.map { it.id }
         val keepAttachments = (attachments.map { it.id } + pinnedAttachments).toSet()
-        val staleAttachments =
-            library.dao.attachmentIdsForWork(freshWork.id).filter { it !in keepAttachments }
-        staleAttachments.chunked(500).forEach { library.dao.deleteAttachments(it) }
-        library.dao.putAttachments(attachments)
+        val staleAttachments = oldAttachments.map { it.id }.filter { it !in keepAttachments }
+        return WorkMergePlan(
+            work = retainedWork,
+            tracks = mergedTracks,
+            attachments = attachments,
+            obsoleteTracks = obsoleteTracks,
+            staleAttachments = staleAttachments,
+        )
+    }
+
+    /** Single unified merge helper shared by local/NAS scans and ASMR.ONE/DLsite imports. */
+    private suspend fun mergeWorkInTransaction(
+        freshWork: WorkEntity,
+        tracks: List<TrackEntity>,
+        attachments: List<AttachmentEntity>,
+        preserveAnyLocalTitle: Boolean = false,
+        catalogArtistFallback: String = "",
+        metadata: DlsiteDetails? = null,
+    ): List<String> {
+        val old = library.dao.details(freshWork.id)
+        val offlineFiles = library.offlineDir.list()?.toHashSet().orEmpty()
+        val customArtworkFiles = library.customArtworkDir.list()?.toHashSet().orEmpty()
+        val completedDownloads = media.completedDownloads.value
+        val plan =
+            planWorkMerge(
+                old = old,
+                freshWork = freshWork,
+                tracks = tracks,
+                attachments = attachments,
+                preserveAnyLocalTitle = preserveAnyLocalTitle,
+                catalogArtistFallback = catalogArtistFallback,
+                completedDownloads = completedDownloads,
+                offlineFiles = offlineFiles,
+                customArtworkFiles = customArtworkFiles,
+            )
+        library.dao.putWorks(listOf(plan.work))
+        plan.obsoleteTracks.chunked(500).forEach { library.dao.deleteTracks(it) }
+        library.dao.putTracks(plan.tracks)
+        plan.staleAttachments.chunked(500).forEach { library.dao.deleteAttachments(it) }
+        library.dao.putAttachments(plan.attachments)
         metadata?.let { fresh ->
             val previous = decodeDlsiteDetails(library.dao.dlsiteMetadata(freshWork.id)?.snapshot)
             library.dao.putDlsiteMetadata(
                 DlsiteMetadataEntity(freshWork.id, fresh.preserving(previous).encode()),
             )
         }
-        return obsoleteTracks
+        return plan.obsoleteTracks
     }
 
     private fun removeObsoleteDownloads(ids: List<String>) {

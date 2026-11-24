@@ -13,7 +13,9 @@ import androidx.core.content.ContextCompat
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionParameters.AudioOffloadPreferences
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.PlayerMessage
 import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
@@ -30,11 +32,12 @@ object AudioOffload {
     fun preferences(
         enabled: Boolean = true,
         speedChangeRequired: Boolean = false,
+        gaplessRequired: Boolean = false,
     ): AudioOffloadPreferences =
         if (enabled)
             AudioOffloadPreferences.Builder()
                 .setAudioOffloadMode(AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED)
-                .setIsGaplessSupportRequired(true)
+                .setIsGaplessSupportRequired(gaplessRequired)
                 .setIsSpeedChangeSupportRequired(speedChangeRequired)
                 .build()
         else AudioOffloadPreferences.DEFAULT
@@ -46,12 +49,48 @@ object AudioOffload {
         if (!supported(Build.VERSION.SDK_INT)) return
         val speedChanged = abs(player.playbackParameters.speed - 1f) > 0.01f
         val enabled = !needsPreciseDeadline(loop.startMs, loop.endMs, timer.handlerDeadlineMs)
+        val desired = preferences(enabled, speedChanged)
+        if (player.trackSelectionParameters.audioOffloadPreferences == desired) return
         player.trackSelectionParameters =
-            player.trackSelectionParameters
-                .buildUpon()
-                .setAudioOffloadPreferences(preferences(enabled, speedChanged))
-                .build()
+            player.trackSelectionParameters.buildUpon().setAudioOffloadPreferences(desired).build()
     }
+}
+
+/**
+ * Burst-friendly LoadControl with wide hysteresis (25s..180s streaming, 15s..60s local) and a 32
+ * MiB memory cap so audio streams fetch in long bursts and let Wi-Fi/cellular radios sleep, while
+ * keeping video memory bounded.
+ */
+@androidx.annotation.OptIn(UnstableApi::class)
+internal object WhispLoadControl {
+    const val STREAMING_MIN_BUFFER_MS = 25_000
+    const val STREAMING_MAX_BUFFER_MS = 180_000
+    const val STREAMING_PLAYBACK_MS = 1_500
+    const val STREAMING_REBUFFER_MS = 2_500
+    const val LOCAL_MIN_BUFFER_MS = 15_000
+    const val LOCAL_MAX_BUFFER_MS = 60_000
+    const val LOCAL_PLAYBACK_MS = 1_000
+    const val LOCAL_REBUFFER_MS = 1_500
+    const val TARGET_BUFFER_BYTES = 32 * 1024 * 1024
+
+    fun create(): LoadControl =
+        DefaultLoadControl.Builder()
+            .setBufferDurationsMsForStreaming(
+                STREAMING_MIN_BUFFER_MS,
+                STREAMING_MAX_BUFFER_MS,
+                STREAMING_PLAYBACK_MS,
+                STREAMING_REBUFFER_MS,
+            )
+            .setBufferDurationsMsForLocalPlayback(
+                LOCAL_MIN_BUFFER_MS,
+                LOCAL_MAX_BUFFER_MS,
+                LOCAL_PLAYBACK_MS,
+                LOCAL_REBUFFER_MS,
+            )
+            .setTargetBufferBytes(TARGET_BUFFER_BYTES)
+            .setPrioritizeTimeOverSizeThresholdsForStreaming(false)
+            .setPrioritizeTimeOverSizeThresholdsForLocalPlayback(true)
+            .build()
 }
 
 object SleepTimer {

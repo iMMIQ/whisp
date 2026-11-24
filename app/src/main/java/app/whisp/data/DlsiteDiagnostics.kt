@@ -7,6 +7,10 @@ import android.os.Build
 import androidx.core.content.FileProvider
 import androidx.core.content.edit
 import java.io.File
+import java.util.ArrayDeque
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -30,38 +34,75 @@ private data class DlsiteDiagnosticReport(
     val requests: List<DlsiteRequestEvent>,
 )
 
-/** Only fixed phases, HTTP status codes and timings enter the diagnostic report. */
+/**
+ * Bounded ring-buffered diagnostic recorder: avoids per-request SharedPreferences XML rewrites by
+ * keeping the last 64 fixed-schema events in memory and debouncing disk persistence.
+ */
 class DlsiteDiagnostics(private val context: Context) {
-    private val preferences =
+    private val preferences by lazy {
         context.getSharedPreferences("dlsite-diagnostics", Context.MODE_PRIVATE)
-    private val json = Json { ignoreUnknownKeys = true }
-
-    private fun readEvents(): List<DlsiteRequestEvent> = runCatching {
-        json.decodeFromString<List<DlsiteRequestEvent>>(
-            preferences.getString("events", "[]")!!,
-        )
     }
-        .getOrDefault(emptyList())
+    private val json = Json { ignoreUnknownKeys = true }
+    private val ring = ArrayDeque<DlsiteRequestEvent>(64)
+    private var loaded = false
+    private var flushTask: ScheduledFuture<*>? = null
+    private val flusher by lazy {
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "whisp-diag-flush").apply { isDaemon = true }
+        }
+    }
+
+    private fun ensureLoaded() {
+        if (loaded) return
+        loaded = true
+        val stored = runCatching {
+            json.decodeFromString<List<DlsiteRequestEvent>>(
+                preferences.getString("events", "[]")!!,
+            )
+        }
+            .getOrDefault(emptyList())
+        stored.takeLast(64).forEach(ring::addLast)
+    }
+
+    private fun scheduleFlush() {
+        flushTask?.cancel(false)
+        flushTask = flusher.schedule({ flushNow() }, 2_000L, TimeUnit.MILLISECONDS)
+    }
+
+    @Synchronized
+    private fun flushNow() {
+        flushTask = null
+        val snapshot = ring.toList()
+        preferences.edit { putString("events", json.encodeToString(snapshot)) }
+    }
 
     @Synchronized
     fun record(event: DlsiteRequestEvent) {
-        val next = readEvents().takeLast(63) + event
-        preferences.edit { putString("events", json.encodeToString(next)) }
+        ensureLoaded()
+        while (ring.size >= 64) ring.removeFirst()
+        ring.addLast(event)
+        scheduleFlush()
     }
 
     @Synchronized
     fun clear() {
+        flushTask?.cancel(false)
+        flushTask = null
+        ring.clear()
+        loaded = true
         preferences.edit { clear() }
     }
 
     @Synchronized
     fun shareIntent(): Intent {
+        ensureLoaded()
+        val snapshot = ring.toList()
         val report =
             DlsiteDiagnosticReport(
                 schema = 1,
                 androidSdk = Build.VERSION.SDK_INT,
                 version = context.packageManager.getPackageInfo(context.packageName, 0).versionName,
-                requests = readEvents(),
+                requests = snapshot,
             )
         val directory = File(context.cacheDir, "diagnostics").apply { mkdirs() }
         val file =

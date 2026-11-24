@@ -116,4 +116,109 @@ class NfsClientTest {
         assertFalse(read)
         assertTrue(closed && fileClosed)
     }
+
+    @Test
+    fun pooledSessionIsReusedAcrossReadsAndClosedOnEvict() {
+        val sessions = CopyOnWriteArrayList<NfsSession>()
+        val closedFlags = CopyOnWriteArrayList<Boolean>()
+        val client =
+            NfsClient(
+                connect = {
+                    val idx = closedFlags.size
+                    closedFlags += false
+                    object : NfsSession {
+                            override fun list(path: String) = emptyList<NfsEntry>()
+
+                            override fun open(path: String) =
+                                object : RemoteReadHandle {
+                                    override val length = 4L
+
+                                    override fun read(
+                                        buffer: ByteArray,
+                                        offset: Long,
+                                        bufferOffset: Int,
+                                        count: Int,
+                                    ): Int {
+                                        if (offset >= 4L) return -1
+                                        val data = byteArrayOf(1, 2, 3, 4)
+                                        val n = minOf(count, (4L - offset).toInt())
+                                        System.arraycopy(
+                                            data,
+                                            offset.toInt(),
+                                            buffer,
+                                            bufferOffset,
+                                            n,
+                                        )
+                                        return n
+                                    }
+
+                                    override fun close() {}
+                                }
+
+                            override fun close() {
+                                closedFlags[idx] = true
+                            }
+                        }
+                        .also(sessions::add)
+                },
+                poolIdleTimeoutMs = 30_000L,
+            )
+        val uri = NfsAddress.assetUri(source.id, "01.wav")
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4), client.bytes(source, uri, 1024))
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4), client.bytes(source, uri, 1024))
+        assertEquals(1, sessions.size)
+        assertFalse(closedFlags[0])
+        client.evict(source.id)
+        assertTrue(closedFlags[0])
+    }
+
+    @Test
+    fun pooledSessionDiscardsBrokenConnectionAndRetriesOnce() {
+        var created = 0
+        var firstClosed = false
+        val client =
+            NfsClient(
+                connect = {
+                    val id = ++created
+                    var opens = 0
+                    object : NfsSession {
+                        override fun list(path: String) = emptyList<NfsEntry>()
+
+                        override fun open(path: String): RemoteReadHandle {
+                            opens++
+                            if (id == 1 && opens == 2) throw IOException("stale pooled mount")
+                            return object : RemoteReadHandle {
+                                override val length = 2L
+
+                                override fun read(
+                                    buffer: ByteArray,
+                                    offset: Long,
+                                    bufferOffset: Int,
+                                    count: Int,
+                                ): Int {
+                                    if (offset >= 2L) return -1
+                                    val data = byteArrayOf(9, 8)
+                                    val n = minOf(count, (2L - offset).toInt())
+                                    System.arraycopy(data, offset.toInt(), buffer, bufferOffset, n)
+                                    return n
+                                }
+
+                                override fun close() {}
+                            }
+                        }
+
+                        override fun close() {
+                            if (id == 1) firstClosed = true
+                        }
+                    }
+                },
+                poolIdleTimeoutMs = 30_000L,
+            )
+        val uri = NfsAddress.assetUri(source.id, "02.wav")
+        assertArrayEquals(byteArrayOf(9, 8), client.bytes(source, uri, 1024))
+        assertArrayEquals(byteArrayOf(9, 8), client.bytes(source, uri, 1024))
+        assertEquals(2, created)
+        assertTrue(firstClosed)
+        client.evict(source.id)
+    }
 }

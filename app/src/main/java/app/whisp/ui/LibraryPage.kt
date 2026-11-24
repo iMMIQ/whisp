@@ -40,6 +40,7 @@ import app.whisp.data.LibrarySort
 import app.whisp.data.ProgressEntity
 import app.whisp.data.WhispImage
 import app.whisp.data.WorkEntity
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private val librarySortOptions =
@@ -97,14 +98,20 @@ internal fun LibraryPage(
     }
 
     LaunchedEffect(query, works) {
-        matchedIds = if (query.isBlank()) null else graph.library.searchWorkIds(query)
+        if (query.isBlank()) {
+            matchedIds = null
+        } else {
+            delay(250L)
+            matchedIds = graph.library.searchWorkIds(query)
+        }
     }
 
     val progressByWork = remember(progressList) { progressList.associateBy { it.workId } }
     val tracksByWork = remember(trackSummaries) { trackSummaries.groupBy { it.workId } }
+    val sortProgress = if (settings.librarySort == LibrarySort.RECENT) progressByWork else null
 
     val filtered =
-        remember(works, tab, series, matchedIds, settings.librarySort, progressByWork) {
+        remember(works, tab, series, matchedIds, settings.librarySort, sortProgress) {
             val base = works.filter { work ->
                 (tab != "收藏" || work.favorite) &&
                     (tab != "离线" || work.offlineAttachments) &&
@@ -115,7 +122,9 @@ internal fun LibraryPage(
                 LibrarySort.ADDED_ASC -> base.sortedBy { it.addedAt }
                 LibrarySort.RECENT ->
                     base.sortedWith(
-                        compareByDescending<WorkEntity> { progressByWork[it.id]?.updatedAt ?: 0L }
+                        compareByDescending<WorkEntity> {
+                                sortProgress?.get(it.id)?.updatedAt ?: 0L
+                            }
                             .thenByDescending { it.addedAt },
                     )
                 LibrarySort.TITLE_ASC -> base.sortedBy { it.title.lowercase() }

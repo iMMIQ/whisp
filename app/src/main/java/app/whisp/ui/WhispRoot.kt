@@ -3,6 +3,7 @@ package app.whisp.ui
 
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -95,28 +96,39 @@ fun WhispRoot(
             }
         }
 
-        // Observe only the single active/resumable work instead of the entire library's tracks.
+        // Observe only the single active/resumable work; ignore periodic positionMs ticks when
+        // already playing a track so Room observeDetails() is never torn down every 15 seconds.
         val activeSession by
             remember(graph) {
+                    val latestIdentity =
+                        graph.library
+                            .observeLatestProgress()
+                            .map { it?.let { p -> p.workId to p.trackId } }
+                            .distinctUntilChanged()
                     combine(
                             graph.playback.openingTrackId,
                             graph.playback.state.map { it.trackId }.distinctUntilChanged(),
                             graph.playback.queueTracks,
-                            graph.library.progress.map { it.firstOrNull() }.distinctUntilChanged(),
+                            latestIdentity,
                         ) { openId, playingId, queued, latest ->
                             val displayedId = openId ?: playingId
-                            Triple(displayedId, queued, latest)
+                            val resolvedTrack = displayedId?.let { id ->
+                                queued.firstOrNull { it.id == id }
+                            }
+                            val fallback = if (displayedId == null) latest else null
+                            Triple(displayedId, resolvedTrack, fallback)
                         }
-                        .flatMapLatest { (displayedId, queued, latest) ->
+                        .distinctUntilChanged()
+                        .flatMapLatest { (displayedId, queuedTrack, fallback) ->
                             flow {
                                 val resolvedTrack =
-                                    if (displayedId != null) {
-                                        queued.firstOrNull { it.id == displayedId }
-                                            ?: withContext(Dispatchers.IO) {
+                                    queuedTrack
+                                        ?: if (displayedId != null) {
+                                            withContext(Dispatchers.IO) {
                                                 graph.library.track(displayedId)
                                             }
-                                    } else null
-                                val workId = resolvedTrack?.workId ?: latest?.workId
+                                        } else null
+                                val workId = resolvedTrack?.workId ?: fallback?.first
                                 if (workId == null) {
                                     emit(null)
                                 } else {
@@ -127,7 +139,7 @@ fun WhispRoot(
                                                 val track =
                                                     resolvedTrack
                                                         ?: detail.tracks.firstOrNull {
-                                                            it.id == latest?.trackId
+                                                            it.id == fallback?.second
                                                         }
                                                         ?: detail.tracks.firstOrNull()
                                                 if (track != null) detail to track else null
@@ -735,13 +747,20 @@ private fun MiniPlayer(
                 stiffness = Spring.StiffnessMedium,
             )
 
-    val liftFraction = (abs(offsetY.value) / expandThresholdPx.coerceAtLeast(1f)).coerceIn(0f, 1f)
+    val liftedHighlight by
+        remember(expandThresholdPx) {
+            derivedStateOf {
+                abs(offsetY.value) / expandThresholdPx.coerceAtLeast(1f) > 0.6f
+            }
+        }
     Column(
         Modifier.testTag("mini-player")
             .widthIn(max = 560.dp)
             .fillMaxWidth()
             .padding(horizontal = 14.dp, vertical = 6.dp)
             .graphicsLayer {
+                val liftFraction =
+                    (abs(offsetY.value) / expandThresholdPx.coerceAtLeast(1f)).coerceIn(0f, 1f)
                 translationY = offsetY.value * 0.55f
                 val liftScale = 1f + liftFraction * 0.018f
                 scaleX = liftScale
@@ -751,7 +770,7 @@ private fun MiniPlayer(
             .background(MaterialTheme.colorScheme.surfaceContainerHigh)
             .border(
                 0.5.dp,
-                if (liftFraction > 0.6f) Rose.copy(alpha = 0.45f)
+                if (liftedHighlight) Rose.copy(alpha = 0.45f)
                 else MaterialTheme.colorScheme.outlineVariant,
                 shape,
             )
@@ -931,11 +950,18 @@ private fun MiniPlayerProgressBar(
     }
     val duration =
         state.durationMs.takeIf { state.trackId == track.id && it > 0 } ?: track.durationMs
-    val position = if (state.trackId == track.id) liveDisplayPos else state.positionMs
     if (duration > 0) {
-        val fraction = (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
-        Box(Modifier.fillMaxWidth().height(2.dp).background(Raised.copy(alpha = 0.7f))) {
-            Box(Modifier.fillMaxHeight().fillMaxWidth(fraction).background(Rose))
+        val trackBg = Raised.copy(alpha = 0.7f)
+        Canvas(Modifier.fillMaxWidth().height(2.dp)) {
+            val pos = if (state.trackId == track.id) liveDisplayPos else state.positionMs
+            val fraction = (pos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+            drawRect(color = trackBg)
+            if (fraction > 0f) {
+                drawRect(
+                    color = Rose,
+                    size = size.copy(width = size.width * fraction),
+                )
+            }
         }
     }
 }

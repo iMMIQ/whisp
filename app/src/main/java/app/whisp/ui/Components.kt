@@ -33,6 +33,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -75,7 +76,9 @@ import coil3.request.crossfade
 import coil3.toBitmap
 import java.util.Locale
 import kotlin.math.abs
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalSharedTransitionApi::class)
 internal val LocalArtworkTransition = compositionLocalOf<SharedTransitionScope?> { null }
@@ -188,6 +191,7 @@ internal fun Artwork(
     val epoch = LocalImageCacheEpoch.current
     val reduced = LocalReducedMotion.current
     val platformContext = LocalPlatformContext.current
+    val scope = rememberCoroutineScope()
     val requestData = remember(image, epoch) { image?.withEpoch(epoch) }
     val imageRequest =
         remember(requestData, reduced, platformContext) {
@@ -215,7 +219,7 @@ internal fun Artwork(
         } else Modifier
     val surface = MaterialTheme.colorScheme.surface
     val raised = MaterialTheme.colorScheme.surfaceContainerHighest
-    BoxWithConstraints(
+    Box(
         modifier
             .then(sharedModifier)
             .background(surface)
@@ -228,7 +232,6 @@ internal fun Artwork(
             ),
         contentAlignment = Alignment.Center,
     ) {
-        val iconSize = (minOf(maxWidth, maxHeight) * 0.28f).coerceIn(20.dp, 54.dp)
         if (requestData == null || failed) {
             Box(
                 Modifier.fillMaxSize()
@@ -243,13 +246,20 @@ internal fun Artwork(
                     Icons.Outlined.Headphones,
                     description,
                     tint = Muted.copy(alpha = .42f),
-                    modifier = Modifier.size(iconSize),
+                    modifier =
+                        Modifier.fillMaxSize(0.28f)
+                            .sizeIn(
+                                minWidth = 20.dp,
+                                minHeight = 20.dp,
+                                maxWidth = 54.dp,
+                                maxHeight = 54.dp,
+                            ),
                 )
             }
         } else {
             if (!loaded && !reduced) {
                 val pulse = rememberInfiniteTransition(label = "artwork-pulse")
-                val alpha by
+                val alphaState =
                     pulse.animateFloat(
                         initialValue = 0.25f,
                         targetValue = 0.65f,
@@ -260,7 +270,11 @@ internal fun Artwork(
                             ),
                         label = "artwork-pulse-alpha",
                     )
-                Box(Modifier.fillMaxSize().background(raised.copy(alpha = alpha)))
+                Box(
+                    Modifier.fillMaxSize().drawBehind {
+                        drawRect(raised.copy(alpha = alphaState.value))
+                    },
+                )
             }
             AsyncImage(
                 model = imageRequest,
@@ -289,9 +303,17 @@ internal fun Artwork(
                         if (cached != null) {
                             onAmbientColor(cached)
                         } else {
-                            runCatching {
-                                val bmp = success.result.image.toBitmap(24, 24)
-                                onAmbientColor(sampleAmbientColor(cacheKey, bmp))
+                            val resultImage = success.result.image
+                            scope.launch {
+                                val sampled =
+                                    withContext(Dispatchers.Default) {
+                                        runCatching {
+                                            val bmp = resultImage.toBitmap(24, 24)
+                                            sampleAmbientColor(cacheKey, bmp)
+                                        }
+                                            .getOrNull()
+                                    }
+                                if (sampled != null) onAmbientColor(sampled)
                             }
                         }
                     }
@@ -736,10 +758,13 @@ internal fun WhispImageLightbox(
         return Offset(rawX.coerceIn(-maxX, maxX), rawY.coerceIn(-maxY, maxY))
     }
 
-    val dismissProgress =
-        (abs(dismissY.value) / (containerSize.height.coerceAtLeast(1) * 0.32f)).coerceIn(0f, 1f)
-    val bgAlpha = (0.96f * (1f - dismissProgress * 0.65f)).coerceIn(0.2f, 0.96f)
-    val dismissScale = (1f - dismissProgress * 0.14f).coerceIn(0.84f, 1f)
+    val showChromeVisible by remember {
+        derivedStateOf {
+            val h = containerSize.height.coerceAtLeast(1) * 0.32f
+            val progress = (abs(dismissY.value) / h).coerceIn(0f, 1f)
+            showChrome && progress < 0.12f
+        }
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -749,7 +774,12 @@ internal fun WhispImageLightbox(
         Box(
             Modifier.fillMaxSize()
                 .onSizeChanged { containerSize = it }
-                .background(ScrimDark.copy(alpha = bgAlpha))
+                .drawBehind {
+                    val h = (size.height.coerceAtLeast(1f) * 0.32f)
+                    val progress = (abs(dismissY.value) / h).coerceIn(0f, 1f)
+                    val bgAlpha = (0.96f * (1f - progress * 0.65f)).coerceIn(0.2f, 0.96f)
+                    drawRect(ScrimDark.copy(alpha = bgAlpha))
+                }
                 .pointerInput(Unit) {
                     detectTapGestures(
                         onTap = { showChrome = !showChrome },
@@ -861,6 +891,9 @@ internal fun WhispImageLightbox(
                 scale = ContentScale.Fit,
                 modifier =
                     Modifier.fillMaxSize().graphicsLayer {
+                        val h = size.height.coerceAtLeast(1f) * 0.32f
+                        val progress = (abs(dismissY.value) / h).coerceIn(0f, 1f)
+                        val dismissScale = (1f - progress * 0.14f).coerceIn(0.84f, 1f)
                         val effectiveScale = scaleAnim.value * dismissScale
                         scaleX = effectiveScale
                         scaleY = effectiveScale
@@ -869,7 +902,7 @@ internal fun WhispImageLightbox(
                     },
             )
             androidx.compose.animation.AnimatedVisibility(
-                visible = showChrome && dismissProgress < 0.12f,
+                visible = showChromeVisible,
                 enter = androidx.compose.animation.fadeIn(tween(if (reduced) 0 else 150)),
                 exit = androidx.compose.animation.fadeOut(tween(if (reduced) 0 else 120)),
             ) {
@@ -1100,4 +1133,41 @@ internal fun shortTitle(title: String): String {
     val body =
         if ('～' in trimmed && !trimmed.startsWith('～')) trimmed.substringAfter('～') else trimmed
     return body.trim(' ', '～', '~', '【', '】', '「', '」', '『', '』')
+}
+
+/** Splits large script/attachment text into paragraph-aligned chunks for LazyColumn rendering. */
+internal fun chunkLongText(text: String, maxChunkChars: Int = 1200): List<String> {
+    if (text.isEmpty()) return emptyList()
+    if (text.length <= maxChunkChars) return listOf(text)
+    val chunks = mutableListOf<String>()
+    val current = StringBuilder(minOf(text.length, maxChunkChars + 256))
+    var start = 0
+    while (start < text.length) {
+        val nl = text.indexOf('\n', start)
+        val end = if (nl < 0) text.length else nl
+        val lineLen = end - start
+        if (current.isNotEmpty() && current.length + 1 + lineLen > maxChunkChars) {
+            chunks += current.toString()
+            current.setLength(0)
+        }
+        if (lineLen > maxChunkChars) {
+            // Hard-split pathologically long single lines so StaticLayout never stalls.
+            var pos = start
+            while (pos < end) {
+                val sliceEnd = minOf(pos + maxChunkChars, end)
+                if (current.isNotEmpty()) {
+                    chunks += current.toString()
+                    current.setLength(0)
+                }
+                chunks += text.substring(pos, sliceEnd)
+                pos = sliceEnd
+            }
+        } else {
+            if (current.isNotEmpty()) current.append('\n')
+            current.append(text, start, end)
+        }
+        start = if (nl < 0) text.length else nl + 1
+    }
+    if (current.isNotEmpty()) chunks += current.toString()
+    return chunks
 }

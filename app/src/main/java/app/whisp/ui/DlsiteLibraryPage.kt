@@ -23,10 +23,18 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.whisp.AppGraph
 import app.whisp.DlsiteLoginActivity
+import app.whisp.data.DlsiteOwnedWork
 import app.whisp.data.WhispImage
+import app.whisp.data.WorkEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private data class DlsiteGridItem(
+    val owned: DlsiteOwnedWork,
+    val entity: WorkEntity,
+    val image: WhispImage?,
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -62,6 +70,19 @@ internal fun DlsiteLibraryPage(
                     }
             }
             if (sortByTitle) filtered.sortedBy { it.title } else filtered
+        }
+    val gridItems =
+        remember(visible, sourceId) {
+            visible.map { work ->
+                val entity = work.entity(sourceId)
+                val coverId = entity.coverId
+                val coverUrl = work.coverUrl
+                val image =
+                    if (coverId != null && coverUrl != null)
+                        WhispImage.Catalog(coverId, coverUrl, sourceId)
+                    else null
+                DlsiteGridItem(work, entity, image)
+            }
         }
     Column(Modifier.fillMaxSize().statusBarsPadding().testTag("dlsite-library")) {
         Row(
@@ -186,18 +207,11 @@ internal fun DlsiteLibraryPage(
             modifier = Modifier.weight(1f).fillMaxWidth(),
         ) {
             WorkGrid(
-                items = visible,
-                key = { it.workno },
-                workOf = { it.entity(sourceId) },
-                imageOf = { work ->
-                    val entity = work.entity(sourceId)
-                    val coverId = entity.coverId
-                    val coverUrl = work.coverUrl
-                    if (coverId != null && coverUrl != null)
-                        WhispImage.Catalog(coverId, coverUrl, sourceId)
-                    else null
-                },
-                onClick = { work -> openOwned(work.workno) },
+                items = gridItems,
+                key = { it.owned.workno },
+                workOf = { it.entity },
+                imageOf = { it.image },
+                onClick = { item -> openOwned(item.owned.workno) },
             )
             if (visible.isEmpty() && !synchronizing) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

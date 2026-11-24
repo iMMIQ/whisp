@@ -117,4 +117,62 @@ class WebDavClientTest {
             assertEquals(listOf("a/01.flac", "b/02.wav"), paths)
         }
     }
+
+    @Test
+    fun parsesMultiPropstatSkips404AndExtractsLastModified() {
+        val body =
+            """
+            <D:multistatus xmlns:D="DAV:" xmlns:x="urn:example">
+              <D:response>
+                <D:href>/ASMR/track01.flac</D:href>
+                <D:propstat>
+                  <D:prop>
+                    <D:displayname>Ignored 404 Display</D:displayname>
+                    <D:resourcetype><D:collection/></D:resourcetype>
+                    <D:getcontentlength>999999</D:getcontentlength>
+                  </D:prop>
+                  <D:status>HTTP/1.1 404 Not Found</D:status>
+                </D:propstat>
+                <D:propstat>
+                  <D:prop>
+                    <x:custom>nested</x:custom>
+                    <D:getcontentlength>4096</D:getcontentlength>
+                    <D:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</D:getlastmodified>
+                  </D:prop>
+                  <D:status>HTTP/1.1 200 OK</D:status>
+                </D:propstat>
+              </D:response>
+              <D:response>
+                <D:href>/ASMR/folder/</D:href>
+                <D:propstat>
+                  <D:prop>
+                    <D:displayname>Custom Folder</D:displayname>
+                    <D:resourcetype><D:collection/></D:resourcetype>
+                  </D:prop>
+                  <D:status>HTTP/1.1 200 OK</D:status>
+                </D:propstat>
+              </D:response>
+            </D:multistatus>
+            """
+                .trimIndent()
+        val entries =
+            WebDavClient.parse(body.toByteArray(), "https://nas.example/ASMR/".toHttpUrl())
+        assertEquals(2, entries.size)
+        val item = entries[0]
+        assertFalse(item.directory)
+        assertEquals("track01.flac", item.name)
+        assertEquals(4096L, item.size)
+        assertEquals(1445412480000L, item.modified)
+        assertTrue(entries[1].directory)
+        assertEquals("Custom Folder", entries[1].name)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun rejectsDoctypeWithNulBytesAndMixedCase() {
+        val payload = "<\u0000!\u0000d\u0000O\u0000c\u0000T\u0000y\u0000P\u0000e\u0000 x><d/>"
+        WebDavClient.parse(
+            payload.toByteArray(Charsets.ISO_8859_1),
+            "https://nas.example/".toHttpUrl(),
+        )
+    }
 }

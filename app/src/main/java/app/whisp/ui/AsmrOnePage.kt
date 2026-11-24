@@ -156,6 +156,12 @@ class AsmrCatalogController(
     }
 }
 
+private data class AsmrGridItem(
+    val work: AsmrWork,
+    val entity: WorkEntity,
+    val image: WhispImage?,
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun AsmrOnePage(
@@ -233,6 +239,19 @@ internal fun AsmrOnePage(
         if (nearEnd && state.items.isNotEmpty() && state.hasMore) catalog.loadNextPage()
     }
 
+    val gridItems =
+        remember(state.items, sourceId) {
+            state.items.map { work ->
+                val entity = work.entity(sourceId)
+                val coverId = entity.coverId
+                val coverUrl = work.coverUrl
+                val image =
+                    if (coverId != null && coverUrl != null)
+                        WhispImage.Catalog(coverId, coverUrl, sourceId)
+                    else null
+                AsmrGridItem(work, entity, image)
+            }
+        }
     val suggestedHistory =
         if (editing)
             history.filter { text.isBlank() || it.contains(text, ignoreCase = true) }.take(4)
@@ -397,13 +416,9 @@ internal fun AsmrOnePage(
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
                             verticalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
-                            items(state.items, key = { it.workId }) { work ->
-                                val image =
-                                    remember(work.coverId, work.coverUrl, sourceId) {
-                                        val id = work.coverId ?: return@remember null
-                                        val url = work.coverUrl ?: return@remember null
-                                        WhispImage.Catalog(id, url, sourceId)
-                                    }
+                            items(gridItems, key = { it.entity.id }) { item ->
+                                val work = item.work
+                                val image = item.image
                                 val rowShape = RoundedCornerShape(16.dp)
                                 Row(
                                     Modifier.fillMaxWidth()
@@ -467,16 +482,11 @@ internal fun AsmrOnePage(
                         }
                     } else {
                         WorkGrid(
-                            items = state.items,
-                            key = { it.workId },
-                            workOf = { it.entity(sourceId) },
-                            imageOf = { work ->
-                                val id = work.coverId
-                                val url = work.coverUrl
-                                if (id != null && url != null) WhispImage.Catalog(id, url, sourceId)
-                                else null
-                            },
-                            onClick = open,
+                            items = gridItems,
+                            key = { it.entity.id },
+                            workOf = { it.entity },
+                            imageOf = { it.image },
+                            onClick = { open(it.work) },
                             state = grid,
                             tag = "asmr-grid",
                             footer = {

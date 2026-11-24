@@ -8,6 +8,7 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.cache.Cache
+import androidx.media3.datasource.cache.CacheDataSink
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheEvictor
 import androidx.media3.datasource.cache.CacheSpan
@@ -19,7 +20,9 @@ import androidx.media3.exoplayer.offline.DownloadProgress
 import androidx.media3.exoplayer.scheduler.Requirements
 import java.io.File
 import java.util.TreeSet
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -107,11 +110,13 @@ class MediaSourceRouting(
     private val messages: MutableSharedFlow<String>,
 ) {
     private val streamingEvictor = AdjustableCacheEvictor(Long.MAX_VALUE, storageChanged)
-    private val mediaDatabase = StandaloneDatabaseProvider(context)
-    val downloadCache =
+    private val mediaDatabase by lazy { StandaloneDatabaseProvider(context) }
+    val downloadCache: SimpleCache by lazy {
         SimpleCache(File(context.filesDir, "offline/audio"), NoOpCacheEvictor(), mediaDatabase)
-    val streamingCache =
+    }
+    val streamingCache: SimpleCache by lazy {
         SimpleCache(File(context.cacheDir, "streaming"), streamingEvictor, mediaDatabase)
+    }
 
     // Lazy scheme-dispatched DataSource: instantiates only the single backend needed for open().
     private val networkFactory = DataSource.Factory {
@@ -146,73 +151,91 @@ class MediaSourceRouting(
         }
     }
 
-    private val streamingFactory =
+    private val streamingFactory: DataSource.Factory by lazy {
         CacheDataSource.Factory()
             .setCache(streamingCache)
+            .setCacheWriteDataSinkFactory(
+                CacheDataSink.Factory().setCache(streamingCache).setFragmentSize(16L * MIB),
+            )
             .setUpstreamDataSourceFactory(networkFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+    }
 
-    val playbackFactory: DataSource.Factory =
+    val playbackFactory: DataSource.Factory by lazy {
         CacheDataSource.Factory()
             .setCache(downloadCache)
             // Only DownloadManager writes pinned copies so paused playback never blocks downloads.
             .setCacheWriteDataSinkFactory(null)
             .setUpstreamDataSourceFactory(streamingFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-
-    val downloadManager =
-        DownloadManager(
-                context,
-                mediaDatabase,
-                downloadCache,
-                networkFactory,
-                Executors.newFixedThreadPool(2),
-            )
-            .apply {
-                maxParallelDownloads = 2
-                requirements = Requirements(Requirements.DEVICE_STORAGE_NOT_LOW)
-            }
+    }
 
     val completedDownloads = MutableStateFlow<Set<String>>(emptySet())
     val downloads = MutableStateFlow<Map<String, Download>>(emptyMap())
     private val downloadRefresh = Channel<Unit>(Channel.CONFLATED)
     private val activeDownloads = MutableStateFlow(false)
 
+    val downloadManager: DownloadManager by lazy {
+        val executor =
+            ThreadPoolExecutor(
+                    2,
+                    2,
+                    30L,
+                    TimeUnit.SECONDS,
+                    LinkedBlockingQueue(),
+                )
+                .apply { allowCoreThreadTimeOut(true) }
+        DownloadManager(
+                context,
+                mediaDatabase,
+                downloadCache,
+                networkFactory,
+                executor,
+            )
+            .apply {
+                maxParallelDownloads = 2
+                requirements = Requirements(Requirements.DEVICE_STORAGE_NOT_LOW)
+                addListener(
+                    object : DownloadManager.Listener {
+                        override fun onInitialized(manager: DownloadManager) {
+                            downloadRefresh.trySend(Unit)
+                        }
+
+                        override fun onDownloadChanged(
+                            manager: DownloadManager,
+                            download: Download,
+                            finalException: Exception?,
+                        ) {
+                            downloadRefresh.trySend(Unit)
+                            storageChanged()
+                            finalException?.let {
+                                messages.tryEmit(
+                                    if (
+                                        generateSequence<Throwable>(it) { cause -> cause.cause }
+                                            .any { cause -> cause is DlsiteLoginRequired }
+                                    )
+                                        "DLsite 登录已过期，请在来源页重新登录"
+                                    else "下载失败，可在来源页重试",
+                                )
+                            }
+                        }
+
+                        override fun onDownloadRemoved(
+                            manager: DownloadManager,
+                            download: Download,
+                        ) {
+                            downloadRefresh.trySend(Unit)
+                            storageChanged()
+                        }
+                    },
+                )
+            }
+    }
+
     init {
         scope.launch {
             streamingCacheMiBUpdates.collect { streamingEvictor.resize(streamingCache, it * MIB) }
         }
-        downloadManager.addListener(
-            object : DownloadManager.Listener {
-                override fun onInitialized(manager: DownloadManager) {
-                    downloadRefresh.trySend(Unit)
-                }
-
-                override fun onDownloadChanged(
-                    manager: DownloadManager,
-                    download: Download,
-                    finalException: Exception?,
-                ) {
-                    downloadRefresh.trySend(Unit)
-                    storageChanged()
-                    finalException?.let {
-                        messages.tryEmit(
-                            if (
-                                generateSequence<Throwable>(it) { cause -> cause.cause }
-                                    .any { cause -> cause is DlsiteLoginRequired }
-                            )
-                                "DLsite 登录已过期，请在来源页重新登录"
-                            else "下载失败，可在来源页重试",
-                        )
-                    }
-                }
-
-                override fun onDownloadRemoved(manager: DownloadManager, download: Download) {
-                    downloadRefresh.trySend(Unit)
-                    storageChanged()
-                }
-            },
-        )
         scope.launch(Dispatchers.Main.immediate) {
             for (ignored in downloadRefresh) {
                 val stored = withContext(Dispatchers.IO) { readDownloads() }
@@ -225,7 +248,11 @@ class MediaSourceRouting(
                 sampleDownloadProgress()
             }
         }
-        downloadRefresh.trySend(Unit)
+        // Warm caches & DownloadManager off the main thread so Application.onCreate stays fast.
+        scope.launch(Dispatchers.IO) {
+            downloadManager
+            downloadRefresh.trySend(Unit)
+        }
         scope.launch(Dispatchers.Main.immediate) {
             combine(downloads.subscriptionCount, activeDownloads) { observers, active ->
                     observers > 0 && active
@@ -243,6 +270,14 @@ class MediaSourceRouting(
 
     fun isCompleted(trackId: String): Boolean =
         downloadManager.downloadIndex.getDownload(trackId)?.state == Download.STATE_COMPLETED
+
+    fun snapshotCompletedDownloads(): Set<String> {
+        val result = HashSet<String>()
+        downloadManager.downloadIndex.getDownloads(Download.STATE_COMPLETED).use { cursor ->
+            while (cursor.moveToNext()) result += cursor.download.request.id
+        }
+        return result
+    }
 
     fun completedUri(trackId: String): String? =
         downloadManager.downloadIndex

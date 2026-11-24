@@ -2,6 +2,10 @@
 package app.whisp.data
 
 import java.io.Closeable
+import java.util.ArrayDeque
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 data class NfsEntry(val name: String, val type: Int, val size: Long, val modifiedMs: Long)
 
@@ -11,11 +15,108 @@ interface NfsSession : Closeable {
     fun open(path: String): RemoteReadHandle
 }
 
-/** An operation owns its connection; file handles and RPC contexts never cross sources. */
+/**
+ * NFS client with optional per-source idle session pooling so consecutive file/fragment reads reuse
+ * mounted RPC contexts while keeping connections isolated across sources and reclaiming idle
+ * mounts.
+ */
 class NfsClient(
     private val connect: (NfsAddress) -> NfsSession = { NativeNfsSession(it) },
+    private val poolIdleTimeoutMs: Long = 0L,
+    private val maxIdlePerSource: Int = 4,
     private val report: (String) -> Unit = {},
 ) {
+    private data class PoolKey(val sourceId: String, val root: String)
+
+    private class IdleSlot(val session: NfsSession, var expiryTask: ScheduledFuture<*>? = null)
+
+    private val poolLock = Any()
+    private val idlePools = mutableMapOf<PoolKey, ArrayDeque<IdleSlot>>()
+    private val generations = mutableMapOf<String, Long>()
+    private val cleaner by lazy {
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "whisp-nfs-pool-idle").apply { isDaemon = true }
+        }
+    }
+
+    private fun borrow(key: PoolKey, address: NfsAddress): Triple<NfsSession, Long, Boolean> {
+        val generation: Long
+        if (poolIdleTimeoutMs > 0L) {
+            synchronized(poolLock) {
+                generation = generations[key.sourceId] ?: 0L
+                val slot = idlePools[key]?.pollLast()
+                if (slot != null) {
+                    slot.expiryTask?.cancel(false)
+                    slot.expiryTask = null
+                    if (idlePools[key]?.isEmpty() == true) idlePools.remove(key)
+                    return Triple(slot.session, generation, true)
+                }
+            }
+        } else {
+            generation = 0L
+        }
+        return Triple(connect(address), generation, false)
+    }
+
+    private fun release(key: PoolKey, session: NfsSession, generation: Long, broken: Boolean) {
+        if (poolIdleTimeoutMs <= 0L || broken) {
+            runCatching { session.close() }
+            return
+        }
+        var shouldClose = false
+        synchronized(poolLock) {
+            val currentGen = generations[key.sourceId] ?: 0L
+            if (currentGen != generation) {
+                shouldClose = true
+            } else {
+                val deque = idlePools.getOrPut(key) { ArrayDeque() }
+                if (deque.size >= maxIdlePerSource) {
+                    shouldClose = true
+                } else {
+                    val slot = IdleSlot(session)
+                    slot.expiryTask =
+                        cleaner.schedule(
+                            { expireSlot(key, slot) },
+                            poolIdleTimeoutMs,
+                            TimeUnit.MILLISECONDS,
+                        )
+                    deque.addLast(slot)
+                }
+            }
+        }
+        if (shouldClose) runCatching { session.close() }
+    }
+
+    private fun expireSlot(key: PoolKey, slot: IdleSlot) {
+        val removed =
+            synchronized(poolLock) {
+                val deque = idlePools[key]
+                val ok = deque?.remove(slot) == true
+                if (deque != null && deque.isEmpty()) idlePools.remove(key)
+                ok
+            }
+        if (removed) runCatching { slot.session.close() }
+    }
+
+    fun evict(sourceId: String) {
+        val toClose = mutableListOf<NfsSession>()
+        synchronized(poolLock) {
+            generations[sourceId] = (generations[sourceId] ?: 0L) + 1L
+            val iterator = idlePools.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.key.sourceId == sourceId) {
+                    for (slot in entry.value) {
+                        slot.expiryTask?.cancel(false)
+                        toClose += slot.session
+                    }
+                    iterator.remove()
+                }
+            }
+        }
+        toClose.forEach { runCatching { it.close() } }
+    }
+
     fun check(source: SourceEntity) =
         connect(NfsAddress.parse(source.root)).use {
             it.list("")
@@ -24,16 +125,20 @@ class NfsClient(
 
     suspend fun walk(source: SourceEntity): List<FileEntry> {
         val address = NfsAddress.parse(source.root)
-        val sessions = mutableListOf<NfsSession>()
+        val workerSessions = arrayOfNulls<NfsSession>(4)
+        val sessionLock = Any()
         try {
-            sessions += connect(address)
             val files = mutableListOf<FileEntry>()
-            walkTree(
+            walkTreeConcurrent(
                 root = "",
                 concurrency = 4,
-                listBatch = { batch ->
-                    while (sessions.size < batch.size) sessions += connect(address)
-                    parallelList(batch) { index, path -> sessions[index].list(path) }
+                listOne = { workerIndex, path ->
+                    val session =
+                        synchronized(sessionLock) {
+                            workerSessions[workerIndex]
+                                ?: connect(address).also { workerSessions[workerIndex] = it }
+                        }
+                    session.list(path)
                 },
                 onDirectory = { parent, entries, enqueue ->
                     for (entry in entries) {
@@ -53,30 +158,65 @@ class NfsClient(
                         if (directory) enqueue(path)
                     }
                 },
-                onLevel = { dirs -> report("NFS listed $dirs directories; ${files.size} entries") },
+                onProgress = { dirs ->
+                    report("NFS listed $dirs directories; ${files.size} entries")
+                },
             )
             return files
         } finally {
-            sessions.forEach { it.close() }
+            synchronized(sessionLock) { workerSessions.filterNotNull() }
+                .forEach { runCatching { it.close() } }
         }
     }
 
     fun open(source: SourceEntity, uri: String): RemoteReadHandle {
         val path = NfsAddress.assetPath(uri, source.id)
-        val session = connect(NfsAddress.parse(source.root))
+        val address = NfsAddress.parse(source.root)
+        val key = PoolKey(source.id, source.root)
+        var borrowed = borrow(key, address)
         val reader =
             try {
-                session.open(path)
-            } catch (e: Exception) {
-                session.close()
-                throw e
+                borrowed.first.open(path)
+            } catch (firstError: Exception) {
+                runCatching { borrowed.first.close() }
+                if (!borrowed.third) throw firstError
+                // Reused mount may have expired server-side; retry once on a fresh mount.
+                val freshGen = synchronized(poolLock) { generations[key.sourceId] ?: 0L }
+                val fresh = connect(address)
+                borrowed = Triple(fresh, freshGen, false)
+                try {
+                    fresh.open(path)
+                } catch (retryError: Exception) {
+                    runCatching { fresh.close() }
+                    throw retryError
+                }
             }
-        return object : RemoteReadHandle by reader {
+        val session = borrowed.first
+        val generation = borrowed.second
+        return object : RemoteReadHandle {
+            private var broken = false
+            private var closed = false
+
+            override val length: Long
+                get() = reader.length
+
+            override fun read(buffer: ByteArray, offset: Long, bufferOffset: Int, count: Int): Int =
+                try {
+                    reader.read(buffer, offset, bufferOffset, count)
+                } catch (e: Exception) {
+                    broken = true
+                    throw e
+                }
+
             override fun close() {
+                if (closed) return
+                closed = true
                 try {
                     reader.close()
+                } catch (_: Exception) {
+                    broken = true
                 } finally {
-                    session.close()
+                    release(key, session, generation, broken)
                 }
             }
         }

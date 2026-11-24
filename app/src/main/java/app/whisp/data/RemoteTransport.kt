@@ -17,12 +17,17 @@ import java.net.URLDecoder
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import okio.BufferedSink
 
 const val MIB = 1024L * 1024
 
@@ -91,6 +96,25 @@ fun RemoteReadHandle.readFull(limit: Int, errorMessage: String = "文件读取�
         used += n
     }
     return bytes
+}
+
+fun RemoteReadHandle.copyToSink(
+    sink: BufferedSink,
+    limit: Int,
+    errorMessage: String = "文件读取中断",
+): Long {
+    require(limit >= 0 && length in 0..limit.toLong()) { "文件过大" }
+    val buffer = ByteArray(64 * 1024)
+    var offset = 0L
+    val total = length
+    while (offset < total) {
+        val toRead = minOf(buffer.size.toLong(), total - offset).toInt()
+        val n = read(buffer, offset, 0, toRead)
+        if (n <= 0) throw IOException(errorMessage)
+        sink.write(buffer, 0, n)
+        offset += n
+    }
+    return offset
 }
 
 fun RemoteReadHandle.readRange(offset: Long, count: Int): ByteArray {
@@ -195,6 +219,51 @@ suspend fun <D, E> walkTree(
     }
 }
 
+/**
+ * Work-stealing concurrent directory walker with fixed [concurrency] worker coroutines. Eliminates
+ * level-batch head-of-line blocking where fast directories wait on a single slow directory.
+ */
+suspend fun <D, E> walkTreeConcurrent(
+    root: D,
+    concurrency: Int = 4,
+    listOne: suspend (workerIndex: Int, dir: D) -> List<E>,
+    onDirectory: (parent: D, entries: List<E>, enqueue: (D) -> Unit) -> Unit,
+    onProgress: (directories: Int) -> Unit = {},
+) = coroutineScope {
+    val workers = concurrency.coerceAtLeast(1)
+    val queue = Channel<D>(Channel.UNLIMITED)
+    val inFlight = AtomicInteger(1)
+    val directories = AtomicInteger(0)
+    val lock = Any()
+    queue.trySend(root)
+    try {
+        val jobs =
+            List(workers) { workerIndex ->
+                launch(Dispatchers.IO) {
+                    for (dir in queue) {
+                        currentCoroutineContext().ensureActive()
+                        val entries = listOne(workerIndex, dir)
+                        currentCoroutineContext().ensureActive()
+                        val count =
+                            synchronized(lock) {
+                                onDirectory(dir, entries) { child ->
+                                    inFlight.incrementAndGet()
+                                    queue.trySend(child)
+                                }
+                                directories.incrementAndGet()
+                            }
+                        if (count % 16 == 0) onProgress(count)
+                        if (inFlight.decrementAndGet() == 0) queue.close()
+                    }
+                }
+            }
+        jobs.joinAll()
+        onProgress(directories.get())
+    } finally {
+        queue.close()
+    }
+}
+
 suspend fun <D, E> parallelList(
     batch: List<D>,
     listOne: suspend (index: Int, dir: D) -> List<E>,
@@ -268,7 +337,7 @@ class RemoteFileDataSource(
 
 fun boundedRead(stream: InputStream, limit: Int): ByteArray {
     val output = java.io.ByteArrayOutputStream()
-    val buffer = ByteArray(8192)
+    val buffer = ByteArray(16384)
     while (true) {
         val count = stream.read(buffer, 0, minOf(buffer.size, limit - output.size() + 1))
         if (count < 0) break
@@ -276,6 +345,20 @@ fun boundedRead(stream: InputStream, limit: Int): ByteArray {
         require(output.size() <= limit) { "文件过大" }
     }
     return output.toByteArray()
+}
+
+fun copyBounded(stream: InputStream, sink: BufferedSink, limit: Int): Long {
+    val buffer = ByteArray(32 * 1024)
+    var total = 0L
+    while (true) {
+        val remaining = (limit.toLong() - total + 1L).coerceAtMost(buffer.size.toLong()).toInt()
+        val count = stream.read(buffer, 0, remaining)
+        if (count < 0) break
+        total += count
+        require(total <= limit) { "文件过大" }
+        sink.write(buffer, 0, count)
+    }
+    return total
 }
 
 internal fun atomicFile(file: File, bytes: ByteArray) {
