@@ -35,6 +35,11 @@ object LibraryIndexer {
 
     private val subtitleSuffix =
         Regex("\\.(${MediaFormats.subtitles.joinToString("|")})$", RegexOption.IGNORE_CASE)
+    private val languageSuffix =
+        Regex(
+            "[._-](?:zh(?:[-_](?:cn|tw|hk|hans|hant))?|chs|cht|cn|sc|tc|ja|jp|jpn|en|eng|ko|kr|bilingual|dual|sub|cc)$",
+            RegexOption.IGNORE_CASE,
+        )
     private val resourceSuffix =
         Regex(
             "\\.(${(MediaFormats.playable + setOf("txt", "jpg", "jpeg", "png", "webp", "pdf")).joinToString("|")})$",
@@ -42,6 +47,47 @@ object LibraryIndexer {
         )
 
     private fun stem(name: String) = name.replace(subtitleSuffix, "").replace(resourceSuffix, "")
+
+    internal fun subtitleBaseStem(name: String): String {
+        var current = stem(name)
+        while (true) {
+            val stripped = current.replace(languageSuffix, "")
+            if (stripped == current || stripped.isBlank()) break
+            current = stripped
+        }
+        return current
+    }
+
+    /**
+     * Returns matching subtitle attachments for [track] sorted by match quality, followed by
+     * remaining work subtitles.
+     */
+    fun subtitleCandidates(
+        track: TrackEntity,
+        attachments: List<AttachmentEntity>,
+    ): List<AttachmentEntity> {
+        val allSubtitles = attachments.filter { it.kind == "subtitle" }
+        if (allSubtitles.isEmpty()) return emptyList()
+        val trackDir = track.relativePath.substringBeforeLast('/', "")
+        val exactStem = stem(track.fileName).lowercase()
+        val baseStem = subtitleBaseStem(track.fileName).lowercase()
+        return allSubtitles.sortedWith(
+            compareBy<AttachmentEntity> {
+                    when {
+                        it.id == track.subtitleId -> 0
+                        stem(it.fileName).lowercase() == exactStem -> 1
+                        subtitleBaseStem(it.fileName).lowercase() == baseStem -> 2
+                        number(it.fileName) == track.order && track.order < 9999 -> 3
+                        else -> 4
+                    }
+                }
+                .thenBy {
+                    if (it.relativePath.substringBeforeLast('/', "") == trackDir) 0 else 1
+                }
+                .thenBy { if (it.fileName.extension() == "vtt") 0 else 1 }
+                .thenBy { it.relativePath },
+        )
+    }
 
     fun number(name: String): Int =
         leadingNumber.find(name.replace(codePrefix, ""))?.groupValues?.get(1)?.toIntOrNull() ?: 9999
@@ -162,12 +208,18 @@ object LibraryIndexer {
             attachments += resources.values
             val resourcesByStem =
                 resources.entries.groupBy { stem(it.key.path.basename()).lowercase() }
+            val subtitlesByBaseStem =
+                resources.entries
+                    .filter { it.value.kind == "subtitle" }
+                    .groupBy { subtitleBaseStem(it.key.path.basename()).lowercase() }
             group
                 .sortedWith(compareBy<FileEntry> { number(it.path.basename()) }.thenBy { it.path })
                 .forEach { file ->
                     val fileName = file.path.basename()
                     val relative = file.path.removePrefix("$root/")
-                    val sameName = resourcesByStem[stem(fileName).lowercase()].orEmpty()
+                    val exactStemKey = stem(fileName).lowercase()
+                    val baseStemKey = subtitleBaseStem(fileName).lowercase()
+                    val sameName = resourcesByStem[exactStemKey].orEmpty()
                     fun match(kind: String) =
                         sameName
                             .filter { it.value.kind == kind }
@@ -181,9 +233,12 @@ object LibraryIndexer {
                             }
                             ?.value
                             ?.id
+                    val exactSubtitles = sameName.filter { it.value.kind == "subtitle" }
+                    val candidateSubtitles = exactSubtitles.ifEmpty {
+                        subtitlesByBaseStem[baseStemKey].orEmpty()
+                    }
                     val subtitle =
-                        sameName
-                            .filter { it.value.kind == "subtitle" }
+                        candidateSubtitles
                             .minWithOrNull(
                                 compareBy<Map.Entry<FileEntry, AttachmentEntity>> {
                                         if (

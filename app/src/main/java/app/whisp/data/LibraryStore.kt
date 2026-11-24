@@ -206,6 +206,44 @@ class LibraryStore(
         return sources.routeUri(work.sourceId, track.id, track.uri)
     }
 
+    /**
+     * Batch-resolves track URIs for a queue in O(1) database/index queries instead of N+1 per-track
+     * Room & DownloadIndex lookups.
+     */
+    suspend fun resolveTrackUris(tracks: List<TrackEntity>, work: WorkEntity): Map<String, String> =
+        withContext(Dispatchers.IO) {
+            if (tracks.isEmpty()) return@withContext emptyMap()
+            val completed = media.completedUrisSnapshot()
+            val offlineNames = offlineDir.list()?.toHashSet().orEmpty()
+            var cachedKind: SourceKind? = null
+            var kindLoaded = false
+            buildMap(tracks.size) {
+                for (track in tracks) {
+                    if (track.id in offlineNames) {
+                        val file = File(offlineDir, track.id)
+                        if (file.isFile) {
+                            put(track.id, Uri.fromFile(file).toString())
+                            continue
+                        }
+                    }
+                    completed[track.id]?.let {
+                        put(track.id, it)
+                        continue
+                    }
+                    val sourceId = work.sourceId
+                    if (sourceId == null || track.uri.isBlank()) {
+                        throw IOException("文件已移动或来源已移除")
+                    }
+                    if (!kindLoaded) {
+                        cachedKind = dao.source(sourceId)?.kindType
+                        kindLoaded = true
+                    }
+                    val kind = cachedKind ?: throw IOException("来源已移除")
+                    put(track.id, sources.routeUriForKind(kind, sourceId, track.id, track.uri))
+                }
+            }
+        }
+
     suspend fun readAsset(id: String, limit: Int = 8 * 1024 * 1024): ByteArray =
         withContext(Dispatchers.IO) {
             offlineFile(id)?.let {

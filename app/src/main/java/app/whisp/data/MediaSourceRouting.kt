@@ -153,6 +153,10 @@ class MediaSourceRouting(
         }
     }
 
+    private val localDirectFactory: DataSource.Factory by lazy {
+        androidx.media3.datasource.DefaultDataSource.Factory(context)
+    }
+
     private val streamingFactory: DataSource.Factory by lazy {
         CacheDataSource.Factory()
             .setCache(streamingCache)
@@ -163,12 +167,66 @@ class MediaSourceRouting(
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
     }
 
-    val playbackFactory: DataSource.Factory by lazy {
+    private val cachedPlaybackFactory: DataSource.Factory by lazy {
         CacheDataSource.Factory()
             .setCache(downloadCache)
             // Only DownloadManager writes pinned copies so paused playback never blocks downloads.
             .setCacheWriteDataSinkFactory(null)
             .setUpstreamDataSourceFactory(streamingFactory)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+    }
+
+    /**
+     * Routes local content:// and file:// media directly to DefaultDataSource so local and
+     * offline-asset playback never writes redundant copies into the online streaming cache.
+     */
+    val playbackFactory: DataSource.Factory by lazy {
+        DataSource.Factory {
+            object : DataSource {
+                private val listeners = mutableListOf<TransferListener>()
+                private var active: DataSource? = null
+
+                override fun addTransferListener(listener: TransferListener) {
+                    listeners += listener
+                    active?.addTransferListener(listener)
+                }
+
+                override fun open(spec: DataSpec): Long {
+                    val scheme = spec.uri.scheme?.lowercase()
+                    val delegate =
+                        if (scheme == "file" || scheme == "content")
+                            localDirectFactory.createDataSource()
+                        else cachedPlaybackFactory.createDataSource()
+                    listeners.forEach(delegate::addTransferListener)
+                    active = delegate
+                    return delegate.open(spec)
+                }
+
+                override fun read(buffer: ByteArray, offset: Int, length: Int) =
+                    active?.read(buffer, offset, length) ?: -1
+
+                override fun getUri() = active?.uri
+
+                override fun getResponseHeaders() = active?.responseHeaders ?: emptyMap()
+
+                override fun close() {
+                    val current = active
+                    active = null
+                    current?.close()
+                }
+            }
+        }
+    }
+
+    /**
+     * Reuses already-cached streaming fragments during offline downloads before hitting the network
+     * upstream, avoiding duplicate data transfer after previewing a work.
+     */
+    private val downloadUpstreamFactory: DataSource.Factory by lazy {
+        CacheDataSource.Factory()
+            .setCache(streamingCache)
+            .setCacheWriteDataSinkFactory(null)
+            .setUpstreamDataSourceFactory(networkFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
     }
 
@@ -194,7 +252,7 @@ class MediaSourceRouting(
                 context,
                 mediaDatabase,
                 downloadCache,
-                networkFactory,
+                downloadUpstreamFactory,
                 executor,
             )
         val configure = {
@@ -296,6 +354,27 @@ class MediaSourceRouting(
             ?.request
             ?.uri
             ?.toString()
+
+    fun completedUrisSnapshot(): Map<String, String> {
+        val memory = downloads.value
+        if (memory.isNotEmpty()) {
+            return buildMap {
+                for ((id, download) in memory) {
+                    if (download.state == Download.STATE_COMPLETED) {
+                        put(id, download.request.uri.toString())
+                    }
+                }
+            }
+        }
+        val result = HashMap<String, String>()
+        downloadManager.downloadIndex.getDownloads(Download.STATE_COMPLETED).use { cursor ->
+            while (cursor.moveToNext()) {
+                val d = cursor.download
+                result[d.request.id] = d.request.uri.toString()
+            }
+        }
+        return result
+    }
 
     fun clearStreamingCache() {
         streamingCache.keys.toList().forEach { streamingCache.removeResource(it) }

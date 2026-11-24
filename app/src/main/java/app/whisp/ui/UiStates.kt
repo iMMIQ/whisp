@@ -3,6 +3,8 @@ package app.whisp.ui
 
 import androidx.media3.common.Player
 import app.whisp.data.DlsiteDetails
+import app.whisp.playback.PlaybackErrorInfo
+import app.whisp.playback.TimerStartAnchor
 
 data class DlsiteUiState(
     val details: DlsiteDetails? = null,
@@ -18,6 +20,7 @@ data class PlaybackState(
     val buffering: Boolean = false,
     val timerEnd: Long = 0,
     val timerStopAfterTrack: Boolean = false,
+    val timerStartAnchor: TimerStartAnchor? = null,
     val loopStart: Long = -1,
     val loopEnd: Long = -1,
     val playWhenReady: Boolean = false,
@@ -25,12 +28,14 @@ data class PlaybackState(
     val hasNext: Boolean = false,
     val ended: Boolean = false,
     val failed: Boolean = false,
+    val errorInfo: PlaybackErrorInfo? = null,
     val queueIds: List<String> = emptyList(),
     val hasVideo: Boolean = false,
     val videoAspectRatio: Float = 16f / 9f,
     val tracksKnown: Boolean = false,
     val speed: Float = 1f,
     val repeatMode: Int = Player.REPEAT_MODE_OFF,
+    val shuffleEnabled: Boolean = false,
 )
 
 internal fun playControlLabel(state: PlaybackState): String =

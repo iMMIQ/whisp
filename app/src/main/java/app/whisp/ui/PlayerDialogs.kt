@@ -31,6 +31,7 @@ import app.whisp.R
 import app.whisp.data.*
 import app.whisp.playback.PlaybackCoordinator
 import app.whisp.playback.SleepTimer
+import app.whisp.playback.TimerStartAnchor
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -78,6 +79,9 @@ internal data class BookmarkDraft(
 internal fun PlayerQueueSheet(
     queueTracks: List<TrackEntity>,
     activeTrackId: String?,
+    shuffleEnabled: Boolean = false,
+    onToggleShuffle: (() -> Unit)? = null,
+    onMoveTrack: ((String, Int) -> Unit)? = null,
     onSelect: (String) -> Unit,
     onDismiss: () -> Unit,
     detail: WorkDetails? = null,
@@ -86,9 +90,15 @@ internal fun PlayerQueueSheet(
     val sections = remember(detail?.tracks) { detail?.tracks?.let(TrackSections::groups).orEmpty() }
     val listState = rememberLazyListState()
     val haptics = rememberWhispHaptics()
+    var reorderMode by remember { mutableStateOf(false) }
     val activeSectionKey =
         remember(sections, activeTrackId) {
             sections.firstOrNull { section -> section.tracks.any { it.id == activeTrackId } }?.key
+        }
+    val remainingDurationMs =
+        remember(queueTracks, activeTrackId) {
+            val activeIdx = queueTracks.indexOfFirst { it.id == activeTrackId }.coerceAtLeast(0)
+            queueTracks.drop(activeIdx).sumOf { it.durationMs.coerceAtLeast(0L) }
         }
     LaunchedEffect(activeTrackId, queueTracks) {
         val index = queueTracks.indexOfFirst { it.id == activeTrackId }
@@ -96,20 +106,46 @@ internal fun PlayerQueueSheet(
     }
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 10.dp),
+            Modifier.fillMaxWidth().padding(start = 24.dp, end = 14.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                stringResource(R.string.action_queue),
-                style = MaterialTheme.typography.headlineSmall,
-                color = Cream,
-                modifier = Modifier.weight(1f),
-            )
-            Text(
-                "${queueTracks.size} 曲",
-                style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
-                color = Muted,
-            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.action_queue),
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = Cream,
+                )
+                val summary =
+                    if (remainingDurationMs > 0L)
+                        "${queueTracks.size} 曲 · 剩余 ${clock(remainingDurationMs)}"
+                    else "${queueTracks.size} 曲"
+                Text(
+                    summary,
+                    style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                    color = Muted,
+                )
+            }
+            if (onToggleShuffle != null && queueTracks.size > 1) {
+                IconAction(
+                    Icons.Outlined.Shuffle,
+                    if (shuffleEnabled) "关闭随机播放" else "开启随机播放",
+                    tint = if (shuffleEnabled) Rose else Muted,
+                    haptic = HapticKind.Tick,
+                ) {
+                    if (!shuffleEnabled) reorderMode = false
+                    onToggleShuffle()
+                }
+            }
+            if (onMoveTrack != null && !shuffleEnabled && queueTracks.size > 1) {
+                IconAction(
+                    Icons.Outlined.SwapVert,
+                    if (reorderMode) "完成排序" else "调整队列顺序",
+                    tint = if (reorderMode) Rose else Muted,
+                    haptic = HapticKind.Tick,
+                ) {
+                    reorderMode = !reorderMode
+                }
+            }
         }
         if (sections.size > 1 && onSwitchSectionTrack != null) {
             LazyRow(
@@ -142,11 +178,45 @@ internal fun PlayerQueueSheet(
             state = listState,
             modifier = Modifier.fillMaxWidth().heightIn(max = 500.dp).navigationBarsPadding(),
         ) {
-            items(queueTracks, key = { it.id }) { item ->
-                TrackRow(item, item.id == activeTrackId) {
-                    haptics.tick()
-                    onSelect(item.id)
-                    dismiss()
+            items(queueTracks.size, key = { queueTracks[it].id }) { index ->
+                val item = queueTracks[index]
+                if (reorderMode && onMoveTrack != null && !shuffleEnabled) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(end = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(Modifier.weight(1f)) {
+                            TrackRow(item, item.id == activeTrackId) {
+                                haptics.tick()
+                                onSelect(item.id)
+                                dismiss()
+                            }
+                        }
+                        IconAction(
+                            Icons.Outlined.KeyboardArrowUp,
+                            "上移曲目",
+                            Muted,
+                            enabled = index > 0,
+                            haptic = HapticKind.Tick,
+                        ) {
+                            onMoveTrack(item.id, -1)
+                        }
+                        IconAction(
+                            Icons.Outlined.KeyboardArrowDown,
+                            "下移曲目",
+                            Muted,
+                            enabled = index < queueTracks.lastIndex,
+                            haptic = HapticKind.Tick,
+                        ) {
+                            onMoveTrack(item.id, 1)
+                        }
+                    }
+                } else {
+                    TrackRow(item, item.id == activeTrackId) {
+                        haptics.tick()
+                        onSelect(item.id)
+                        dismiss()
+                    }
                 }
             }
         }
@@ -377,10 +447,14 @@ internal fun PlayerFragmentsSheet(
 internal fun SleepTimerDialog(
     timerEnd: Long,
     stopAfterTrack: Boolean,
+    sleepFadeSeconds: Int = 15,
+    timerStartAnchor: TimerStartAnchor? = null,
     haptics: WhispHaptics,
     onSelectMinutes: (Int) -> Unit,
     onExtendMinutes: (Int) -> Unit,
     onStopAfterTrack: (Boolean) -> Unit,
+    onSelectFadeSeconds: ((Int) -> Unit)? = null,
+    onJumpToStartAnchor: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
     var nowElapsed by remember(timerEnd) { mutableLongStateOf(SystemClock.elapsedRealtime()) }
@@ -521,8 +595,63 @@ internal fun SleepTimerDialog(
                     Icon(Icons.Outlined.Check, null, tint = Rose, modifier = Modifier.size(18.dp))
                 }
             }
+            if (onSelectFadeSeconds != null) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        "淡出时长",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Muted,
+                    )
+                    SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
+                        SupportedSleepFadeSeconds.forEachIndexed { index, sec ->
+                            SegmentedButton(
+                                selected = sleepFadeSeconds == sec,
+                                onClick = {
+                                    haptics.tick()
+                                    onSelectFadeSeconds(sec)
+                                },
+                                shape =
+                                    SegmentedButtonDefaults.itemShape(
+                                        index,
+                                        SupportedSleepFadeSeconds.size,
+                                    ),
+                            ) {
+                                Text(
+                                    "${sec}秒",
+                                    style =
+                                        MaterialTheme.typography.labelMedium.merge(
+                                            TabularNumeralStyle,
+                                        ),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            if (timerStartAnchor != null && onJumpToStartAnchor != null) {
+                OutlinedButton(
+                    onClick = {
+                        haptics.confirm()
+                        onJumpToStartAnchor()
+                        dismiss()
+                    },
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Icon(Icons.Outlined.History, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "回到定时起点（${clock(timerStartAnchor.positionMs)}）",
+                        style = MaterialTheme.typography.labelLarge.merge(TabularNumeralStyle),
+                    )
+                }
+            }
             Text(
-                "定时到期前将平滑淡出音量，避免突然中断",
+                "定时到期前按听觉曲线平滑淡出音量，避免突然中断",
                 style = MaterialTheme.typography.bodySmall,
                 color = Muted,
             )
@@ -702,9 +831,12 @@ internal fun PlayerMoreSheet(
     context: Context,
     currentSpeed: Float,
     hasSubtitles: Boolean,
+    hasSubtitleCandidates: Boolean = false,
     onSpeedChange: (Float) -> Unit,
     onOpenDetail: () -> Unit,
     onSubtitleTune: () -> Unit,
+    onSubtitlePicker: () -> Unit = {},
+    onSubtitleSearch: () -> Unit = {},
     onPreciseSeek: () -> Unit,
     onPreferences: () -> Unit,
     onRestart: () -> Unit,
@@ -752,11 +884,31 @@ internal fun PlayerMoreSheet(
         )
         if (hasSubtitles) {
             WhispSheetRow(
+                icon = Icons.Outlined.Search,
+                title = "搜索台词",
+                subtitle = "按关键词定位当前曲目字幕",
+                onClick = {
+                    onSubtitleSearch()
+                    dismiss()
+                },
+            )
+            WhispSheetRow(
                 icon = Icons.Outlined.Subtitles,
                 title = "字幕微调",
-                subtitle = "边看实时字幕边调偏移、字号与编码",
+                subtitle = "边看实时字幕边调本曲偏移、字号与编码",
                 onClick = {
                     onSubtitleTune()
+                    dismiss()
+                },
+            )
+        }
+        if (hasSubtitleCandidates) {
+            WhispSheetRow(
+                icon = Icons.Outlined.Translate,
+                title = "字幕轨与双语对照",
+                subtitle = "切换字幕文件或叠加第二语言字幕",
+                onClick = {
+                    onSubtitlePicker()
                     dismiss()
                 },
             )
@@ -764,7 +916,7 @@ internal fun PlayerMoreSheet(
         WhispSheetRow(
             icon = Icons.Outlined.Tune,
             title = stringResource(R.string.label_playback_settings),
-            subtitle = "倍速、步长、字幕、外观与隐私",
+            subtitle = "音效增强、倍速、步长、字幕与隐私",
             onClick = {
                 onPreferences()
                 dismiss()
@@ -902,9 +1054,14 @@ internal fun PreciseSeekDialog(
 @Composable
 internal fun LiveSubtitleTuneOverlay(
     settings: Settings,
+    trackOffsetMs: Long,
+    onTrackOffsetChange: (Long) -> Unit,
     onUpdateSettings: ((Settings) -> Settings) -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
+    hasCandidates: Boolean = false,
+    onOpenPicker: () -> Unit = {},
+    onOpenSearch: () -> Unit = {},
 ) {
     val haptics = rememberWhispHaptics()
     val shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
@@ -925,6 +1082,16 @@ internal fun LiveSubtitleTuneOverlay(
                 color = Cream,
                 modifier = Modifier.weight(1f),
             )
+            IconAction(Icons.Outlined.Search, "搜索台词", Muted, haptic = HapticKind.Tick) {
+                onClose()
+                onOpenSearch()
+            }
+            if (hasCandidates) {
+                IconAction(Icons.Outlined.Translate, "切换字幕与双语", Muted, haptic = HapticKind.Tick) {
+                    onClose()
+                    onOpenPicker()
+                }
+            }
             TextButton(onClick = onClose) { Text("完成", fontWeight = FontWeight.SemiBold) }
         }
         Row(
@@ -933,17 +1100,17 @@ internal fun LiveSubtitleTuneOverlay(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Column(Modifier.weight(1f)) {
-                Text("偏移", style = MaterialTheme.typography.labelLarge, color = Muted)
+                Text("本曲偏移", style = MaterialTheme.typography.labelLarge, color = Muted)
                 Text(
-                    "${settings.subtitleOffsetMs} ms",
+                    "${trackOffsetMs} ms",
                     style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
-                    color = if (settings.subtitleOffsetMs != 0L) Rose else Muted,
+                    color = if (trackOffsetMs != 0L) Rose else Muted,
                 )
             }
             OutlinedButton(
                 onClick = {
                     haptics.tick()
-                    onUpdateSettings { it.copy(subtitleOffsetMs = it.subtitleOffsetMs - 250) }
+                    onTrackOffsetChange(trackOffsetMs - 250L)
                 },
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
             ) {
@@ -952,11 +1119,11 @@ internal fun LiveSubtitleTuneOverlay(
                     style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
                 )
             }
-            if (settings.subtitleOffsetMs != 0L) {
+            if (trackOffsetMs != 0L) {
                 TextButton(
                     onClick = {
                         haptics.tick()
-                        onUpdateSettings { it.copy(subtitleOffsetMs = 0L) }
+                        onTrackOffsetChange(0L)
                     },
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
                 ) {
@@ -966,7 +1133,7 @@ internal fun LiveSubtitleTuneOverlay(
             OutlinedButton(
                 onClick = {
                     haptics.tick()
-                    onUpdateSettings { it.copy(subtitleOffsetMs = it.subtitleOffsetMs + 250) }
+                    onTrackOffsetChange(trackOffsetMs + 250L)
                 },
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
             ) {
@@ -1011,9 +1178,209 @@ internal fun LiveSubtitleTuneOverlay(
 }
 
 @Composable
+internal fun SubtitlePickerSheet(
+    candidates: List<AttachmentEntity>,
+    activePrimaryId: String?,
+    activeSecondaryId: String?,
+    hasOverride: Boolean,
+    onSelect: (primaryId: String?, secondaryId: String?) -> Unit,
+    onResetAuto: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val haptics = rememberWhispHaptics()
+    WhispSheet(onDismissRequest = onDismiss) { dismiss ->
+        Row(
+            Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp, top = 6.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "字幕轨与双语",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+                modifier = Modifier.weight(1f),
+            )
+            if (hasOverride) {
+                TextButton(
+                    onClick = {
+                        haptics.tick()
+                        onResetAuto()
+                        dismiss()
+                    },
+                ) {
+                    Text("恢复自动")
+                }
+            }
+        }
+        Text(
+            "点选设为主字幕；点右侧「双语」可叠加第二语言对照",
+            style = MaterialTheme.typography.bodySmall,
+            color = Muted,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+        )
+        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 460.dp).navigationBarsPadding()) {
+            items(candidates, key = { it.id }) { item ->
+                val isPrimary = item.id == activePrimaryId
+                val isSecondary = item.id == activeSecondaryId
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clickable {
+                            haptics.tick()
+                            val nextSecondary =
+                                if (activeSecondaryId == item.id) null else activeSecondaryId
+                            onSelect(item.id, nextSecondary)
+                        }
+                        .padding(horizontal = 24.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                        Text(
+                            item.fileName,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (isPrimary) Rose else Cream,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        val folder = item.relativePath.substringBeforeLast('/', "")
+                        if (folder.isNotBlank()) {
+                            Text(
+                                folder,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Muted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    if (isPrimary) {
+                        Text(
+                            "主字幕",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Rose,
+                            modifier = Modifier.padding(end = 8.dp),
+                        )
+                    } else if (activePrimaryId != null) {
+                        FilterChip(
+                            selected = isSecondary,
+                            onClick = {
+                                haptics.tick()
+                                onSelect(activePrimaryId, if (isSecondary) null else item.id)
+                            },
+                            label = {
+                                Text(
+                                    if (isSecondary) "副字幕 ✓" else "双语",
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun SubtitleSearchSheet(
+    cues: List<DisplayCue>,
+    offsetMs: Long,
+    onJump: (Cue) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val haptics = rememberWhispHaptics()
+    val matches =
+        remember(cues, query) {
+            val q = query.trim()
+            if (q.isEmpty()) cues.take(50)
+            else
+                cues.filter { cue ->
+                    cue.text.contains(q, ignoreCase = true) ||
+                        cue.secondaryText?.contains(q, ignoreCase = true) == true
+                }
+        }
+    WhispSheet(onDismissRequest = onDismiss) { dismiss ->
+        Column(
+            Modifier.fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .navigationBarsPadding()
+                .imePadding(),
+        ) {
+            Text(
+                "搜索台词",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp),
+            )
+            WhispSearchBar(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = "输入台词关键词",
+                modifier = Modifier.padding(vertical = 6.dp),
+            )
+            if (matches.isEmpty()) {
+                Text(
+                    "未找到匹配台词",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Muted,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 20.dp),
+                )
+            } else {
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                    items(matches.size, key = { "${matches[it].startMs}_$it" }) { idx ->
+                        val item = matches[idx]
+                        val displayTime = (item.startMs + offsetMs).coerceAtLeast(0L)
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    haptics.tick()
+                                    onJump(item.toCue())
+                                    dismiss()
+                                }
+                                .padding(horizontal = 8.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.Top,
+                        ) {
+                            Text(
+                                clock(displayTime),
+                                style =
+                                    MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                                color = Rose,
+                                modifier = Modifier.width(58.dp).padding(top = 2.dp),
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    item.text,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Cream,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                item.secondaryText?.let { sub ->
+                                    Text(
+                                        sub,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Muted,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(top = 2.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+        }
+    }
+}
+
+@Composable
 internal fun PlaybackPreferencesDialog(
     settings: Settings,
     currentSpeed: Float,
+    trackOffsetMs: Long = 0L,
+    onTrackOffsetChange: ((Long) -> Unit)? = null,
     onSpeedChange: (Float) -> Unit,
     onUpdateSettings: ((Settings) -> Settings) -> Unit,
     onDismiss: () -> Unit,
@@ -1042,6 +1409,81 @@ internal fun PlaybackPreferencesDialog(
                 .navigationBarsPadding(),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            Text(
+                "音声与听感",
+                style = MaterialTheme.typography.labelLarge,
+                color = Rose,
+            )
+            WhispToggleRow(
+                label = "左右声道互换",
+                subtitle = "修正声道录反或睡眠耳机反戴",
+                checked = settings.swapChannels,
+                tag = "audio-swap-channels",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(swapChannels = it) } },
+            )
+            WhispToggleRow(
+                label = "夜间防炸耳柔化",
+                subtitle = "柔化突发高音峰值并轻度提亮耳语",
+                checked = settings.nightDynamics,
+                tag = "audio-night-dynamics",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(nightDynamics = it) } },
+            )
+            WhispToggleRow(
+                label = "单声道合并",
+                subtitle = "侧睡单耳佩戴时听全双耳声音",
+                checked = settings.monoAudio,
+                tag = "audio-mono",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(monoAudio = it) } },
+            )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "夜间精细音量",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Muted,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    "${(settings.volumeGain * 100f).roundToInt()}%",
+                    style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                    color = if (settings.volumeGain < 0.99f) Rose else Muted,
+                )
+            }
+            SyncedSlider(
+                settings.volumeGain,
+                0.15f..1.0f,
+                onValueChange = { value ->
+                    onUpdateSettings { it.copy(volumeGain = value) }
+                },
+            )
+            WhispToggleRow(
+                label = "连续音轨无缝衔接",
+                subtitle = "减少章节切曲停顿（不兼容硬件卸载时自动软件拼接）",
+                checked = settings.gaplessPriority,
+                tag = "audio-gapless",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(gaplessPriority = it) } },
+            )
+            WhispToggleRow(
+                label = "恢复播放微淡入",
+                subtitle = "避免佩戴耳机恢复播放时的生硬切入",
+                checked = settings.softFadePause,
+                tag = "audio-soft-fade",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(softFadePause = it) } },
+            )
+            WhispToggleRow(
+                label = "长暂停后自动回退 3 秒",
+                subtitle = "暂停超过 5 分钟再听时自动回溯衔接",
+                checked = settings.smartResumeRewind,
+                tag = "audio-smart-rewind",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(smartResumeRewind = it) } },
+            )
+            WhispToggleRow(
+                label = "提示音时压低音量而非暂停",
+                subtitle = "导航或通知语音播报时自动闪避声音",
+                checked = settings.duckOnInterrupt,
+                tag = "audio-duck-interrupt",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(duckOnInterrupt = it) } },
+            )
+            HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
             Text(
                 stringResource(R.string.label_playback_speed),
                 style = MaterialTheme.typography.labelLarge,
@@ -1110,53 +1552,55 @@ internal fun PlaybackPreferencesDialog(
                     onUpdateSettings { it.copy(subtitleSize = value.roundToInt()) }
                 },
             )
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("字幕偏移", style = MaterialTheme.typography.labelLarge, color = Muted)
-                    Text(
-                        "${settings.subtitleOffsetMs} ms",
-                        style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
-                        color = if (settings.subtitleOffsetMs != 0L) Rose else Muted,
-                    )
-                }
-                OutlinedButton(
-                    onClick = {
-                        haptics.tick()
-                        onUpdateSettings { it.copy(subtitleOffsetMs = it.subtitleOffsetMs - 250) }
-                    },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+            if (onTrackOffsetChange != null) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text(
-                        "−250",
-                        style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
-                    )
-                }
-                if (settings.subtitleOffsetMs != 0L) {
-                    TextButton(
+                    Column(Modifier.weight(1f)) {
+                        Text("本曲字幕偏移", style = MaterialTheme.typography.labelLarge, color = Muted)
+                        Text(
+                            "${trackOffsetMs} ms",
+                            style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                            color = if (trackOffsetMs != 0L) Rose else Muted,
+                        )
+                    }
+                    OutlinedButton(
                         onClick = {
                             haptics.tick()
-                            onUpdateSettings { it.copy(subtitleOffsetMs = 0L) }
+                            onTrackOffsetChange(trackOffsetMs - 250L)
                         },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                     ) {
-                        Text("归零")
+                        Text(
+                            "−250",
+                            style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                        )
                     }
-                }
-                OutlinedButton(
-                    onClick = {
-                        haptics.tick()
-                        onUpdateSettings { it.copy(subtitleOffsetMs = it.subtitleOffsetMs + 250) }
-                    },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                ) {
-                    Text(
-                        "+250",
-                        style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
-                    )
+                    if (trackOffsetMs != 0L) {
+                        TextButton(
+                            onClick = {
+                                haptics.tick()
+                                onTrackOffsetChange(0L)
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                        ) {
+                            Text("归零")
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            haptics.tick()
+                            onTrackOffsetChange(trackOffsetMs + 250L)
+                        },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text(
+                            "+250",
+                            style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                        )
+                    }
                 }
             }
             Text(

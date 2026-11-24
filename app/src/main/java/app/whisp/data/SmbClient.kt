@@ -25,10 +25,12 @@ import okio.ByteString.Companion.encodeUtf8
  * closes its individual file handle independently.
  */
 class SmbClient(
-    private val idleTimeoutMs: Long = 45_000L,
+    // Exceeds WhispLoadControl's 180s burst window so quiet intervals between bursts keep sessions
+    // warm.
+    private val idleTimeoutMs: Long = 210_000L,
     private val report: (String) -> Unit = {},
 ) {
-    constructor(report: (String) -> Unit) : this(idleTimeoutMs = 45_000L, report = report)
+    constructor(report: (String) -> Unit) : this(idleTimeoutMs = 210_000L, report = report)
 
     private val encryptedConfig = buildConfig(encrypt = true)
     private val compatibleConfig = buildConfig(encrypt = false)

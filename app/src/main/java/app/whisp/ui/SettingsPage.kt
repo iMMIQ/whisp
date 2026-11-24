@@ -143,6 +143,105 @@ internal fun SettingsPage(
                     )
                 }
             }
+            item(key = "section-audio") {
+                SettingsGroupCard("音声与听感") {
+                    WhispToggleRow(
+                        label = "左右声道互换",
+                        subtitle = "修正双耳声道录反或睡眠耳机反戴",
+                        checked = settings.swapChannels,
+                        tag = "settings-swap-channels",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(swapChannels = checked) }
+                            }
+                        },
+                    )
+                    WhispToggleRow(
+                        label = "夜间防炸耳柔化",
+                        subtitle = "压缩突发高音峰值并轻度提亮轻声耳语",
+                        checked = settings.nightDynamics,
+                        tag = "settings-night-dynamics",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(nightDynamics = checked) }
+                            }
+                        },
+                    )
+                    WhispToggleRow(
+                        label = "单声道合并",
+                        subtitle = "侧睡单耳佩戴时听全双耳内容",
+                        checked = settings.monoAudio,
+                        tag = "settings-mono-audio",
+                        onCheckedChange = { checked ->
+                            scope.launch { graph.settings.update { it.copy(monoAudio = checked) } }
+                        },
+                    )
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "夜间精细音量",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = Muted,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            "${(settings.volumeGain * 100f).roundToInt()}%",
+                            style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                            color = if (settings.volumeGain < 0.99f) Rose else Muted,
+                        )
+                    }
+                    SyncedSlider(
+                        settings.volumeGain,
+                        0.15f..1.0f,
+                        onValueChange = { value ->
+                            scope.launch { graph.settings.update { it.copy(volumeGain = value) } }
+                        },
+                    )
+                    WhispToggleRow(
+                        label = "连续音轨无缝衔接",
+                        subtitle = "减少章节切曲停顿，必要时自动回退软件拼接",
+                        checked = settings.gaplessPriority,
+                        tag = "settings-gapless",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(gaplessPriority = checked) }
+                            }
+                        },
+                    )
+                    WhispToggleRow(
+                        label = "恢复播放微淡入",
+                        subtitle = "避免佩戴耳机恢复播放时的生硬切入",
+                        checked = settings.softFadePause,
+                        tag = "settings-soft-fade",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(softFadePause = checked) }
+                            }
+                        },
+                    )
+                    WhispToggleRow(
+                        label = "长暂停后自动回退 3 秒",
+                        subtitle = "暂停超过 5 分钟再听时自动回溯衔接",
+                        checked = settings.smartResumeRewind,
+                        tag = "settings-smart-rewind",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(smartResumeRewind = checked) }
+                            }
+                        },
+                    )
+                    WhispToggleRow(
+                        label = "提示音时压低音量而非暂停",
+                        subtitle = "导航或通知语音播报时自动降低背景声音",
+                        checked = settings.duckOnInterrupt,
+                        tag = "settings-duck-interrupt",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(duckOnInterrupt = checked) }
+                            }
+                        },
+                    )
+                }
+            }
             item(key = "section-playback") {
                 SettingsGroupCard("播放与字幕") {
                     Text(

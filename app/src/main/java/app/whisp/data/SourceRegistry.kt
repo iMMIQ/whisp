@@ -38,10 +38,39 @@ class SourceRegistry(
 ) {
     val dav = WebDavClient(http)
     val smb = SmbClient { Log.i("WhispScan", it) }
-    val nfs = NfsClient(poolIdleTimeoutMs = 45_000L, report = { Log.i("WhispScan", it) })
+    // Align NFS idle pool TTL with WhispLoadControl's 180s streaming burst window.
+    val nfs = NfsClient(poolIdleTimeoutMs = 210_000L, report = { Log.i("WhispScan", it) })
     val dlsite = DlsiteClient(onlineHttp)
     internal val dlsiteClients = ConcurrentHashMap<String, DlsiteAccountClient>()
     internal val dlsiteCookieWrites = Mutex()
+
+    private val asmrMediaHttp: OkHttpClient by lazy {
+        onlineHttp
+            .newBuilder()
+            .addNetworkInterceptor { chain ->
+                val url = chain.request().url
+                val localLoopback =
+                    url.host in setOf("localhost", "127.0.0.1", "10.0.2.2") &&
+                        runCatching {
+                                android.security.NetworkSecurityPolicy.getInstance()
+                                    .isCleartextTrafficPermitted(url.host)
+                            }
+                            .getOrDefault(false)
+                if (
+                    !((url.scheme == "https" || localLoopback) &&
+                        url.username.isEmpty() &&
+                        url.password.isEmpty())
+                ) {
+                    throw IOException("文件地址须使用 HTTPS")
+                }
+                chain.proceed(chain.request())
+            }
+            .build()
+    }
+
+    private val webDavMediaHttp: OkHttpClient by lazy {
+        http.newBuilder().followRedirects(false).followSslRedirects(false).build()
+    }
 
     fun asmrClient(source: SourceEntity): AsmrOneClient {
         require(source.kindType == SourceKind.ASMRONE) { "来源类型不匹配" }
@@ -200,14 +229,22 @@ class SourceRegistry(
      */
     suspend fun routeUri(sourceId: String?, assetId: String, rawUri: String): String {
         if (sourceId == null || rawUri.isBlank()) throw IOException("文件已移动或来源已移除")
-        return when (dao.source(sourceId)?.kindType) {
+        val kind = dao.source(sourceId)?.kindType ?: throw IOException("来源已移除")
+        return routeUriForKind(kind, sourceId, assetId, rawUri)
+    }
+
+    fun routeUriForKind(
+        kind: SourceKind,
+        sourceId: String,
+        assetId: String,
+        rawUri: String,
+    ): String =
+        when (kind) {
             SourceKind.ASMRONE -> "whisp-asmr://$sourceId/$assetId"
             SourceKind.DLSITE -> "whisp-dlsite://$sourceId/$assetId"
             SourceKind.WEBDAV -> "whisp-webdav://$sourceId/$assetId"
-            null -> throw IOException("来源已移除")
             else -> rawUri
         }
-    }
 
     suspend fun readRemoteBytes(
         sourceId: String?,
@@ -286,31 +323,7 @@ class SourceRegistry(
                 }
             "whisp-asmr" ->
                 ResolvingDataSource.Factory(
-                        OkHttpDataSource.Factory(
-                                onlineHttp
-                                    .newBuilder()
-                                    .addNetworkInterceptor { chain ->
-                                        val url = chain.request().url
-                                        val localLoopback =
-                                            url.host in
-                                                setOf("localhost", "127.0.0.1", "10.0.2.2") &&
-                                                runCatching {
-                                                        android.security.NetworkSecurityPolicy
-                                                            .getInstance()
-                                                            .isCleartextTrafficPermitted(url.host)
-                                                    }
-                                                    .getOrDefault(false)
-                                        if (
-                                            !((url.scheme == "https" || localLoopback) &&
-                                                url.username.isEmpty() &&
-                                                url.password.isEmpty())
-                                        ) {
-                                            throw IOException("文件地址须使用 HTTPS")
-                                        }
-                                        chain.proceed(chain.request())
-                                    }
-                                    .build(),
-                            )
+                        OkHttpDataSource.Factory(asmrMediaHttp)
                             .setDefaultRequestProperties(AsmrOneClient.MEDIA_HEADERS),
                     ) { spec ->
                         val asset = spec.uri.lastPathSegment ?: throw IOException("文件标识无效")
@@ -342,15 +355,7 @@ class SourceRegistry(
                     }
                     .createDataSource()
             "whisp-webdav" ->
-                ResolvingDataSource.Factory(
-                        OkHttpDataSource.Factory(
-                            http
-                                .newBuilder()
-                                .followRedirects(false)
-                                .followSslRedirects(false)
-                                .build(),
-                        ),
-                    ) { spec ->
+                ResolvingDataSource.Factory(OkHttpDataSource.Factory(webDavMediaHttp)) { spec ->
                         val asset = spec.uri.lastPathSegment ?: throw IOException("文件标识无效")
                         val sourceId = spec.uri.authority ?: throw IOException("来源未关联")
                         val (targetUri, authHeader) =

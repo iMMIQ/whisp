@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.QueueMusic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.*
@@ -61,6 +62,7 @@ import app.whisp.playback.PlaybackCoordinator
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -70,6 +72,7 @@ internal fun VideoOutput(
     active: Boolean,
     playing: Boolean,
     modifier: Modifier = Modifier,
+    contentScale: ContentScale = ContentScale.Fit,
 ) {
     val player by playback.playerFlow.collectAsStateWithLifecycle()
     val state by playback.state.collectAsStateWithLifecycle()
@@ -99,7 +102,7 @@ internal fun VideoOutput(
             PlayerSurface(
                 attached,
                 Modifier.matchParentSize()
-                    .resizeWithContentScale(ContentScale.Fit, Size(state.videoAspectRatio, 1f)),
+                    .resizeWithContentScale(contentScale, Size(state.videoAspectRatio, 1f)),
             )
         }
     }
@@ -110,6 +113,7 @@ private enum class FullscreenDragMode {
     Seek,
     Brightness,
     Volume,
+    Speed2x,
 }
 
 @Composable
@@ -120,14 +124,21 @@ internal fun FullScreenVideo(
     state: PlaybackState,
     active: Boolean,
     caption: String,
+    secondaryCaption: String? = null,
     subtitleSize: Int,
     skipSeconds: Int,
+    hasQueue: Boolean = false,
+    previewCaptionProvider: ((Long) -> String?)? = null,
+    onOpenQueue: (() -> Unit)? = null,
     exit: () -> Unit,
-    timeline: @Composable (onScrubbingChange: (Boolean) -> Unit) -> Unit,
+    timeline:
+        @Composable
+        (onScrubPreview: (Long?) -> Unit, onScrubbingChange: (Boolean) -> Unit) -> Unit,
 ) {
     val activity = LocalActivity.current
     val context = LocalContext.current
     val haptics = rememberWhispHaptics()
+    val scope = rememberCoroutineScope()
     val originalOrientation = rememberSaveable {
         activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     }
@@ -162,17 +173,22 @@ internal fun FullScreenVideo(
     }
     var controls by rememberSaveable(trackId) { mutableStateOf(true) }
     var locked by rememberSaveable(trackId) { mutableStateOf(false) }
+    var fillScreen by rememberSaveable { mutableStateOf(false) }
     var showUnlockHint by remember { mutableStateOf(false) }
     var scrubbing by remember(trackId) { mutableStateOf(false) }
+    var scrubPreviewMs by remember(trackId) { mutableStateOf<Long?>(null) }
     var draggingHud by remember { mutableStateOf(false) }
     var interaction by remember { mutableIntStateOf(0) }
     var foreground by remember { mutableStateOf(false) }
     var hudText by remember { mutableStateOf<String?>(null) }
+    var hudSubText by remember { mutableStateOf<String?>(null) }
     var hudToken by remember { mutableIntStateOf(0) }
     val currentState by rememberUpdatedState(state)
+    val latestPreviewCaption by rememberUpdatedState(previewCaptionProvider)
 
-    fun flashHud(text: String) {
+    fun flashHud(text: String, sub: String? = null) {
         hudText = text
+        hudSubText = sub
         hudToken++
     }
 
@@ -180,6 +196,7 @@ internal fun FullScreenVideo(
         if (!draggingHud && hudText != null) {
             delay(1100)
             hudText = null
+            hudSubText = null
         }
     }
     LaunchedEffect(showUnlockHint) {
@@ -206,8 +223,20 @@ internal fun FullScreenVideo(
             controls = false
         }
     }
+    val effectiveCaption =
+        scrubPreviewMs?.let { latestPreviewCaption?.invoke(it) }?.takeIf { it.isNotBlank() }
+            ?: caption
+    val effectiveSecondary = if (scrubPreviewMs != null) null else secondaryCaption
+
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        VideoOutput(playback, trackId, active, state.playing, Modifier.matchParentSize())
+        VideoOutput(
+            playback = playback,
+            trackId = trackId,
+            active = active,
+            playing = state.playing,
+            contentScale = if (fillScreen) ContentScale.Crop else ContentScale.Fit,
+            modifier = Modifier.matchParentSize(),
+        )
         Box(
             Modifier.matchParentSize()
                 .semantics { contentDescription = "视频画面" }
@@ -274,6 +303,22 @@ internal fun FullScreenVideo(
                                             ) / 255f
                                         }
                                         .getOrDefault(0.5f)
+                            // Hold anywhere for 420 ms without dragging to engage temporary 2x
+                            // fast-forward.
+                            val speedHoldJob =
+                                if (active && currentState.playing) {
+                                    scope.launch {
+                                        delay(420L)
+                                        if (mode == FullscreenDragMode.None) {
+                                            mode = FullscreenDragMode.Speed2x
+                                            draggingHud = true
+                                            playback.setTemporarySpeed(2.0f)
+                                            haptics.tick()
+                                            hudText = "2.0x 倍速播放中"
+                                            hudSubText = "松手恢复原速"
+                                        }
+                                    }
+                                } else null
                             try {
                                 while (true) {
                                     val event = awaitPointerEvent()
@@ -290,6 +335,12 @@ internal fun FullScreenVideo(
                                     val delta = change.positionChange()
                                     totalDx += delta.x
                                     totalDy += delta.y
+                                    if (
+                                        mode == FullscreenDragMode.None &&
+                                            (abs(totalDx) > slopPx || abs(totalDy) > slopPx)
+                                    ) {
+                                        speedHoldJob?.cancel()
+                                    }
                                     if (mode == FullscreenDragMode.None) {
                                         if (
                                             abs(totalDx) > slopPx &&
@@ -328,6 +379,10 @@ internal fun FullScreenVideo(
                                             val sign = if (diffSec >= 0) "+" else "−"
                                             hudText =
                                                 "${clock(seekTarget)} (${sign}${abs(diffSec)}s)"
+                                            hudSubText =
+                                                latestPreviewCaption?.invoke(seekTarget)?.takeIf {
+                                                    it.isNotBlank()
+                                                }
                                         }
                                         FullscreenDragMode.Brightness -> {
                                             change.consume()
@@ -341,6 +396,7 @@ internal fun FullScreenVideo(
                                                 win.attributes = lp
                                             }
                                             hudText = "亮度 ${(floatBrightness * 100).roundToInt()}%"
+                                            hudSubText = null
                                         }
                                         FullscreenDragMode.Volume -> {
                                             change.consume()
@@ -359,11 +415,19 @@ internal fun FullScreenVideo(
                                             val pct =
                                                 if (maxVol > 0) (nextVol * 100 / maxVol) else 0
                                             hudText = "音量 $pct%"
+                                            hudSubText = null
+                                        }
+                                        FullscreenDragMode.Speed2x -> {
+                                            change.consume()
                                         }
                                         FullscreenDragMode.None -> Unit
                                     }
                                 }
                             } finally {
+                                speedHoldJob?.cancel()
+                                if (mode == FullscreenDragMode.Speed2x) {
+                                    playback.restoreConfiguredSpeed()
+                                }
                                 if (draggingHud) {
                                     draggingHud = false
                                     hudToken++
@@ -384,11 +448,14 @@ internal fun FullScreenVideo(
             enter = fadeIn(tween(if (reduced) 0 else 100)),
             exit = fadeOut(tween(if (reduced) 0 else 150)),
         ) {
-            Box(
-                Modifier.clip(RoundedCornerShape(14.dp))
-                    .background(Ink.copy(alpha = 0.78f))
+            Column(
+                Modifier.widthIn(max = 300.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Ink.copy(alpha = 0.80f))
                     .border(0.5.dp, Rose.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
                     .padding(horizontal = 18.dp, vertical = 10.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Text(
                     hudText.orEmpty(),
@@ -396,6 +463,18 @@ internal fun FullScreenVideo(
                     color = Cream,
                     fontWeight = FontWeight.SemiBold,
                 )
+                hudSubText
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { sub ->
+                        Text(
+                            sub,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Cream.copy(alpha = 0.82f),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
             }
         }
         AnimatedVisibility(
@@ -449,6 +528,16 @@ internal fun FullScreenVideo(
                     overflow = TextOverflow.Ellipsis,
                 )
                 IconAction(
+                    if (fillScreen) Icons.Outlined.FitScreen else Icons.Outlined.AspectRatio,
+                    if (fillScreen) "适应画面" else "填满屏幕",
+                    tint = if (fillScreen) Rose else Cream,
+                    haptic = HapticKind.Tick,
+                ) {
+                    fillScreen = !fillScreen
+                    flashHud(if (fillScreen) "画面：填满屏幕" else "画面：原始比例")
+                    interaction++
+                }
+                IconAction(
                     Icons.Outlined.LockOpen,
                     "锁定防误触",
                     haptic = HapticKind.Confirm,
@@ -467,15 +556,16 @@ internal fun FullScreenVideo(
             Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (caption.isNotBlank()) {
-                Box(
+            if (effectiveCaption.isNotBlank()) {
+                Column(
                     Modifier.padding(horizontal = 24.dp, vertical = 10.dp)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Ink.copy(alpha = 0.66f))
                         .padding(horizontal = 14.dp, vertical = 6.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
-                        caption,
+                        effectiveCaption,
                         color = Cream,
                         fontSize = subtitleSize.sp,
                         lineHeight = (subtitleSize + 8).sp,
@@ -483,6 +573,18 @@ internal fun FullScreenVideo(
                         maxLines = 4,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    if (!effectiveSecondary.isNullOrBlank()) {
+                        Text(
+                            effectiveSecondary,
+                            color = Cream.copy(alpha = 0.78f),
+                            fontSize = (subtitleSize - 3).coerceAtLeast(13).sp,
+                            lineHeight = (subtitleSize + 3).sp,
+                            textAlign = TextAlign.Center,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
                 }
             }
             AnimatedVisibility(
@@ -501,63 +603,133 @@ internal fun FullScreenVideo(
                         .navigationBarsPadding()
                         .padding(top = 6.dp, bottom = 10.dp),
                 ) {
-                    timeline { isScrubbing ->
-                        scrubbing = isScrubbing
-                        interaction++
-                    }
+                    timeline(
+                        { preview -> scrubPreviewMs = preview },
+                        { isScrubbing ->
+                            scrubbing = isScrubbing
+                            interaction++
+                        },
+                    )
                     Row(
-                        Modifier.fillMaxWidth().padding(top = 4.dp),
-                        horizontalArrangement =
-                            Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        IconAction(
-                            when (skipSeconds) {
-                                5 -> Icons.Outlined.Replay5
-                                30 -> Icons.Outlined.Replay30
-                                else -> Icons.Outlined.Replay10
-                            },
-                            "后退${skipSeconds}秒",
-                            enabled = active,
-                            haptic = HapticKind.Tick,
+                        val quickSpeeds = listOf(1.0f, 1.25f, 1.5f, 2.0f, 0.75f)
+                        val speedShape = RoundedCornerShape(999.dp)
+                        Box(
+                            Modifier.clip(speedShape)
+                                .background(Ink.copy(alpha = 0.55f))
+                                .border(
+                                    0.5.dp,
+                                    if (abs(state.speed - 1f) > 0.01f) Rose.copy(alpha = 0.5f)
+                                    else Cream.copy(alpha = 0.25f),
+                                    speedShape,
+                                )
+                                .clickable {
+                                    val idx = quickSpeeds.indexOfFirst {
+                                        abs(it - state.speed) < 0.05f
+                                    }
+                                    val next = quickSpeeds[(idx + 1) % quickSpeeds.size]
+                                    haptics.tick()
+                                    playback.setPlaybackSpeed(next)
+                                    flashHud("倍速 ${formatSpeedLabel(next)}")
+                                    interaction++
+                                }
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
                         ) {
-                            playback.skip(-skipSeconds * 1000L)
-                            interaction++
-                        }
-                        FilledIconButton(
-                            onClick = {
-                                haptics.confirm()
-                                playback.togglePlay()
-                                interaction++
-                            },
-                            enabled = active,
-                            modifier = Modifier.size(48.dp),
-                            shape = CircleShape,
-                            colors =
-                                IconButtonDefaults.filledIconButtonColors(
-                                    containerColor = Rose,
-                                    contentColor = Ink,
-                                ),
-                        ) {
-                            Icon(
-                                if (state.playWhenReady) Icons.Filled.Pause
-                                else Icons.Filled.PlayArrow,
-                                if (state.playWhenReady) "暂停" else "播放",
-                                modifier = Modifier.size(26.dp),
+                            Text(
+                                formatSpeedLabel(state.speed),
+                                style =
+                                    MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                                color = if (abs(state.speed - 1f) > 0.01f) Rose else Cream,
                             )
                         }
-                        IconAction(
-                            when (skipSeconds) {
-                                5 -> Icons.Outlined.Forward5
-                                30 -> Icons.Outlined.Forward30
-                                else -> Icons.Outlined.Forward10
-                            },
-                            "前进${skipSeconds}秒",
-                            enabled = active,
-                            haptic = HapticKind.Tick,
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            playback.skip(skipSeconds * 1000L)
-                            interaction++
+                            IconAction(
+                                Icons.Outlined.SkipPrevious,
+                                "上一曲",
+                                enabled = active && (state.hasPrevious || state.trackId != null),
+                                haptic = HapticKind.Tick,
+                            ) {
+                                playback.previous()
+                                interaction++
+                            }
+                            Box(
+                                Modifier.size(44.dp).clip(CircleShape).clickable(enabled = active) {
+                                    haptics.tick()
+                                    playback.skip(-skipSeconds * 1000L)
+                                    interaction++
+                                },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                SkipSecondsIcon(
+                                    seconds = skipSeconds,
+                                    forward = false,
+                                    tint = if (active) Cream else Cream.copy(alpha = 0.35f),
+                                )
+                            }
+                            FilledIconButton(
+                                onClick = {
+                                    haptics.confirm()
+                                    playback.togglePlay()
+                                    interaction++
+                                },
+                                enabled = active,
+                                modifier = Modifier.size(48.dp),
+                                shape = CircleShape,
+                                colors =
+                                    IconButtonDefaults.filledIconButtonColors(
+                                        containerColor = Rose,
+                                        contentColor = Ink,
+                                    ),
+                            ) {
+                                Icon(
+                                    if (state.playWhenReady) Icons.Filled.Pause
+                                    else Icons.Filled.PlayArrow,
+                                    if (state.playWhenReady) "暂停" else "播放",
+                                    modifier = Modifier.size(26.dp),
+                                )
+                            }
+                            Box(
+                                Modifier.size(44.dp).clip(CircleShape).clickable(enabled = active) {
+                                    haptics.tick()
+                                    playback.skip(skipSeconds * 1000L)
+                                    interaction++
+                                },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                SkipSecondsIcon(
+                                    seconds = skipSeconds,
+                                    forward = true,
+                                    tint = if (active) Cream else Cream.copy(alpha = 0.35f),
+                                )
+                            }
+                            IconAction(
+                                Icons.Outlined.SkipNext,
+                                "下一曲",
+                                enabled = active && state.hasNext,
+                                haptic = HapticKind.Tick,
+                            ) {
+                                playback.next()
+                                interaction++
+                            }
+                        }
+                        if (hasQueue && onOpenQueue != null) {
+                            IconAction(
+                                Icons.AutoMirrored.Outlined.QueueMusic,
+                                "播放队列",
+                                Cream,
+                                haptic = HapticKind.Tick,
+                            ) {
+                                onOpenQueue()
+                                interaction++
+                            }
+                        } else {
+                            Spacer(Modifier.size(44.dp))
                         }
                     }
                 }

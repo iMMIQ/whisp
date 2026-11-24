@@ -68,6 +68,7 @@ import kotlinx.coroutines.withContext
 fun WhispRoot(
     graph: AppGraph,
     playerRequest: Int = 0,
+    inPipMode: Boolean = false,
     requestNotifications: () -> Unit = {},
 ) {
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
@@ -154,8 +155,29 @@ fun WhispRoot(
                 }
                 .collectAsStateWithLifecycle(initialValue = null)
 
+        val audioOnly by graph.playback.audioOnly.collectAsStateWithLifecycle()
         val current = activeSession?.first
         val currentTrack = activeSession?.second
+        val currentWorkProgress by
+            remember(current?.work?.id) {
+                    current?.work?.id?.let { graph.library.observeProgress(it) } ?: flowOf(null)
+                }
+                .collectAsStateWithLifecycle(initialValue = null)
+        val miniFallbackPosition =
+            remember(currentWorkProgress, currentTrack?.id) {
+                currentWorkProgress?.takeIf { it.trackId == currentTrack?.id }?.positionMs ?: 0L
+            }
+
+        if (inPipMode && currentTrack != null && state.hasVideo && !audioOnly) {
+            VideoOutput(
+                playback = graph.playback,
+                trackId = currentTrack.id,
+                active = state.trackId == currentTrack.id,
+                playing = state.playing,
+                modifier = Modifier.fillMaxSize(),
+            )
+            return@WhispTheme
+        }
 
         // Independent saved back stacks per top-level tab preserve navigation & scroll state.
         val libraryStack = rememberNavBackStack(WhispRoute.Library)
@@ -300,6 +322,7 @@ fun WhispRoot(
                                             detail = current,
                                             track = currentTrack,
                                             state = state,
+                                            fallbackPosition = miniFallbackPosition,
                                             playback = graph.playback,
                                             onToggle = graph.playback::togglePlay,
                                             shareCover = miniTransition,
@@ -764,6 +787,7 @@ private fun MiniPlayer(
     detail: WorkDetails,
     track: TrackEntity,
     state: PlaybackState,
+    fallbackPosition: Long,
     playback: PlaybackCoordinator,
     onToggle: () -> Unit,
     shareCover: Boolean,
@@ -839,7 +863,18 @@ private fun MiniPlayer(
                             if (abs(totalDy) > slopPx && abs(totalDy) > abs(totalDx)) {
                                 if (totalDy < 0f) axis = MiniDragAxis.Vertical
                             } else if (abs(totalDx) > slopPx && abs(totalDx) > abs(totalDy)) {
-                                axis = MiniDragAxis.Horizontal
+                                val canSwipeLeft =
+                                    currentState.trackId != null && currentState.hasNext
+                                val canSwipeRight =
+                                    currentState.trackId != null &&
+                                        (currentState.hasPrevious ||
+                                            playback.currentPosition() > 3000L)
+                                if (
+                                    (totalDx < 0f && canSwipeLeft) ||
+                                        (totalDx > 0f && canSwipeRight)
+                                ) {
+                                    axis = MiniDragAxis.Horizontal
+                                }
                             }
                         }
                         when (axis) {
@@ -857,11 +892,14 @@ private fun MiniPlayer(
                             MiniDragAxis.Horizontal -> {
                                 change.consume()
                                 velocityTracker.addPosition(change.uptimeMillis, change.position)
-                                val nextX =
-                                    totalDx.coerceIn(
-                                        -swipeTrackThresholdPx * 1.2f,
-                                        swipeTrackThresholdPx * 1.2f,
-                                    )
+                                val canLeft = currentState.trackId != null && currentState.hasNext
+                                val canRight =
+                                    currentState.trackId != null &&
+                                        (currentState.hasPrevious ||
+                                            playback.currentPosition() > 3000L)
+                                val minX = if (canLeft) -swipeTrackThresholdPx * 1.2f else 0f
+                                val maxX = if (canRight) swipeTrackThresholdPx * 1.2f else 0f
+                                val nextX = totalDx.coerceIn(minX, maxX)
                                 scope.launch { offsetX.snapTo(nextX) }
                                 val nowCrossed = abs(nextX) >= swipeTrackThresholdPx
                                 if (nowCrossed && !crossed) {
@@ -890,7 +928,8 @@ private fun MiniPlayer(
                                 playback.next()
                             } else if (
                                 (cur >= swipeTrackThresholdPx || vx > 1000f) &&
-                                    (currentState.hasPrevious || currentState.trackId != null)
+                                    currentState.trackId != null &&
+                                    (currentState.hasPrevious || playback.currentPosition() > 3000L)
                             ) {
                                 playback.previous()
                             }
@@ -905,32 +944,53 @@ private fun MiniPlayer(
             Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp, top = 7.dp, bottom = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(
-                Modifier.weight(1f).graphicsLayer { translationX = offsetX.value * 0.45f },
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Artwork(
-                    image = detail.work.coverId?.let { WhispImage.Asset(it) },
-                    description = null,
-                    modifier = Modifier.size(46.dp).clip(RoundedCornerShape(11.dp)),
-                    sharedKey = detail.work.id.takeIf { shareCover },
-                )
-                Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                    Text(
-                        shortTitle(detail.work.title).ifBlank { detail.work.title },
-                        style = MaterialTheme.typography.titleSmall,
-                        color = Cream,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                val swipeFraction =
+                    (offsetX.value / swipeTrackThresholdPx.coerceAtLeast(1f)).coerceIn(-1f, 1f)
+                if (swipeFraction > 0.15f) {
+                    Icon(
+                        Icons.Outlined.SkipPrevious,
+                        null,
+                        tint = Rose.copy(alpha = swipeFraction.coerceIn(0f, 1f)),
+                        modifier =
+                            Modifier.align(Alignment.CenterStart).padding(start = 8.dp).size(20.dp),
                     )
-                    Text(
-                        track.title,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Muted,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = 1.dp),
+                } else if (swipeFraction < -0.15f) {
+                    Icon(
+                        Icons.Outlined.SkipNext,
+                        null,
+                        tint = Rose.copy(alpha = (-swipeFraction).coerceIn(0f, 1f)),
+                        modifier =
+                            Modifier.align(Alignment.CenterEnd).padding(end = 8.dp).size(20.dp),
                     )
+                }
+                Row(
+                    Modifier.fillMaxWidth().graphicsLayer { translationX = offsetX.value * 0.45f },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Artwork(
+                        image = detail.work.coverId?.let { WhispImage.Asset(it) },
+                        description = null,
+                        modifier = Modifier.size(46.dp).clip(RoundedCornerShape(11.dp)),
+                        sharedKey = detail.work.id.takeIf { shareCover },
+                    )
+                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                        Text(
+                            shortTitle(detail.work.title).ifBlank { detail.work.title },
+                            style = MaterialTheme.typography.titleSmall,
+                            color = Cream,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            track.title,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Muted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 1.dp),
+                        )
+                    }
                 }
             }
             // Dedicated separated tap zone to reduce accidental full-player expansion.
@@ -960,7 +1020,12 @@ private fun MiniPlayer(
                 }
             }
         }
-        MiniPlayerProgressBar(track = track, state = state, playback = playback)
+        MiniPlayerProgressBar(
+            track = track,
+            state = state,
+            fallbackPosition = fallbackPosition,
+            playback = playback,
+        )
     }
 }
 
@@ -968,13 +1033,14 @@ private fun MiniPlayer(
 private fun MiniPlayerProgressBar(
     track: TrackEntity,
     state: PlaybackState,
+    fallbackPosition: Long,
     playback: PlaybackCoordinator,
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     var liveDisplayPos by
-        remember(track.id, state.trackId, state.positionMs) {
+        remember(track.id, state.trackId, state.positionMs, fallbackPosition) {
             mutableLongStateOf(
-                if (state.trackId == track.id) playback.currentPosition() else state.positionMs,
+                if (state.trackId == track.id) playback.currentPosition() else fallbackPosition,
             )
         }
     // Sample directly from ExoPlayer locally without mutating PlaybackCoordinator.positionMs.
@@ -995,7 +1061,7 @@ private fun MiniPlayerProgressBar(
     if (duration > 0) {
         val trackBg = Raised.copy(alpha = 0.7f)
         Canvas(Modifier.fillMaxWidth().height(2.dp)) {
-            val pos = if (state.trackId == track.id) liveDisplayPos else state.positionMs
+            val pos = if (state.trackId == track.id) liveDisplayPos else fallbackPosition
             val fraction = (pos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
             drawRect(color = trackBg)
             if (fraction > 0f) {

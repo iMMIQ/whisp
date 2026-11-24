@@ -117,6 +117,20 @@ class NfsClient(
         toClose.forEach { runCatching { it.close() } }
     }
 
+    fun closeIdle() {
+        val toClose = mutableListOf<NfsSession>()
+        synchronized(poolLock) {
+            for (deque in idlePools.values) {
+                for (slot in deque) {
+                    slot.expiryTask?.cancel(false)
+                    toClose += slot.session
+                }
+            }
+            idlePools.clear()
+        }
+        toClose.forEach { runCatching { it.close() } }
+    }
+
     fun check(source: SourceEntity) =
         connect(NfsAddress.parse(source.root)).use {
             it.list("")
@@ -210,32 +224,72 @@ class NfsClient(
                     throw retryError
                 }
             }
-        val session = borrowed.first
-        val generation = borrowed.second
+        val initialSession = borrowed.first
+        val initialGeneration = borrowed.second
+        val expectedLength = reader.length
         return object : RemoteReadHandle {
+            private var currentSession = initialSession
+            private var currentGeneration = initialGeneration
+            private var currentReader = reader
             private var broken = false
             private var closed = false
 
             override val length: Long
-                get() = reader.length
+                get() = expectedLength
 
-            override fun read(buffer: ByteArray, offset: Long, bufferOffset: Int, count: Int): Int =
+            override fun read(buffer: ByteArray, offset: Long, bufferOffset: Int, count: Int): Int {
                 try {
-                    reader.read(buffer, offset, bufferOffset, count)
-                } catch (e: Exception) {
-                    broken = true
-                    throw e
+                    return currentReader.read(buffer, offset, bufferOffset, count)
+                } catch (firstError: Exception) {
+                    if (closed || Thread.currentThread().isInterrupted) {
+                        broken = true
+                        throw firstError
+                    }
+                    // Discard the broken mount and retry once on a fresh connection, matching SMB
+                    // resiliency.
+                    runCatching { currentReader.close() }
+                    runCatching { currentSession.close() }
+                    val freshGen = synchronized(poolLock) { generations[key.sourceId] ?: 0L }
+                    val freshSession =
+                        try {
+                            connect(address)
+                        } catch (connectError: Exception) {
+                            broken = true
+                            throw firstError
+                        }
+                    val freshReader =
+                        try {
+                            freshSession.open(path)
+                        } catch (openError: Exception) {
+                            runCatching { freshSession.close() }
+                            broken = true
+                            throw openError
+                        }
+                    currentSession = freshSession
+                    currentGeneration = freshGen
+                    currentReader = freshReader
+                    if (freshReader.length != expectedLength) {
+                        broken = true
+                        throw java.io.IOException("NFS：文件已改变，请重新扫描")
+                    }
+                    return try {
+                        freshReader.read(buffer, offset, bufferOffset, count)
+                    } catch (retryError: Exception) {
+                        broken = true
+                        throw retryError
+                    }
                 }
+            }
 
             override fun close() {
                 if (closed) return
                 closed = true
                 try {
-                    reader.close()
+                    currentReader.close()
                 } catch (_: Exception) {
                     broken = true
                 } finally {
-                    release(key, session, generation, broken)
+                    release(key, currentSession, currentGeneration, broken)
                 }
             }
         }

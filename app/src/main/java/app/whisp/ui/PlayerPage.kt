@@ -16,18 +16,21 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.QueueMusic
@@ -53,6 +56,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -68,9 +72,11 @@ import app.whisp.R
 import app.whisp.data.*
 import app.whisp.playback.LoopState
 import app.whisp.playback.PlaybackCoordinator
+import app.whisp.playback.PlaybackErrorInfo
 import app.whisp.playback.SleepTimer
 import java.util.UUID
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -88,19 +94,54 @@ internal object SubtitleFollow {
             abs(current - previous) <= 1
 }
 
-private fun rewindIconFor(seconds: Int) =
+@Composable
+internal fun SkipSecondsIcon(
+    seconds: Int,
+    forward: Boolean,
+    tint: Color,
+    contentDescription: String? = null,
+) {
     when (seconds) {
-        5 -> Icons.Outlined.Replay5
-        30 -> Icons.Outlined.Replay30
-        else -> Icons.Outlined.Replay10
+        5 ->
+            Icon(
+                if (forward) Icons.Outlined.Forward5 else Icons.Outlined.Replay5,
+                contentDescription,
+                tint = tint,
+            )
+        10 ->
+            Icon(
+                if (forward) Icons.Outlined.Forward10 else Icons.Outlined.Replay10,
+                contentDescription,
+                tint = tint,
+            )
+        30 ->
+            Icon(
+                if (forward) Icons.Outlined.Forward30 else Icons.Outlined.Replay30,
+                contentDescription,
+                tint = tint,
+            )
+        else ->
+            Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Outlined.Replay,
+                    contentDescription,
+                    tint = tint,
+                    modifier =
+                        Modifier.size(24.dp).graphicsLayer {
+                            if (forward) scaleX = -1f
+                        },
+                )
+                Text(
+                    seconds.toString(),
+                    color = tint,
+                    fontSize = 8.5.sp,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelSmall.merge(TabularNumeralStyle),
+                    modifier = Modifier.offset(y = 1.dp),
+                )
+            }
     }
-
-private fun forwardIconFor(seconds: Int) =
-    when (seconds) {
-        5 -> Icons.Outlined.Forward5
-        30 -> Icons.Outlined.Forward30
-        else -> Icons.Outlined.Forward10
-    }
+}
 
 @Composable
 internal fun PlayerPage(
@@ -116,11 +157,17 @@ internal fun PlayerPage(
     val playback = graph.playback
     val state by playback.state.collectAsStateWithLifecycle()
     val cues by playback.subtitles.cues.collectAsStateWithLifecycle()
+    val displayCues by playback.subtitles.displayCues.collectAsStateWithLifecycle()
+    val activePrimarySubId by playback.subtitles.activePrimaryId.collectAsStateWithLifecycle()
+    val activeSecondarySubId by playback.subtitles.activeSecondaryId.collectAsStateWithLifecycle()
     val loading by playback.subtitles.loading.collectAsStateWithLifecycle()
     val subtitleError by playback.subtitles.error.collectAsStateWithLifecycle()
     val queueTracks by playback.queueTracks.collectAsStateWithLifecycle()
     val opening by playback.openingTrackId.collectAsStateWithLifecycle()
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
+    val trackSubtitleOffsets by graph.settings.trackSubtitleOffsets.collectAsStateWithLifecycle()
+    val trackSubtitleSelections by
+        graph.settings.trackSubtitleSelections.collectAsStateWithLifecycle()
     val audioOnly by playback.audioOnly.collectAsStateWithLifecycle()
     val embeddedSubtitle by playback.embeddedSubtitle.collectAsStateWithLifecycle()
     val markA by playback.loopDraftStart.collectAsStateWithLifecycle()
@@ -130,6 +177,11 @@ internal fun PlayerPage(
                 detail?.work?.id?.let { graph.library.observeProgress(it) } ?: flowOf(null)
             }
             .collectAsStateWithLifecycle(initialValue = null)
+    val workBookmarks by
+        remember(detail?.work?.id) {
+                detail?.work?.id?.let { graph.library.observeBookmarks(it) } ?: flowOf(emptyList())
+            }
+            .collectAsStateWithLifecycle(initialValue = emptyList())
 
     var fullscreen by rememberSaveable { mutableStateOf(false) }
     var queue by rememberSaveable { mutableStateOf(false) }
@@ -137,12 +189,15 @@ internal fun PlayerPage(
     var timer by rememberSaveable { mutableStateOf(false) }
     var preferences by rememberSaveable { mutableStateOf(false) }
     var subtitleTune by rememberSaveable { mutableStateOf(false) }
+    var subtitlePicker by rememberSaveable { mutableStateOf(false) }
+    var subtitleSearch by rememberSaveable { mutableStateOf(false) }
     var inlineAbBar by rememberSaveable { mutableStateOf(false) }
     var showScript by rememberSaveable(detail?.work?.id) { mutableStateOf(false) }
     var bookmark by remember { mutableStateOf<BookmarkDraft?>(null) }
     var subtitleAction by remember(track?.id) { mutableStateOf<Cue?>(null) }
     var more by rememberSaveable { mutableStateOf(false) }
     var precise by rememberSaveable { mutableStateOf(false) }
+    var refreshingSource by remember { mutableStateOf(false) }
     var followSignal by remember(track?.id) { mutableIntStateOf(0) }
 
     val context = LocalContext.current
@@ -169,11 +224,20 @@ internal fun PlayerPage(
     // Only keep Media3's embedded text renderer active while the player screen is visible and no
     // external subtitle file is bound; disabling it in background/screen-off unlocks audio offload.
     val subtitleOwner = remember { Any() }
-    val wantsEmbeddedSubtitles = track.subtitleId == null
+    val wantsEmbeddedSubtitles = track.subtitleId == null && activePrimarySubId == null
     LifecycleResumeEffect(playback, subtitleOwner, wantsEmbeddedSubtitles) {
         playback.subtitleVisibility(subtitleOwner, wantsEmbeddedSubtitles)
         onPauseOrDispose { playback.subtitleVisibility(subtitleOwner, false) }
     }
+
+    val trackOffsetMs = trackSubtitleOffsets[track.id] ?: 0L
+    val trackBookmarks =
+        remember(workBookmarks, track.id) { workBookmarks.filter { it.trackId == track.id } }
+    val subtitleCandidates =
+        remember(track.id, detail.attachments) {
+            LibraryIndexer.subtitleCandidates(track, detail.attachments)
+        }
+    val hasSubtitleOverride = trackSubtitleSelections[track.id] != null
 
     val scripts =
         remember(detail.attachments) {
@@ -184,6 +248,43 @@ internal fun PlayerPage(
             track.scriptId?.takeIf { id -> scripts.any { it.id == id } }
                 ?: scripts.firstOrNull()?.id
         }
+
+    val onRefreshOnlineWork: (() -> Unit)? =
+        if (detail.work.originKind == SourceKind.ASMRONE && detail.work.sourceId != null) {
+            {
+                if (!refreshingSource) {
+                    refreshingSource = true
+                    scope.launch {
+                        try {
+                            val sourceId = detail.work.sourceId
+                            val asmrId = detail.work.rj?.let(::asmrWorkNumber)
+                            if (asmrId != null) {
+                                graph.sync.importAsmrWork(sourceId, asmrId, existingOnly = true)
+                                val updated =
+                                    withContext(Dispatchers.IO) {
+                                        graph.library.workDetails(detail.work.id)
+                                    }
+                                if (updated != null) {
+                                    playback.playWork(
+                                        updated,
+                                        track.id,
+                                        startPosition = playback.currentPosition(),
+                                    )
+                                }
+                            } else {
+                                playback.retryPlayback()
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            graph.messages.tryEmit(e.message ?: "刷新作品地址失败")
+                        } finally {
+                            refreshingSource = false
+                        }
+                    }
+                }
+            }
+        } else null
 
     val coverImage =
         remember(detail.work.coverId) { detail.work.coverId?.let { WhispImage.Asset(it) } }
@@ -275,25 +376,48 @@ internal fun PlayerPage(
 
     if (fullscreen && showVideo) {
         val timeline = playback.positionMs.collectAsStateWithLifecycle()
-        val caption by
+        val captionPair by
             remember(
                 cues,
+                displayCues,
                 track.id,
                 state.trackId,
                 fallbackPosition,
-                settings.subtitleOffsetMs,
+                trackOffsetMs,
                 embeddedSubtitle,
+                activePrimarySubId,
             ) {
                 derivedStateOf {
                     val pos = if (state.trackId == track.id) timeline.value else fallbackPosition
                     val current =
                         SubtitleTimeline.current(
                             cues,
-                            (pos - settings.subtitleOffsetMs).coerceAtLeast(0),
+                            (pos - trackOffsetMs).coerceAtLeast(0),
                         )
-                    cues.getOrNull(current)?.text
-                        ?: if (track.subtitleId == null) embeddedSubtitle else ""
+                    val matched = displayCues.getOrNull(current)
+                    if (matched != null) matched.text to matched.secondaryText
+                    else
+                        (if (track.subtitleId == null && activePrimarySubId == null)
+                            embeddedSubtitle
+                        else "") to null
                 }
+            }
+        val fullscreenPreviewCaption: ((Long) -> String?)? =
+            remember(cues, trackBookmarks, trackOffsetMs) {
+                if (cues.isEmpty() && trackBookmarks.isEmpty()) null
+                else
+                    { posMs ->
+                        val nearBookmark =
+                            trackBookmarks
+                                .minByOrNull { abs(it.positionMs - posMs) }
+                                ?.takeIf { abs(it.positionMs - posMs) <= 2_500L }
+                        val adjusted = (posMs - trackOffsetMs).coerceAtLeast(0L)
+                        val cueText =
+                            SubtitleTimeline.current(cues, adjusted)
+                                .takeIf { it >= 0 }
+                                ?.let { cues[it].text }
+                        cueText ?: nearBookmark?.let { "★ ${it.title}" }
+                    }
             }
         FullScreenVideo(
             playback = playback,
@@ -301,11 +425,15 @@ internal fun PlayerPage(
             title = track.title,
             state = state,
             active = shownTrack != null,
-            caption = caption,
+            caption = captionPair.first,
+            secondaryCaption = captionPair.second,
             subtitleSize = settings.subtitleSize,
             skipSeconds = settings.skipSeconds,
+            hasQueue = queueTracks.isNotEmpty(),
+            previewCaptionProvider = fullscreenPreviewCaption,
+            onOpenQueue = { queue = true },
             exit = { fullscreen = false },
-            timeline = { onScrubbingChange ->
+            timeline = { onScrubPreview, onScrubbingChange ->
                 PlayerTimeline(
                     track = track,
                     state = state,
@@ -314,8 +442,9 @@ internal fun PlayerPage(
                     fallbackPosition = fallbackPosition,
                     playback = playback,
                     cues = cues,
-                    subtitleOffsetMs = settings.subtitleOffsetMs,
-                    onScrubPreview = {},
+                    bookmarks = trackBookmarks,
+                    subtitleOffsetMs = trackOffsetMs,
+                    onScrubPreview = onScrubPreview,
                     onScrubbingChange = onScrubbingChange,
                 )
             },
@@ -360,12 +489,13 @@ internal fun PlayerPage(
             }
             val onOpenWorkDetail: () -> Unit = { openDetail(detail.work.id) }
             val onDirectSeekCue: (Cue) -> Unit = { cue ->
-                val targetPos = (cue.startMs + settings.subtitleOffsetMs).coerceAtLeast(0L)
+                val targetPos = (cue.startMs + trackOffsetMs).coerceAtLeast(0L)
                 haptics.tick()
                 followSignal++
                 if (shownTrack != null) {
+                    // Keep paused state intact when browsing subtitles silently; resume only if
+                    // already playing.
                     playback.seek(targetPos)
-                    if (!state.playWhenReady) playback.togglePlay()
                 } else {
                     playback.playWork(detail, track.id, startPosition = targetPos)
                 }
@@ -379,6 +509,9 @@ internal fun PlayerPage(
                     shownTrack = shownTrack,
                     opening = opening,
                     cues = cues,
+                    displayCues = displayCues,
+                    trackBookmarks = trackBookmarks,
+                    trackOffsetMs = trackOffsetMs,
                     loading = loading,
                     subtitleError = subtitleError,
                     embeddedSubtitle = embeddedSubtitle,
@@ -395,6 +528,7 @@ internal fun PlayerPage(
                     preferredScriptId = preferredScriptId,
                     video = video,
                     followSignal = followSignal,
+                    refreshingSource = refreshingSource,
                     dismissDragModifier = dismissDragModifier,
                     graph = graph,
                     playback = playback,
@@ -407,7 +541,7 @@ internal fun PlayerPage(
                         val cueIndex =
                             SubtitleTimeline.anchor(
                                 cues,
-                                (state.loopStart - settings.subtitleOffsetMs).coerceAtLeast(0),
+                                (state.loopStart - trackOffsetMs).coerceAtLeast(0),
                             )
                         bookmark =
                             BookmarkDraft.forLoop(
@@ -426,8 +560,10 @@ internal fun PlayerPage(
                     onOpenQueue = { queue = true },
                     onOpenFragments = { fragments = true },
                     onOpenTimer = { timer = true },
+                    onOpenSubtitleTune = { subtitleTune = true },
                     onOpenPreferences = { preferences = true },
                     onOpenMore = { more = true },
+                    onRefreshOnlineWork = onRefreshOnlineWork,
                     modifier = mod,
                 )
             }
@@ -536,9 +672,16 @@ internal fun PlayerPage(
             ) {
                 LiveSubtitleTuneOverlay(
                     settings = settings,
+                    trackOffsetMs = trackOffsetMs,
+                    onTrackOffsetChange = { nextOffset ->
+                        scope.launch { graph.settings.setTrackSubtitleOffset(track.id, nextOffset) }
+                    },
                     onUpdateSettings = { transform ->
                         scope.launch { graph.settings.update(transform) }
                     },
+                    hasCandidates = subtitleCandidates.isNotEmpty(),
+                    onOpenPicker = { subtitlePicker = true },
+                    onOpenSearch = { subtitleSearch = true },
                     onClose = { subtitleTune = false },
                 )
             }
@@ -549,18 +692,19 @@ internal fun PlayerPage(
         PlayerQueueSheet(
             queueTracks = queueTracks,
             activeTrackId = state.trackId,
+            shuffleEnabled = state.shuffleEnabled,
+            onToggleShuffle = playback::toggleShuffle,
+            onMoveTrack = playback::moveQueuedTrack,
             onSelect = playback::selectQueuedTrack,
             onDismiss = { queue = false },
             detail = detail,
             onSwitchSectionTrack = { targetTrackId ->
-                playback.playWork(detail, targetTrackId, startPosition = 0L)
+                val savedPos = graph.settings.savedTrackPosition(targetTrackId)
+                playback.playWork(detail, targetTrackId, startPosition = savedPos)
             },
         )
     }
     if (fragments) {
-        val workBookmarks by
-            remember(detail.work.id) { graph.library.observeBookmarks(detail.work.id) }
-                .collectAsStateWithLifecycle(initialValue = emptyList())
         PlayerFragmentsSheet(
             detail = detail,
             track = track,
@@ -568,7 +712,7 @@ internal fun PlayerPage(
             markA = markA,
             shownTrack = shownTrack,
             cues = cues,
-            settings = settings,
+            settings = settings.copy(subtitleOffsetMs = trackOffsetMs),
             bookmarks = workBookmarks,
             playback = playback,
             onDeleteBookmark = { item ->
@@ -595,10 +739,16 @@ internal fun PlayerPage(
         SleepTimerDialog(
             timerEnd = state.timerEnd,
             stopAfterTrack = state.timerStopAfterTrack,
+            sleepFadeSeconds = settings.sleepFadeSeconds,
+            timerStartAnchor = state.timerStartAnchor,
             haptics = haptics,
             onSelectMinutes = playback::setTimer,
             onExtendMinutes = playback::extendTimer,
             onStopAfterTrack = playback::setStopAfterTrack,
+            onSelectFadeSeconds = { sec ->
+                scope.launch { graph.settings.update { it.copy(sleepFadeSeconds = sec) } }
+            },
+            onJumpToStartAnchor = playback::jumpToTimerStartAnchor,
             onDismiss = { timer = false },
         )
     }
@@ -624,11 +774,11 @@ internal fun PlayerPage(
         )
     }
     subtitleAction?.let { cue ->
-        val cueStart = (cue.startMs + settings.subtitleOffsetMs).coerceAtLeast(0L)
+        val cueStart = (cue.startMs + trackOffsetMs).coerceAtLeast(0L)
         val cueEnd =
             cue.endMs
                 .takeIf { it < Long.MAX_VALUE }
-                ?.let { (it + settings.subtitleOffsetMs).coerceAtLeast(0L) }
+                ?.let { (it + trackOffsetMs).coerceAtLeast(0L) }
                 ?.takeIf { it - cueStart >= 500L }
         SubtitleActionSheet(
             cue = cue,
@@ -639,7 +789,7 @@ internal fun PlayerPage(
                 playback.playWork(detail, track.id, startPosition = cueStart)
             },
             onSaveCue = {
-                bookmark = BookmarkDraft.fromCue(track.id, cue, settings.subtitleOffsetMs)
+                bookmark = BookmarkDraft.fromCue(track.id, cue, trackOffsetMs)
             },
             onMarkLoopStart = {
                 playback.setLoopDraftStart(cueStart)
@@ -664,14 +814,50 @@ internal fun PlayerPage(
             onDismiss = { subtitleAction = null },
         )
     }
+    if (subtitlePicker && subtitleCandidates.isNotEmpty()) {
+        SubtitlePickerSheet(
+            candidates = subtitleCandidates,
+            activePrimaryId = activePrimarySubId ?: track.subtitleId,
+            activeSecondaryId = activeSecondarySubId,
+            hasOverride = hasSubtitleOverride,
+            onSelect = { primaryId, secondaryId ->
+                scope.launch {
+                    graph.settings.setTrackSubtitleSelection(
+                        track.id,
+                        TrackSubtitleSelection(primaryId, secondaryId),
+                    )
+                }
+            },
+            onResetAuto = {
+                scope.launch { graph.settings.setTrackSubtitleSelection(track.id, null) }
+            },
+            onDismiss = { subtitlePicker = false },
+        )
+    }
+    if (subtitleSearch && displayCues.isNotEmpty()) {
+        SubtitleSearchSheet(
+            cues = displayCues,
+            offsetMs = trackOffsetMs,
+            onJump = { cue ->
+                val targetPos = (cue.startMs + trackOffsetMs).coerceAtLeast(0L)
+                followSignal++
+                if (shownTrack != null) playback.seek(targetPos)
+                else playback.playWork(detail, track.id, startPosition = targetPos)
+            },
+            onDismiss = { subtitleSearch = false },
+        )
+    }
     if (more) {
         PlayerMoreSheet(
             context = context,
             currentSpeed = state.speed,
             hasSubtitles = hasAnySubtitles,
+            hasSubtitleCandidates = subtitleCandidates.isNotEmpty(),
             onSpeedChange = playback::setPlaybackSpeed,
             onOpenDetail = { openDetail(detail.work.id) },
             onSubtitleTune = { subtitleTune = true },
+            onSubtitlePicker = { subtitlePicker = true },
+            onSubtitleSearch = { subtitleSearch = true },
             onPreciseSeek = { precise = true },
             onPreferences = { preferences = true },
             onRestart = { playback.playWork(detail, restart = true) },
@@ -693,6 +879,10 @@ internal fun PlayerPage(
         PlaybackPreferencesDialog(
             settings = settings,
             currentSpeed = state.speed,
+            trackOffsetMs = trackOffsetMs,
+            onTrackOffsetChange = { nextOffset ->
+                scope.launch { graph.settings.setTrackSubtitleOffset(track.id, nextOffset) }
+            },
             onSpeedChange = playback::setPlaybackSpeed,
             onUpdateSettings = { transform -> scope.launch { graph.settings.update(transform) } },
             onDismiss = { preferences = false },
@@ -851,7 +1041,24 @@ private fun PlayerCover(
     dismissDragModifier: Modifier,
 ) {
     val bg = MaterialTheme.colorScheme.background
-    Box(modifier.background(MaterialTheme.colorScheme.surface).then(dismissDragModifier)) {
+    val reduced = LocalReducedMotion.current
+    var videoOverlayVisible by remember(track.id, showVideo) { mutableStateOf(true) }
+    val showOverlay = !showVideo || videoOverlayVisible || !state.playing
+    Box(
+        modifier
+            .background(MaterialTheme.colorScheme.surface)
+            .then(dismissDragModifier)
+            .then(
+                if (showVideo) {
+                    Modifier.pointerInput(shownTrack != null) {
+                        detectTapGestures(
+                            onTap = { videoOverlayVisible = !videoOverlayVisible },
+                            onDoubleTap = { if (shownTrack != null) onFullscreen() },
+                        )
+                    }
+                } else Modifier,
+            ),
+    ) {
         if (showVideo) {
             VideoOutput(
                 playback = playback,
@@ -869,55 +1076,64 @@ private fun PlayerCover(
                 onAmbientColor = onAmbientColor,
             )
         }
-        Box(
-            Modifier.matchParentSize()
-                .background(
-                    Brush.verticalGradient(
-                        0.0f to bg.copy(alpha = .44f),
-                        0.32f to Color.Transparent,
-                        0.66f to bg.copy(alpha = .58f),
-                        1.0f to bg,
-                    ),
-                ),
-        )
-        PlayerTopBar(
-            video = video,
-            audioOnly = audioOnly,
-            hasScripts = hasScripts,
-            showScript = showScript,
-            onToggleAudioOnly = { playback.setAudioOnly(!audioOnly) },
-            onToggleScript = onToggleScript,
-            onOpenWorkDetail = onOpenWorkDetail,
-            back = back,
-            overlayBackdrop = true,
-        )
-        Text(
-            shortTitle(detail.work.title).ifBlank { detail.work.title },
-            style = MaterialTheme.typography.headlineSmall,
-            color = Cream,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            modifier =
-                Modifier.align(Alignment.BottomStart)
-                    .padding(
-                        start = 22.dp,
-                        end = if (showVideo) 64.dp else 22.dp,
-                        top = 12.dp,
-                        bottom = 10.dp,
-                    )
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable(onClick = onOpenWorkDetail),
-        )
-        if (showVideo) {
-            CompositionLocalProvider(LocalCoverControls provides true) {
-                Box(Modifier.align(Alignment.BottomEnd).padding(8.dp)) {
-                    IconAction(
-                        Icons.Outlined.Fullscreen,
-                        "全屏",
-                        enabled = shownTrack != null,
-                        haptic = HapticKind.Tick,
-                    ) {
-                        onFullscreen()
+        AnimatedVisibility(
+            visible = showOverlay,
+            enter = fadeIn(tween(if (reduced) 0 else 140)),
+            exit = fadeOut(tween(if (reduced) 0 else 140)),
+            modifier = Modifier.matchParentSize(),
+        ) {
+            Box(Modifier.fillMaxSize()) {
+                Box(
+                    Modifier.matchParentSize()
+                        .background(
+                            Brush.verticalGradient(
+                                0.0f to bg.copy(alpha = .44f),
+                                0.32f to Color.Transparent,
+                                0.66f to bg.copy(alpha = .58f),
+                                1.0f to bg,
+                            ),
+                        ),
+                )
+                PlayerTopBar(
+                    video = video,
+                    audioOnly = audioOnly,
+                    hasScripts = hasScripts,
+                    showScript = showScript,
+                    onToggleAudioOnly = { playback.setAudioOnly(!audioOnly) },
+                    onToggleScript = onToggleScript,
+                    onOpenWorkDetail = onOpenWorkDetail,
+                    back = back,
+                    overlayBackdrop = true,
+                )
+                Text(
+                    shortTitle(detail.work.title).ifBlank { detail.work.title },
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = Cream,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier =
+                        Modifier.align(Alignment.BottomStart)
+                            .padding(
+                                start = 22.dp,
+                                end = if (showVideo) 64.dp else 22.dp,
+                                top = 12.dp,
+                                bottom = 10.dp,
+                            )
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(onClick = onOpenWorkDetail),
+                )
+                if (showVideo) {
+                    CompositionLocalProvider(LocalCoverControls provides true) {
+                        Box(Modifier.align(Alignment.BottomEnd).padding(8.dp)) {
+                            IconAction(
+                                Icons.Outlined.Fullscreen,
+                                "全屏",
+                                enabled = shownTrack != null,
+                                haptic = HapticKind.Tick,
+                            ) {
+                                onFullscreen()
+                            }
+                        }
                     }
                 }
             }
@@ -1009,13 +1225,21 @@ private fun EmbeddedScriptPane(
     preferredId: String?,
     graph: AppGraph,
     encoding: String,
+    fontSizeSp: Int,
     modifier: Modifier,
 ) {
     var selectedId by
         rememberSaveable(scripts.map { it.id }) {
             mutableStateOf(preferredId ?: scripts.first().id)
         }
+    LaunchedEffect(preferredId) {
+        if (preferredId != null && scripts.any { it.id == preferredId }) {
+            selectedId = preferredId
+        }
+    }
     val selected = scripts.firstOrNull { it.id == selectedId } ?: scripts.first()
+    val scrollStates = remember { mutableMapOf<String, LazyListState>() }
+    val listState = scrollStates.getOrPut(selected.id) { LazyListState() }
     var rawBytes by remember(selected.id) { mutableStateOf<ByteArray?>(null) }
     var chunks by remember(selected.id) { mutableStateOf<List<String>?>(null) }
     var loading by remember(selected.id) { mutableStateOf(true) }
@@ -1086,18 +1310,21 @@ private fun EmbeddedScriptPane(
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 chunks != null ->
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp),
-                    ) {
-                        itemsIndexed(chunks!!, key = { idx, _ -> idx }) { _, chunk ->
-                            Text(
-                                chunk,
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = Cream.copy(alpha = 0.92f),
-                                lineHeight = 28.sp,
-                                modifier = Modifier.fillMaxWidth(),
-                            )
+                    SelectionContainer {
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp),
+                        ) {
+                            itemsIndexed(chunks!!, key = { idx, _ -> idx }) { _, chunk ->
+                                Text(
+                                    chunk,
+                                    fontSize = (fontSizeSp - 2).coerceIn(14, 26).sp,
+                                    lineHeight = (fontSizeSp + 8).coerceIn(22, 38).sp,
+                                    color = Cream.copy(alpha = 0.92f),
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            }
                         }
                     }
             }
@@ -1110,12 +1337,14 @@ private fun PlayerSubtitles(
     track: TrackEntity,
     activeTrackId: String?,
     cues: List<Cue>,
+    displayCues: List<DisplayCue>,
     loading: Boolean,
     subtitleError: String?,
     embeddedSubtitle: String,
     settings: Settings,
+    trackOffsetMs: Long,
     fallbackPosition: Long,
-    scrubPreviewMs: Long?,
+    scrubPreviewState: State<Long?>,
     followSignal: Int,
     playback: PlaybackCoordinator,
     onDirectSeek: (Cue) -> Unit,
@@ -1139,36 +1368,45 @@ private fun PlayerSubtitles(
         }
         return
     }
-    // Collecting positionMs inside PlayerSubtitles isolates timeline ticks from PlayerPage.
+    // Collecting positionMs & reading scrubPreviewState inside PlayerSubtitles isolates
+    // high-frequency
+    // ticks and seek-bar drags from recomposing PlayerControls or PlayerPage.
     val timeline = playback.positionMs.collectAsStateWithLifecycle()
     key(track.id) {
+        val previewing by
+            remember(scrubPreviewState) { derivedStateOf { scrubPreviewState.value != null } }
         val cueState by
             remember(
                 cues,
                 track.id,
                 activeTrackId,
                 fallbackPosition,
-                settings.subtitleOffsetMs,
-                scrubPreviewMs,
+                trackOffsetMs,
+                scrubPreviewState,
             ) {
                 derivedStateOf(structuralEqualityPolicy()) {
                     val pos =
-                        scrubPreviewMs
+                        scrubPreviewState.value
                             ?: if (activeTrackId == track.id) timeline.value else fallbackPosition
-                    val position = (pos - settings.subtitleOffsetMs).coerceAtLeast(0)
+                    val position = (pos - trackOffsetMs).coerceAtLeast(0)
                     SubtitleTimeline.anchor(cues, position) to
                         SubtitleTimeline.current(cues, position)
                 }
             }
+        val effectiveDisplay =
+            remember(cues, displayCues) {
+                if (displayCues.size == cues.size) displayCues
+                else cues.map { DisplayCue(it.startMs, it.endMs, it.text) }
+            }
         SubtitlePane(
-            cues = cues,
+            cues = effectiveDisplay,
             loading = loading,
             error = subtitleError,
             anchor = cueState.first,
             active = cueState.second,
             size = settings.subtitleSize,
             followSignal = followSignal,
-            previewing = scrubPreviewMs != null,
+            previewing = previewing,
             modifier = modifier,
             onDirectSeek = onDirectSeek,
             onRetry = { playback.subtitles.retry(track.id) },
@@ -1186,6 +1424,7 @@ private fun PlayerTimeline(
     fallbackPosition: Long,
     playback: PlaybackCoordinator,
     cues: List<Cue> = emptyList(),
+    bookmarks: List<BookmarkEntity> = emptyList(),
     subtitleOffsetMs: Long = 0L,
     onScrubPreview: (Long?) -> Unit = {},
     onScrubbingChange: ((Boolean) -> Unit)? = null,
@@ -1204,14 +1443,23 @@ private fun PlayerTimeline(
         remember(state.trackId, track.id) {
             { if (state.trackId == track.id) buffered.value else 0L }
         }
+    val bookmarkPositions = remember(bookmarks) { bookmarks.map { it.positionMs } }
     val previewCaptionProvider: ((Long) -> String?)? =
-        remember(cues, subtitleOffsetMs) {
-            if (cues.isEmpty()) null
+        remember(cues, bookmarks, subtitleOffsetMs) {
+            if (cues.isEmpty() && bookmarks.isEmpty()) null
             else
                 { posMs ->
+                    val nearBookmark =
+                        bookmarks
+                            .minByOrNull { abs(it.positionMs - posMs) }
+                            ?.takeIf { abs(it.positionMs - posMs) <= 2_500L }
                     val adjusted = (posMs - subtitleOffsetMs).coerceAtLeast(0L)
-                    val idx = SubtitleTimeline.current(cues, adjusted)
-                    cues.getOrNull(idx)?.text
+                    val cueText =
+                        if (cues.isNotEmpty()) {
+                            val idx = SubtitleTimeline.current(cues, adjusted)
+                            cues.getOrNull(idx)?.text
+                        } else null
+                    cueText ?: nearBookmark?.let { "★ ${it.title}" }
                 }
         }
     Column(Modifier.padding(horizontal = 18.dp)) {
@@ -1228,6 +1476,7 @@ private fun PlayerTimeline(
                 },
                 onSeek = playback::seek,
                 bufferedProvider = bufferedProvider,
+                bookmarkPositions = bookmarkPositions,
                 onFineBounds = { fineBounds = it },
                 previewCaptionProvider = previewCaptionProvider,
                 onScrubbingChange = onScrubbingChange,
@@ -1275,10 +1524,14 @@ private fun TimelineLabels(
 @Composable
 private fun ActiveModifiersRow(
     state: PlaybackState,
+    settings: Settings,
+    trackOffsetMs: Long,
     markA: Long,
     onOpenPreferences: () -> Unit,
+    onOpenSubtitleTune: () -> Unit,
     onOpenTimer: () -> Unit,
     onToggleInlineAb: () -> Unit,
+    onToggleShuffle: () -> Unit,
 ) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var nowElapsed by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
@@ -1301,26 +1554,126 @@ private fun ActiveModifiersRow(
     val showTimer = state.timerEnd > 0L && remainingMin > 0
     val showStopAfterTrack = state.timerStopAfterTrack
     val showLoop = state.loopStart >= 0L || markA >= 0L
-    if (!showSpeed && !showTimer && !showStopAfterTrack && !showLoop) return
+    val showOffset = trackOffsetMs != 0L
+    val showShuffle = state.shuffleEnabled
+    val showAudioMod = settings.hasDspEffects || settings.volumeGain < 0.99f
+    if (
+        !showSpeed &&
+            !showTimer &&
+            !showStopAfterTrack &&
+            !showLoop &&
+            !showOffset &&
+            !showShuffle &&
+            !showAudioMod
+    ) {
+        return
+    }
 
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
+    LazyRow(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        contentPadding = PaddingValues(horizontal = 20.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (showSpeed) {
-            StatusPill(text = formatSpeedLabel(state.speed), onClick = onOpenPreferences)
+            item(key = "mod-speed") {
+                StatusPill(text = formatSpeedLabel(state.speed), onClick = onOpenPreferences)
+            }
+        }
+        if (showShuffle) {
+            item(key = "mod-shuffle") {
+                StatusPill(text = "随机", onClick = onToggleShuffle)
+            }
+        }
+        if (showAudioMod) {
+            item(key = "mod-audio") {
+                val label = buildList {
+                    if (settings.swapChannels) add("声道反转")
+                    if (settings.nightDynamics) add("夜间柔化")
+                    if (settings.monoAudio) add("单声道")
+                    if (settings.volumeGain < 0.99f) {
+                        add("音量${(settings.volumeGain * 100f).roundToInt()}%")
+                    }
+                }
+                    .joinToString("·")
+                StatusPill(text = label, onClick = onOpenPreferences)
+            }
+        }
+        if (showOffset) {
+            item(key = "mod-offset") {
+                val sign = if (trackOffsetMs > 0) "+" else ""
+                StatusPill(text = "字幕 ${sign}${trackOffsetMs}ms", onClick = onOpenSubtitleTune)
+            }
         }
         if (showLoop) {
-            val text =
-                if (state.loopStart >= 0L) "A–B ${clock(state.loopStart)}–${clock(state.loopEnd)}"
-                else "A ${clock(markA)}"
-            StatusPill(text = text, onClick = onToggleInlineAb)
+            item(key = "mod-loop") {
+                val text =
+                    if (state.loopStart >= 0L)
+                        "A–B ${clock(state.loopStart)}–${clock(state.loopEnd)}"
+                    else "A ${clock(markA)}"
+                StatusPill(text = text, onClick = onToggleInlineAb)
+            }
         }
         if (showTimer) {
-            StatusPill(text = "定时 ${remainingMin}分", onClick = onOpenTimer)
+            item(key = "mod-timer") {
+                StatusPill(text = "定时 ${remainingMin}分", onClick = onOpenTimer)
+            }
         } else if (showStopAfterTrack) {
-            StatusPill(text = "播完本曲停", onClick = onOpenTimer)
+            item(key = "mod-stop-track") {
+                StatusPill(text = "播完本曲停", onClick = onOpenTimer)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlayerErrorBanner(
+    errorInfo: PlaybackErrorInfo,
+    refreshingSource: Boolean,
+    onRetry: () -> Unit,
+    onRefreshSource: (() -> Unit)?,
+) {
+    val shape = RoundedCornerShape(14.dp)
+    Row(
+        Modifier.fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 4.dp)
+            .clip(shape)
+            .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.25f))
+            .border(0.5.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.45f), shape)
+            .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Icon(
+            Icons.Outlined.ErrorOutline,
+            null,
+            tint = MaterialTheme.colorScheme.error,
+            modifier = Modifier.size(18.dp),
+        )
+        Text(
+            errorInfo.message,
+            style = MaterialTheme.typography.bodySmall,
+            color = Cream,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (errorInfo.canRefreshSource && onRefreshSource != null) {
+            TextButton(
+                onClick = onRefreshSource,
+                enabled = !refreshingSource,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text(if (refreshingSource) "刷新中" else "刷新地址")
+            }
+        }
+        if (errorInfo.canRetry) {
+            TextButton(
+                onClick = onRetry,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text("重试", color = Rose)
+            }
         }
     }
 }
@@ -1447,20 +1800,20 @@ private fun InlineAbLoopBar(
             if (state.loopStart >= 0L) {
                 SmallStepButton("A−0.5s") {
                     haptics.tick()
-                    playback.adjustLoop(deltaStartMs = -500L)
+                    playback.adjustLoop(deltaStartMs = -500L, preview = true)
                 }
                 SmallStepButton("A+0.5s") {
                     haptics.tick()
-                    playback.adjustLoop(deltaStartMs = 500L)
+                    playback.adjustLoop(deltaStartMs = 500L, preview = true)
                 }
                 Spacer(Modifier.weight(1f))
                 SmallStepButton("B−0.5s") {
                     haptics.tick()
-                    playback.adjustLoop(deltaEndMs = -500L)
+                    playback.adjustLoop(deltaEndMs = -500L, preview = true)
                 }
                 SmallStepButton("B+0.5s") {
                     haptics.tick()
-                    playback.adjustLoop(deltaEndMs = 500L)
+                    playback.adjustLoop(deltaEndMs = 500L, preview = true)
                 }
             } else {
                 OutlinedButton(
@@ -1518,6 +1871,9 @@ private fun PlayerControls(
     shownTrack: TrackEntity?,
     opening: String?,
     cues: List<Cue>,
+    displayCues: List<DisplayCue>,
+    trackBookmarks: List<BookmarkEntity>,
+    trackOffsetMs: Long,
     loading: Boolean,
     subtitleError: String?,
     embeddedSubtitle: String,
@@ -1534,6 +1890,7 @@ private fun PlayerControls(
     preferredScriptId: String?,
     video: Boolean,
     followSignal: Int,
+    refreshingSource: Boolean,
     graph: AppGraph,
     playback: PlaybackCoordinator,
     onToggleFavorite: () -> Unit,
@@ -1547,8 +1904,10 @@ private fun PlayerControls(
     onOpenQueue: () -> Unit,
     onOpenFragments: () -> Unit,
     onOpenTimer: () -> Unit,
+    onOpenSubtitleTune: () -> Unit,
     onOpenPreferences: () -> Unit,
     onOpenMore: () -> Unit,
+    onRefreshOnlineWork: (() -> Unit)?,
     modifier: Modifier,
     dismissDragModifier: Modifier,
 ) {
@@ -1564,11 +1923,13 @@ private fun PlayerControls(
     val reduced = LocalReducedMotion.current
     val amoled = LocalAmoledBlack.current
     val haptics = rememberWhispHaptics()
-    var scrubPreviewMs by remember(track.id) { mutableStateOf<Long?>(null) }
+    // Store scrub preview in a MutableState box passed down without reading .value here,
+    // preventing 60-120Hz recomposition of the entire PlayerControls tree during seeks.
+    val scrubPreviewState = remember(track.id) { mutableStateOf<Long?>(null) }
 
     fun jumpCue(delta: Int) {
         if (cues.isEmpty() || shownTrack == null) return
-        val adjusted = (playback.currentPosition() - settings.subtitleOffsetMs).coerceAtLeast(0L)
+        val adjusted = (playback.currentPosition() - trackOffsetMs).coerceAtLeast(0L)
         val current = SubtitleTimeline.anchor(cues, adjusted)
         val target = (current + delta).coerceIn(0, cues.lastIndex)
         onDirectSeekCue(cues[target])
@@ -1607,6 +1968,7 @@ private fun PlayerControls(
                     preferredId = preferredScriptId,
                     graph = graph,
                     encoding = settings.textEncoding,
+                    fontSizeSp = settings.subtitleSize,
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                 )
             coverFocusMode ->
@@ -1626,18 +1988,29 @@ private fun PlayerControls(
                     track = track,
                     activeTrackId = state.trackId,
                     cues = cues,
+                    displayCues = displayCues,
                     loading = loading,
                     subtitleError = subtitleError,
                     embeddedSubtitle = embeddedSubtitle,
                     settings = settings,
+                    trackOffsetMs = trackOffsetMs,
                     fallbackPosition = fallbackPosition,
-                    scrubPreviewMs = scrubPreviewMs,
+                    scrubPreviewState = scrubPreviewState,
                     followSignal = followSignal,
                     playback = playback,
                     onDirectSeek = onDirectSeekCue,
                     onLongPress = onLongPressSubtitle,
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                 )
+        }
+        if (state.failed) {
+            val info = state.errorInfo ?: PlaybackErrorInfo("播放失败，请检查文件授权或网络连接")
+            PlayerErrorBanner(
+                errorInfo = info,
+                refreshingSource = refreshingSource,
+                onRetry = playback::retryPlayback,
+                onRefreshSource = onRefreshOnlineWork,
+            )
         }
         if (inlineAbBar || lastClearedLoop != null) {
             InlineAbLoopBar(
@@ -1652,10 +2025,14 @@ private fun PlayerControls(
         } else {
             ActiveModifiersRow(
                 state = state,
+                settings = settings,
+                trackOffsetMs = trackOffsetMs,
                 markA = markA,
                 onOpenPreferences = onOpenPreferences,
+                onOpenSubtitleTune = onOpenSubtitleTune,
                 onOpenTimer = onOpenTimer,
                 onToggleInlineAb = onToggleInlineAb,
+                onToggleShuffle = playback::toggleShuffle,
             )
         }
         PlayerTimeline(
@@ -1666,8 +2043,9 @@ private fun PlayerControls(
             fallbackPosition = fallbackPosition,
             playback = playback,
             cues = cues,
-            subtitleOffsetMs = settings.subtitleOffsetMs,
-            onScrubPreview = { scrubPreviewMs = it },
+            bookmarks = trackBookmarks,
+            subtitleOffsetMs = trackOffsetMs,
+            onScrubPreview = { scrubPreviewState.value = it },
         )
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp),
@@ -1699,10 +2077,12 @@ private fun PlayerControls(
                     ),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    rewindIconFor(settings.skipSeconds),
-                    stringResource(R.string.action_rewind_seconds, settings.skipSeconds),
+                SkipSecondsIcon(
+                    seconds = settings.skipSeconds,
+                    forward = false,
                     tint = if (shownTrack != null) Cream else Cream.copy(alpha = 0.35f),
+                    contentDescription =
+                        stringResource(R.string.action_rewind_seconds, settings.skipSeconds),
                 )
             }
             Box(contentAlignment = Alignment.Center) {
@@ -1770,7 +2150,7 @@ private fun PlayerControls(
                         )
                     }
                 }
-                if (state.buffering) {
+                if (state.buffering || opening != null) {
                     CircularProgressIndicator(
                         Modifier.size(70.dp),
                         color = Rose,
@@ -1797,10 +2177,12 @@ private fun PlayerControls(
                     ),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    forwardIconFor(settings.skipSeconds),
-                    stringResource(R.string.action_forward_seconds, settings.skipSeconds),
+                SkipSecondsIcon(
+                    seconds = settings.skipSeconds,
+                    forward = true,
                     tint = if (shownTrack != null) Cream else Cream.copy(alpha = 0.35f),
+                    contentDescription =
+                        stringResource(R.string.action_forward_seconds, settings.skipSeconds),
                 )
             }
             IconAction(
@@ -1819,7 +2201,7 @@ private fun PlayerControls(
             IconAction(
                 Icons.AutoMirrored.Outlined.QueueMusic,
                 stringResource(R.string.action_queue),
-                Muted,
+                if (state.shuffleEnabled) Rose else Muted,
                 enabled = opening == null && hasQueue,
                 haptic = HapticKind.Tick,
                 action = onOpenQueue,
@@ -1849,7 +2231,7 @@ private fun PlayerControls(
             IconAction(
                 Icons.Outlined.MoreHoriz,
                 stringResource(R.string.action_more_playback),
-                if (abs(state.speed - 1f) > 0.01f) Rose else Muted,
+                if (abs(state.speed - 1f) > 0.01f || settings.hasDspEffects) Rose else Muted,
                 haptic = HapticKind.Tick,
                 action = onOpenMore,
             )
@@ -1860,7 +2242,7 @@ private fun PlayerControls(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SubtitlePane(
-    cues: List<Cue>,
+    cues: List<DisplayCue>,
     loading: Boolean,
     error: String?,
     anchor: Int,
@@ -1943,7 +2325,7 @@ private fun SubtitlePane(
                             tween(if (reduced) 0 else 160),
                             label = "subtitle-bg",
                         )
-                    Box(
+                    Column(
                         Modifier.fillMaxWidth()
                             .clip(cueShape)
                             .drawBehind {
@@ -1953,11 +2335,12 @@ private fun SubtitlePane(
                             .combinedClickable(
                                 hapticFeedbackEnabled = LocalTouchFeedback.current,
                                 onClickLabel = "跳转到这句",
-                                onClick = { onDirectSeek(cue) },
+                                onClick = { onDirectSeek(cue.toCue()) },
                                 onLongClickLabel = "字幕操作",
-                                onLongClick = { onLongPress(cue) },
+                                onLongClick = { onLongPress(cue.toCue()) },
                             )
                             .padding(horizontal = 12.dp, vertical = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         Text(
                             cue.text,
@@ -1967,6 +2350,16 @@ private fun SubtitlePane(
                             textAlign = TextAlign.Center,
                             modifier = Modifier.fillMaxWidth().testTag("subtitle-$index"),
                         )
+                        if (!cue.secondaryText.isNullOrBlank()) {
+                            Text(
+                                cue.secondaryText,
+                                color = color.copy(alpha = if (isActive) 0.78f else 0.56f),
+                                fontSize = (size - 4).coerceAtLeast(13).sp,
+                                lineHeight = (size + 3).sp,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth().padding(top = 3.dp),
+                            )
+                        }
                     }
                 }
             }

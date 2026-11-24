@@ -69,7 +69,14 @@ class PlaybackCoordinator(
     private val playerListener =
         object : Player.Listener {
             override fun onEvents(player: Player, events: Player.Events) {
-                refreshFromPlayer(player)
+                val queueChanged =
+                    events.containsAny(
+                        Player.EVENT_TIMELINE_CHANGED,
+                        Player.EVENT_SHUFFLE_MODE_ENABLED_CHANGED,
+                        Player.EVENT_MEDIA_ITEM_TRANSITION,
+                        Player.EVENT_PLAYLIST_METADATA_CHANGED,
+                    )
+                refreshFromPlayer(player, queueDirty = queueChanged)
             }
 
             override fun onCues(cueGroup: CueGroup) {
@@ -79,6 +86,22 @@ class PlaybackCoordinator(
                         .joinToString("\n")
             }
         }
+
+    private var activeErrorInfo: PlaybackErrorInfo? = null
+
+    internal fun setPlaybackError(info: PlaybackErrorInfo) {
+        activeErrorInfo = info
+        activePlayer?.let { refreshFromPlayer(it, queueDirty = false) }
+    }
+
+    internal fun clearPlaybackError() {
+        if (activeErrorInfo != null) {
+            activeErrorInfo = null
+            activePlayer?.let { refreshFromPlayer(it, queueDirty = false) }
+        }
+    }
+
+    fun isVideoOutputActive(): Boolean = videoOwners.isNotEmpty() && !audioOnly.value
 
     internal fun attach(
         player: ExoPlayer,
@@ -116,6 +139,7 @@ class PlaybackCoordinator(
         textToggle = null
         playerFlow.value = null
         queueSnapshot.clear()
+        activeErrorInfo = null
         state.value = PlaybackState()
         positionMs.value = 0L
         bufferedMs.value = 0L
@@ -127,11 +151,11 @@ class PlaybackCoordinator(
     }
 
     internal fun onControllerStateChanged() {
-        activePlayer?.let(::refreshFromPlayer)
+        activePlayer?.let { refreshFromPlayer(it, queueDirty = false) }
     }
 
     fun refreshPlayer() {
-        activePlayer?.let(::refreshFromPlayer)
+        activePlayer?.let { refreshFromPlayer(it) }
         subtitles.ensureLoaded()
     }
 
@@ -196,7 +220,7 @@ class PlaybackCoordinator(
             .collectLatest { (active, hasSubtitles) ->
                 syncTimelineOnce()
                 if (!active) return@collectLatest
-                val intervalMs = if (hasSubtitles) 150L else 350L
+                val intervalMs = if (hasSubtitles) 100L else 180L
                 while (currentCoroutineContext().isActive) {
                     delay(intervalMs)
                     syncTimelineOnce()
@@ -263,32 +287,54 @@ class PlaybackCoordinator(
                     }
                 val selectedTrack = ordered[resume.index]
                 openingTrackId.value = selectedTrack.id
-                val player = ensurePlayer()
-                val currentId = player.currentMediaItem?.mediaId
-                val currentQueueIds =
-                    (0 until player.mediaItemCount).map {
-                        player.getMediaItemAt(it).mediaId
+                // Parallelize service binding and batch URI resolution to slash cold-start latency.
+                val (player, prebuiltItems) =
+                    coroutineScope {
+                        val playerDeferred = async { ensurePlayer() }
+                        val itemsDeferred =
+                            async(Dispatchers.IO) { mediaItems(ordered, detail.work) }
+                        val resolvedPlayer = playerDeferred.await()
+                        val currentId = resolvedPlayer.currentMediaItem?.mediaId
+                        val currentQueueIds =
+                            (0 until resolvedPlayer.mediaItemCount).map {
+                                resolvedPlayer.getMediaItemAt(it).mediaId
+                            }
+                        val targetIds = ordered.map { it.id }
+                        val continuingSame =
+                            !restart &&
+                                !shuffle &&
+                                startPosition == null &&
+                                currentId == selectedTrack.id
+                        if (continuingSame && currentQueueIds == targetIds) {
+                            itemsDeferred.cancel()
+                            resolvedPlayer to null
+                        } else {
+                            resolvedPlayer to itemsDeferred.await()
+                        }
                     }
-                val targetIds = ordered.map { it.id }
+                val currentId = player.currentMediaItem?.mediaId
                 val continuingSame =
                     !restart && !shuffle && startPosition == null && currentId == selectedTrack.id
                 if (continuingSame) subtitles.retry(selectedTrack.id)
-                if (continuingSame && currentQueueIds == targetIds) {
+                if (continuingSame && prebuiltItems == null) {
                     queueSnapshot.clear()
                     ordered.forEach { queueSnapshot[it.id] = it }
                     player.shuffleModeEnabled = false
                     if (player.playbackState == Player.STATE_ENDED) player.seekTo(resume.index, 0)
                     if (player.playbackState == Player.STATE_IDLE) player.prepare()
                     if (pendingStartPlaying) player.play() else player.pause()
-                    refreshFromPlayer(player)
+                    refreshFromPlayer(player, queueDirty = true)
                     return@launch
                 }
                 val resumePosition =
                     if (continuingSame) player.currentPosition.coerceAtLeast(0L)
                     else resume.positionMs
-                val items = withContext(Dispatchers.IO) { mediaItems(ordered, detail.work) }
+                val items =
+                    prebuiltItems
+                        ?: withContext(Dispatchers.IO) { mediaItems(ordered, detail.work) }
                 queueSnapshot.clear()
                 ordered.forEach { queueSnapshot[it.id] = it }
+                activeErrorInfo = null
                 if (shuffle && shuffledIndices != null) {
                     player.setMediaItems(items, shuffledIndices[0], 0L)
                     player.setShuffleOrder(
@@ -301,7 +347,7 @@ class PlaybackCoordinator(
                 }
                 player.prepare()
                 if (pendingStartPlaying) player.play() else player.pause()
-                refreshFromPlayer(player)
+                refreshFromPlayer(player, queueDirty = true)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -347,6 +393,7 @@ class PlaybackCoordinator(
         if (player.playWhenReady) {
             player.pause()
         } else {
+            activeErrorInfo = null
             if (player.playbackState == Player.STATE_ENDED) player.seekTo(0, 0)
             if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
                 player.prepare()
@@ -389,6 +436,67 @@ class PlaybackCoordinator(
         player.seekTo(index, 0L)
         if (player.playbackState == Player.STATE_IDLE) player.prepare()
         player.play()
+    }
+
+    fun retryPlayback() {
+        val player = activePlayer ?: return
+        if (player.mediaItemCount == 0) return
+        activeErrorInfo = null
+        player.prepare()
+        player.play()
+        refreshFromPlayer(player, queueDirty = false)
+    }
+
+    fun toggleShuffle() {
+        val player = activePlayer ?: return
+        if (player.mediaItemCount <= 1) return
+        val next = !player.shuffleModeEnabled
+        if (next) {
+            val currentIdx = player.currentMediaItemIndex.coerceIn(0, player.mediaItemCount - 1)
+            val rest = (0 until player.mediaItemCount).filter { it != currentIdx }.shuffled()
+            val indices = (listOf(currentIdx) + rest).toIntArray()
+            player.setShuffleOrder(ShuffleOrder.DefaultShuffleOrder(indices, Random.nextLong()))
+        }
+        player.shuffleModeEnabled = next
+        refreshFromPlayer(player, queueDirty = true)
+    }
+
+    fun moveQueuedTrack(trackId: String, delta: Int) {
+        val player = activePlayer ?: return
+        if (player.shuffleModeEnabled || player.mediaItemCount <= 1) return
+        val fromIndex =
+            (0 until player.mediaItemCount).firstOrNull {
+                player.getMediaItemAt(it).mediaId == trackId
+            } ?: return
+        val toIndex = (fromIndex + delta).coerceIn(0, player.mediaItemCount - 1)
+        if (fromIndex == toIndex) return
+        player.moveMediaItem(fromIndex, toIndex)
+        refreshFromPlayer(player, queueDirty = true)
+    }
+
+    /**
+     * Temporarily applies a playback speed (e.g. fullscreen 2x long-press) without overwriting
+     * preferences.
+     */
+    fun setTemporarySpeed(speed: Float) {
+        activePlayer?.setPlaybackSpeed(speed.coerceIn(0.5f, 3.0f))
+    }
+
+    fun restoreConfiguredSpeed() {
+        activePlayer?.setPlaybackSpeed(settings.settings.value.playbackSpeed.coerceIn(0.5f, 2.0f))
+    }
+
+    fun jumpToTimerStartAnchor() {
+        val anchor = activeTimer?.lastStartAnchor ?: return
+        val player = activePlayer ?: return
+        val index =
+            (0 until player.mediaItemCount).firstOrNull {
+                player.getMediaItemAt(it).mediaId == anchor.trackId
+            }
+        if (index != null) {
+            player.seekTo(index, anchor.positionMs)
+            activeTimer?.clearStartAnchor()
+        }
     }
 
     fun setPlaybackSpeed(speed: Float) {
@@ -435,14 +543,40 @@ class PlaybackCoordinator(
         loopDraftStart.value = clamped
     }
 
-    fun adjustLoop(deltaStartMs: Long = 0L, deltaEndMs: Long = 0L) {
+    fun adjustLoop(deltaStartMs: Long = 0L, deltaEndMs: Long = 0L, preview: Boolean = false) {
         val loop = activeLoop ?: return
+        val player = activePlayer ?: return
+        val duration = player.duration.takeIf { it > 0L }
         if (loop.active) {
-            val nextStart = (loop.startMs + deltaStartMs).coerceAtLeast(0L)
-            val nextEnd = (loop.endMs + deltaEndMs).coerceAtLeast(nextStart + 500L)
-            loop.set(nextStart, nextEnd)
+            val minSpan = 500L
+            val maxEnd = duration ?: Long.MAX_VALUE
+            var nextStart = loop.startMs
+            var nextEnd = loop.endMs.coerceAtMost(maxEnd)
+            if (deltaStartMs != 0L) {
+                val upperStart = (nextEnd - minSpan).coerceAtLeast(0L)
+                nextStart = (loop.startMs + deltaStartMs).coerceIn(0L, upperStart)
+            }
+            if (deltaEndMs != 0L) {
+                val lowerEnd = (nextStart + minSpan).coerceAtMost(maxEnd)
+                nextEnd = (loop.endMs + deltaEndMs).coerceIn(lowerEnd, maxEnd)
+            }
+            if (nextEnd - nextStart >= minSpan) {
+                loop.set(nextStart, nextEnd)
+                if (preview) {
+                    val previewTarget =
+                        if (deltaEndMs != 0L && deltaStartMs == 0L) {
+                            (nextEnd - 1_500L).coerceAtLeast(nextStart)
+                        } else {
+                            nextStart
+                        }
+                    player.seekTo(previewTarget)
+                }
+            }
         } else if (loopDraftStart.value >= 0L && deltaStartMs != 0L) {
-            loopDraftStart.value = (loopDraftStart.value + deltaStartMs).coerceAtLeast(0L)
+            val upper = duration ?: Long.MAX_VALUE
+            val next = (loopDraftStart.value + deltaStartMs).coerceIn(0L, upper)
+            loopDraftStart.value = next
+            if (preview) player.seekTo(next)
         }
     }
 
@@ -550,12 +684,25 @@ class PlaybackCoordinator(
         return buildMediaItem(track, work, hide, artwork)
     }
 
-    /** Builds a queue sharing a single hideArtwork preference lookup & cover thumbnail encode. */
+    /**
+     * Builds a queue sharing a single hideArtwork preference lookup, batch URI resolution & cover
+     * encode.
+     */
     suspend fun mediaItems(tracks: List<TrackEntity>, work: WorkEntity): List<MediaItem> {
         if (tracks.isEmpty()) return emptyList()
         val hide = settings.settingsUpdates.first().hideArtwork
         val artwork = if (hide) null else images.thumbnailBytes(work.coverId)
-        return tracks.map { buildMediaItem(it, work, hide, artwork) }
+        val uris = library.resolveTrackUris(tracks, work)
+        return tracks.map { track ->
+            val uri = uris[track.id] ?: library.resolveTrackUri(track, work)
+            MediaItem.Builder()
+                .setMediaId(track.id)
+                .setUri(uri.toUri())
+                .setMimeType(MediaFormats.videoMimeType(track.fileName))
+                .setCustomCacheKey(track.id)
+                .setMediaMetadata(mediaMetadata(track, work, hide, artwork))
+                .build()
+        }
     }
 
     private suspend fun buildMediaItem(
@@ -579,7 +726,7 @@ class PlaybackCoordinator(
         messages.tryEmit(message)
     }
 
-    private fun refreshFromPlayer(player: Player) {
+    private fun refreshFromPlayer(player: Player, queueDirty: Boolean = true) {
         val item = player.currentMediaItem
         val trackId = item?.mediaId
         val previousTrackId = state.value.trackId
@@ -588,8 +735,18 @@ class PlaybackCoordinator(
             loopDraftStart.value = -1L
             subtitles.load(trackId)
         }
-        val orderedIndices = orderedQueueIndices(player)
-        val queueIds = orderedIndices.map { player.getMediaItemAt(it).mediaId }
+        val queueIds =
+            if (queueDirty || state.value.queueIds.size != player.mediaItemCount) {
+                orderedQueueIndices(player).map { player.getMediaItemAt(it).mediaId }
+            } else {
+                state.value.queueIds
+            }
+        if (trackId != previousTrackId && trackId != null) {
+            val currentPosInQueue = queueIds.indexOf(trackId)
+            val nextTrackId =
+                if (currentPosInQueue >= 0) queueIds.getOrNull(currentPosInQueue + 1) else null
+            subtitles.prefetch(nextTrackId)
+        }
         val duration = player.duration.takeIf { it > 0 } ?: 0L
         val pos = player.currentPosition.coerceAtLeast(0L)
         if (positionMs.value != pos) positionMs.value = pos
@@ -618,6 +775,7 @@ class PlaybackCoordinator(
                 16f / 9f
             }
 
+        val errorInfo = if (player.playerError != null) activeErrorInfo else null
         val nextState =
             PlaybackState(
                 trackId = trackId,
@@ -627,6 +785,7 @@ class PlaybackCoordinator(
                 buffering = player.playbackState == Player.STATE_BUFFERING,
                 timerEnd = activeTimer?.deadlineMs ?: 0L,
                 timerStopAfterTrack = activeTimer?.stopAfterTrack == true,
+                timerStartAnchor = activeTimer?.lastStartAnchor,
                 loopStart = activeLoop?.startMs ?: -1L,
                 loopEnd = activeLoop?.endMs ?: -1L,
                 playWhenReady = player.playWhenReady,
@@ -634,12 +793,14 @@ class PlaybackCoordinator(
                 hasNext = player.hasNextMediaItem(),
                 ended = player.playbackState == Player.STATE_ENDED,
                 failed = player.playerError != null,
+                errorInfo = errorInfo,
                 queueIds = queueIds,
                 hasVideo = hasVideo,
                 videoAspectRatio = aspectRatio,
                 tracksKnown = tracksKnown,
                 speed = player.playbackParameters.speed,
                 repeatMode = player.repeatMode,
+                shuffleEnabled = player.shuffleModeEnabled,
             )
         lastClearedLoop.value = activeLoop?.lastClearedBySeek
         val prev = state.value
@@ -650,6 +811,7 @@ class PlaybackCoordinator(
                 prev.buffering == nextState.buffering &&
                 prev.timerEnd == nextState.timerEnd &&
                 prev.timerStopAfterTrack == nextState.timerStopAfterTrack &&
+                prev.timerStartAnchor == nextState.timerStartAnchor &&
                 prev.loopStart == nextState.loopStart &&
                 prev.loopEnd == nextState.loopEnd &&
                 prev.playWhenReady == nextState.playWhenReady &&
@@ -657,14 +819,18 @@ class PlaybackCoordinator(
                 prev.hasNext == nextState.hasNext &&
                 prev.ended == nextState.ended &&
                 prev.failed == nextState.failed &&
+                prev.errorInfo == nextState.errorInfo &&
                 prev.queueIds == nextState.queueIds &&
                 prev.hasVideo == nextState.hasVideo &&
                 prev.videoAspectRatio == nextState.videoAspectRatio &&
                 prev.tracksKnown == nextState.tracksKnown &&
                 prev.speed == nextState.speed &&
-                prev.repeatMode == nextState.repeatMode
+                prev.repeatMode == nextState.repeatMode &&
+                prev.shuffleEnabled == nextState.shuffleEnabled
         if (!sameDiscrete) state.value = nextState
-        reconcileQueueTracks(player, queueIds)
+        if (queueDirty || queueTracks.value.size != queueIds.size) {
+            reconcileQueueTracks(player, queueIds)
+        }
     }
 
     private fun reconcileQueueTracks(player: Player, queueIds: List<String>) {

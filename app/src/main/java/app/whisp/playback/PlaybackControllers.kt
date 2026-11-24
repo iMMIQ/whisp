@@ -11,13 +11,20 @@ import android.os.Build
 import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionParameters.AudioOffloadPreferences
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.PlayerMessage
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import app.whisp.data.DlsiteLoginRequired
+import java.io.FileNotFoundException
+import java.io.IOException
 import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -25,7 +32,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-/** DSP audio offload policy: enabled overnight, disabled only when precise AP deadlines exist. */
+/**
+ * DSP audio offload policy: enabled overnight, disabled only when precise AP deadlines or DSP
+ * effects exist.
+ */
 @androidx.annotation.OptIn(UnstableApi::class)
 object AudioOffload {
     fun supported(sdkInt: Int): Boolean = sdkInt >= 29
@@ -43,17 +53,146 @@ object AudioOffload {
                 .build()
         else AudioOffloadPreferences.DEFAULT
 
-    fun needsPreciseDeadline(loopStart: Long, loopEnd: Long, timerEnd: Long): Boolean =
-        (loopStart >= 0 && loopEnd > loopStart) || timerEnd > 0
+    fun needsPreciseDeadline(
+        loopStart: Long,
+        loopEnd: Long,
+        timerEnd: Long,
+        dspEffectsActive: Boolean = false,
+    ): Boolean = (loopStart >= 0 && loopEnd > loopStart) || timerEnd > 0 || dspEffectsActive
 
-    internal fun apply(player: ExoPlayer, loop: AbLoopController, timer: SleepTimerController) {
+    internal fun apply(
+        player: ExoPlayer,
+        loop: AbLoopController,
+        timer: SleepTimerController,
+        dspEffectsActive: Boolean = false,
+        gaplessRequired: Boolean = false,
+    ) {
         if (!supported(Build.VERSION.SDK_INT)) return
         val speedChanged = abs(player.playbackParameters.speed - 1f) > 0.01f
-        val enabled = !needsPreciseDeadline(loop.startMs, loop.endMs, timer.handlerDeadlineMs)
-        val desired = preferences(enabled, speedChanged)
+        val enabled =
+            !needsPreciseDeadline(
+                loop.startMs,
+                loop.endMs,
+                timer.handlerDeadlineMs,
+                dspEffectsActive,
+            )
+        val desired = preferences(enabled, speedChanged, gaplessRequired)
         if (player.trackSelectionParameters.audioOffloadPreferences == desired) return
         player.trackSelectionParameters =
             player.trackSelectionParameters.buildUpon().setAudioOffloadPreferences(desired).build()
+    }
+}
+
+/**
+ * Network-resilient retry policy: allows 5 retries with smooth backoff for transient Wi-Fi/cellular
+ * handoffs while failing fast on unrecoverable auth/404 errors.
+ */
+@androidx.annotation.OptIn(UnstableApi::class)
+internal class WhispLoadErrorHandlingPolicy : DefaultLoadErrorHandlingPolicy(5) {
+    override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+        val cause = loadErrorInfo.exception
+        val unrecoverable =
+            generateSequence<Throwable>(cause) { it.cause }
+                .any { err ->
+                    err is DlsiteLoginRequired ||
+                        err is FileNotFoundException ||
+                        (err is HttpDataSource.InvalidResponseCodeException &&
+                            err.responseCode in setOf(401, 403, 404, 410))
+                }
+        if (unrecoverable) return androidx.media3.common.C.TIME_UNSET
+        return super.getRetryDelayMsFor(loadErrorInfo)
+    }
+}
+
+data class PlaybackErrorInfo(
+    val message: String,
+    val canRetry: Boolean = true,
+    val canRefreshSource: Boolean = false,
+    val requiresDlsiteLogin: Boolean = false,
+)
+
+internal object PlaybackErrorFormatter {
+    fun describe(error: PlaybackException, uriScheme: String? = null): PlaybackErrorInfo {
+        val chain = generateSequence<Throwable>(error) { it.cause }.toList()
+        if (chain.any { it is DlsiteLoginRequired }) {
+            return PlaybackErrorInfo(
+                message = "DLsite 登录已过期，请在来源页重新登录",
+                canRetry = false,
+                requiresDlsiteLogin = true,
+            )
+        }
+        val httpError =
+            chain.filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()
+        if (httpError != null) {
+            val code = httpError.responseCode
+            val isAsmr = uriScheme == "whisp-asmr"
+            return when (code) {
+                401,
+                403,
+                410 ->
+                    PlaybackErrorInfo(
+                        message =
+                            if (isAsmr) "在线音频链接已失效（HTTP $code），可尝试刷新作品地址"
+                            else "资源访问被拒绝（HTTP $code），请检查来源凭据",
+                        canRetry = true,
+                        canRefreshSource = isAsmr,
+                    )
+                404 ->
+                    PlaybackErrorInfo(
+                        message = "音频文件不存在（HTTP 404），请重新扫描来源",
+                        canRetry = true,
+                        canRefreshSource = isAsmr,
+                    )
+                in 500..599 ->
+                    PlaybackErrorInfo(
+                        message = "服务器暂时不可用（HTTP $code），请稍后重试",
+                        canRetry = true,
+                    )
+                else ->
+                    PlaybackErrorInfo(
+                        message = "网络请求失败（HTTP $code），请检查连接后重试",
+                        canRetry = true,
+                    )
+            }
+        }
+        if (
+            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED
+        ) {
+            return PlaybackErrorInfo(
+                message = "当前设备不支持此音频或视频编码格式",
+                canRetry = false,
+            )
+        }
+        if (
+            error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ||
+                chain.any { it is FileNotFoundException }
+        ) {
+            return PlaybackErrorInfo(
+                message = "音轨文件已移动或删除，请检查文件授权或重新扫描",
+                canRetry = true,
+            )
+        }
+        val specificMessage =
+            chain.filterIsInstance<IOException>().firstNotNullOfOrNull { io ->
+                io.message?.takeIf {
+                    it.startsWith("SMB：") || it.startsWith("NFS：") || it.startsWith("DLsite")
+                }
+            }
+        if (specificMessage != null) {
+            return PlaybackErrorInfo(message = specificMessage, canRetry = true)
+        }
+        if (
+            error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ||
+                chain.any { it is java.net.SocketTimeoutException }
+        ) {
+            return PlaybackErrorInfo(message = "连接超时，请检查网络或 NAS 状态后重试", canRetry = true)
+        }
+        if (error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED) {
+            return PlaybackErrorInfo(message = "网络连接中断，请检查网络后点击重试", canRetry = true)
+        }
+        return PlaybackErrorInfo(message = "播放失败，请检查文件授权或网络连接", canRetry = true)
     }
 }
 
@@ -124,9 +263,11 @@ data class LoopState(val startMs: Long, val endMs: Long) {
     }
 }
 
+data class TimerStartAnchor(val trackId: String, val positionMs: Long)
+
 /**
- * AlarmManager-backed sleep timer with coroutine fallback. Using AlarmManager keeps DSP audio
- * offload enabled overnight until the AP wakes to pause playback.
+ * AlarmManager-backed sleep timer with coroutine fallback, perceptual quadratic fade-out curve,
+ * deferred volume restoration (preventing post-pause burst), and sleep-start position anchor.
  */
 internal class SleepTimerController(
     private val context: Context,
@@ -135,11 +276,19 @@ internal class SleepTimerController(
     private val onChanged: () -> Unit,
     private val getVolume: () -> Float = { 1f },
     private val setVolume: (Float) -> Unit = {},
+    private val captureStartAnchor: () -> TimerStartAnchor? = { null },
 ) {
     companion object {
         private const val SLEEP_ALARM_REQUEST_CODE = 1702
-        private const val FADE_LEAD_MS = 12_000L
+        private const val DOZE_WAKE_MARGIN_MS = 3_000L
+
+        internal fun perceptualFadeFactor(linearFraction: Float): Float {
+            val clamped = linearFraction.coerceIn(0f, 1f)
+            return clamped * clamped
+        }
     }
+
+    var fadeDurationMs: Long = 15_000L
 
     var deadlineMs: Long = 0L
         private set
@@ -153,6 +302,9 @@ internal class SleepTimerController(
     var fading: Boolean = false
         private set
 
+    var lastStartAnchor: TimerStartAnchor? = null
+        private set
+
     val handlerDeadlineMs: Long
         get() = if (handledByAlarm && !fading) 0L else deadlineMs
 
@@ -160,6 +312,7 @@ internal class SleepTimerController(
     private var fadeJob: Job? = null
     private var fadeWakeLock: PowerManager.WakeLock? = null
     private var savedVolume: Float? = null
+    private var pendingRestoreVolume: Float? = null
     private var receiverRegistered = false
     private val action = "${context.packageName}.ACTION_SLEEP_TIMER"
 
@@ -181,14 +334,31 @@ internal class SleepTimerController(
         receiverRegistered = true
     }
 
+    fun restorePendingVolumeIfNeeded() {
+        val pending = pendingRestoreVolume ?: return
+        pendingRestoreVolume = null
+        if (!fading) setVolume(pending)
+    }
+
+    fun clearStartAnchor() {
+        if (lastStartAnchor != null) {
+            lastStartAnchor = null
+            onChanged()
+        }
+    }
+
     fun setMinutes(minutes: Int) {
         cancelFade(restoreVolume = true)
+        restorePendingVolumeIfNeeded()
         timerJob?.cancel()
         timerJob = null
         cancelAlarm()
         stopAfterTrack = false
         deadlineMs = SleepTimer.deadlineMs(SystemClock.elapsedRealtime(), minutes)
-        if (deadlineMs > 0L) scheduleCurrentDeadline()
+        if (deadlineMs > 0L) {
+            lastStartAnchor = captureStartAnchor() ?: lastStartAnchor
+            scheduleCurrentDeadline()
+        }
         onChanged()
     }
 
@@ -197,10 +367,12 @@ internal class SleepTimerController(
         val now = SystemClock.elapsedRealtime()
         val base = if (deadlineMs > now) deadlineMs else now
         cancelFade(restoreVolume = true)
+        restorePendingVolumeIfNeeded()
         timerJob?.cancel()
         timerJob = null
         cancelAlarm()
         stopAfterTrack = false
+        if (lastStartAnchor == null) lastStartAnchor = captureStartAnchor()
         deadlineMs = (base + deltaMinutes * 60_000L).coerceAtMost(now + 180 * 60_000L)
         scheduleCurrentDeadline()
         onChanged()
@@ -208,11 +380,13 @@ internal class SleepTimerController(
 
     fun setStopAfterTrack(enabled: Boolean) {
         cancelFade(restoreVolume = true)
+        restorePendingVolumeIfNeeded()
         timerJob?.cancel()
         timerJob = null
         cancelAlarm()
         deadlineMs = 0L
         stopAfterTrack = enabled
+        if (enabled) lastStartAnchor = captureStartAnchor() ?: lastStartAnchor
         onChanged()
     }
 
@@ -226,8 +400,11 @@ internal class SleepTimerController(
     private fun scheduleCurrentDeadline() {
         val now = SystemClock.elapsedRealtime()
         val remaining = deadlineMs - now
+        val fadeLead = fadeDurationMs.coerceIn(5_000L, 45_000L)
+        val wakeLead = fadeLead + DOZE_WAKE_MARGIN_MS
         val wakeAt =
-            if (remaining > FADE_LEAD_MS + 3_000L) deadlineMs - FADE_LEAD_MS else deadlineMs
+            if (remaining > wakeLead + 2_000L) deadlineMs - wakeLead
+            else deadlineMs - fadeLead.coerceAtMost(remaining / 2)
         val alarmManager = context.getSystemService(AlarmManager::class.java)
         val scheduled =
             alarmManager != null &&
@@ -259,6 +436,7 @@ internal class SleepTimerController(
             return
         }
         cancelFade(restoreVolume = true)
+        val fadeLead = fadeDurationMs.coerceIn(5_000L, 45_000L)
         val initialVolume = getVolume().coerceIn(0f, 1f)
         savedVolume = initialVolume
         fading = true
@@ -266,15 +444,18 @@ internal class SleepTimerController(
         onChanged()
         fadeJob = scope.launch {
             try {
-                val fadeSpan = remaining.toFloat().coerceAtLeast(1f)
+                // If Doze woke early due to safety margin, wait until the fade window starts.
+                val preFadeWait = remaining - fadeLead
+                if (preFadeWait > 200L) delay(preFadeWait)
+                val fadeSpan = (target - SystemClock.elapsedRealtime()).coerceAtLeast(1L).toFloat()
                 while (isActive) {
                     val left = target - SystemClock.elapsedRealtime()
                     if (left <= 0L) break
                     if (initialVolume > 0f) {
-                        val factor = (left / fadeSpan).coerceIn(0f, 1f)
+                        val factor = perceptualFadeFactor(left / fadeSpan)
                         setVolume(initialVolume * factor)
                     }
-                    delay(minOf(200L, left))
+                    delay(minOf(150L, left))
                 }
                 if (isActive && deadlineMs == target) expire()
             } finally {
@@ -293,7 +474,7 @@ internal class SleepTimerController(
             pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "${context.packageName}:sleep-fade")
                 .apply {
                     setReferenceCounted(false)
-                    acquire(timeoutMs.coerceIn(1_000L, FADE_LEAD_MS + 10_000L))
+                    acquire(timeoutMs.coerceIn(1_000L, 60_000L))
                 }
                 .also { fadeWakeLock = it }
         }
@@ -329,8 +510,11 @@ internal class SleepTimerController(
         cancelAlarm()
         deadlineMs = 0L
         stopAfterTrack = false
+        if (prev != null) setVolume(0f)
         onExpired()
-        if (prev != null) setVolume(prev)
+        // Defer volume restoration until AudioTrack fully drains / next playback starts to avoid
+        // tail clicks.
+        if (prev != null) pendingRestoreVolume = prev
         onChanged()
     }
 
@@ -349,6 +533,7 @@ internal class SleepTimerController(
 
     fun release() {
         cancelFade(restoreVolume = true)
+        restorePendingVolumeIfNeeded()
         timerJob?.cancel()
         timerJob = null
         cancelAlarm()

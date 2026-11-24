@@ -99,6 +99,7 @@ internal fun PrecisionSeekBar(
     onPreview: (Long?) -> Unit,
     onSeek: (Long) -> Unit,
     bufferedProvider: () -> Long = { 0L },
+    bookmarkPositions: List<Long> = emptyList(),
     onFineBounds: ((LongRange?) -> Unit)? = null,
     previewCaptionProvider: ((Long) -> String?)? = null,
     onScrubbingChange: ((Boolean) -> Unit)? = null,
@@ -370,6 +371,24 @@ internal fun PrecisionSeekBar(
                     trackStroke,
                     StrokeCap.Round,
                 )
+            }
+
+            // Bookmark markers on the track
+            if (bookmarkPositions.isNotEmpty() && duration > 0L) {
+                val markerHalfH = 4.5.dp.toPx()
+                val markerStroke = 1.6.dp.toPx()
+                bookmarkPositions.forEach { pos ->
+                    if (pos in start..end) {
+                        val bx = x(pos)
+                        drawLine(
+                            Cream.copy(alpha = 0.72f),
+                            Offset(bx, y - markerHalfH),
+                            Offset(bx, y + markerHalfH),
+                            markerStroke,
+                            StrokeCap.Round,
+                        )
+                    }
+                }
             }
 
             // A-B loop range and markers

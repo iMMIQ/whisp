@@ -26,6 +26,14 @@ object LibrarySort {
 
 val SupportedSkipSeconds = listOf(5, 10, 15, 30)
 
+val SupportedSleepFadeSeconds = listOf(12, 15, 30)
+
+@Serializable
+data class TrackSubtitleSelection(
+    val primaryId: String? = null,
+    val secondaryId: String? = null,
+)
+
 @Serializable
 data class Settings(
     val subtitleSize: Int = 21,
@@ -41,7 +49,19 @@ data class Settings(
     val amoledBlack: Boolean = false,
     val skipSeconds: Int = 10,
     val librarySort: String = LibrarySort.ADDED_DESC,
+    val swapChannels: Boolean = false,
+    val monoAudio: Boolean = false,
+    val nightDynamics: Boolean = false,
+    val volumeGain: Float = 1f,
+    val gaplessPriority: Boolean = false,
+    val softFadePause: Boolean = true,
+    val duckOnInterrupt: Boolean = true,
+    val smartResumeRewind: Boolean = true,
+    val sleepFadeSeconds: Int = 15,
 ) {
+    val hasDspEffects: Boolean
+        get() = swapChannels || monoAudio || nightDynamics
+
     fun normalized(): Settings =
         copy(
             subtitleSize = subtitleSize.coerceIn(16, 30),
@@ -53,12 +73,17 @@ data class Settings(
             skipSeconds = skipSeconds.takeIf { it in SupportedSkipSeconds } ?: 10,
             librarySort =
                 librarySort.takeIf { it in LibrarySort.supported } ?: LibrarySort.ADDED_DESC,
+            volumeGain = volumeGain.coerceIn(0.15f, 1f),
+            sleepFadeSeconds = sleepFadeSeconds.takeIf { it in SupportedSleepFadeSeconds } ?: 15,
         )
 }
 
 class SettingsStore(private val context: Context, scope: CoroutineScope) {
     private val settingsKey = stringPreferencesKey("settings-json")
     private val searchHistoryKey = stringPreferencesKey("asmr-search-history")
+    private val trackSubtitleOffsetsKey = stringPreferencesKey("track-subtitle-offsets")
+    private val trackSubtitleSelectionsKey = stringPreferencesKey("track-subtitle-selections")
+    private val trackPositionsKey = stringPreferencesKey("track-positions")
 
     private fun decode(prefs: Preferences): Settings {
         prefs[settingsKey]?.let { raw ->
@@ -93,6 +118,45 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
     val streamingCacheMiBUpdates: Flow<Int> =
         settingsUpdates.map { it.streamingCacheMiB }.distinctUntilChanged()
 
+    val trackSubtitleOffsets: StateFlow<Map<String, Long>> =
+        context.preferences.data
+            .map { prefs ->
+                runCatching {
+                        settingsJson.decodeFromString<Map<String, Long>>(
+                            prefs[trackSubtitleOffsetsKey] ?: "{}",
+                        )
+                    }
+                    .getOrDefault(emptyMap())
+            }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
+
+    val trackSubtitleSelections: StateFlow<Map<String, TrackSubtitleSelection>> =
+        context.preferences.data
+            .map { prefs ->
+                runCatching {
+                        settingsJson.decodeFromString<Map<String, TrackSubtitleSelection>>(
+                            prefs[trackSubtitleSelectionsKey] ?: "{}",
+                        )
+                    }
+                    .getOrDefault(emptyMap())
+            }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
+
+    val trackPositions: StateFlow<Map<String, Long>> =
+        context.preferences.data
+            .map { prefs ->
+                runCatching {
+                        settingsJson.decodeFromString<Map<String, Long>>(
+                            prefs[trackPositionsKey] ?: "{}",
+                        )
+                    }
+                    .getOrDefault(emptyMap())
+            }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
+
     val asmrSearchHistory: StateFlow<List<String>> =
         context.preferences.data
             .map { prefs ->
@@ -104,6 +168,78 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
                     .getOrDefault(emptyList())
             }
             .stateIn(scope, SharingStarted.Eagerly, emptyList())
+
+    fun subtitleOffsetFor(trackId: String?): Long {
+        if (trackId == null) return 0L
+        return trackSubtitleOffsets.value[trackId] ?: 0L
+    }
+
+    fun subtitleSelectionFor(trackId: String?): TrackSubtitleSelection? = trackId?.let {
+        trackSubtitleSelections.value[it]
+    }
+
+    fun savedTrackPosition(trackId: String?): Long = trackId?.let { trackPositions.value[it] } ?: 0L
+
+    suspend fun setTrackSubtitleOffset(trackId: String, offsetMs: Long) {
+        val clamped = offsetMs.coerceIn(-10_000L, 10_000L)
+        context.preferences.edit { prefs ->
+            val current = runCatching {
+                settingsJson.decodeFromString<LinkedHashMap<String, Long>>(
+                    prefs[trackSubtitleOffsetsKey] ?: "{}",
+                )
+            }
+                .getOrDefault(LinkedHashMap())
+            current.remove(trackId)
+            if (clamped != 0L) current[trackId] = clamped
+            while (current.size > 200) {
+                val eldest = current.entries.iterator().next().key
+                current.remove(eldest)
+            }
+            prefs[trackSubtitleOffsetsKey] = settingsJson.encodeToString<Map<String, Long>>(current)
+        }
+    }
+
+    suspend fun setTrackSubtitleSelection(trackId: String, selection: TrackSubtitleSelection?) {
+        context.preferences.edit { prefs ->
+            val current = runCatching {
+                settingsJson.decodeFromString<LinkedHashMap<String, TrackSubtitleSelection>>(
+                    prefs[trackSubtitleSelectionsKey] ?: "{}",
+                )
+            }
+                .getOrDefault(LinkedHashMap())
+            current.remove(trackId)
+            if (
+                selection != null && (selection.primaryId != null || selection.secondaryId != null)
+            ) {
+                current[trackId] = selection
+            }
+            while (current.size > 200) {
+                val eldest = current.entries.iterator().next().key
+                current.remove(eldest)
+            }
+            prefs[trackSubtitleSelectionsKey] =
+                settingsJson.encodeToString<Map<String, TrackSubtitleSelection>>(current)
+        }
+    }
+
+    suspend fun rememberTrackPosition(trackId: String, positionMs: Long) {
+        val clamped = positionMs.coerceAtLeast(0L)
+        context.preferences.edit { prefs ->
+            val current = runCatching {
+                settingsJson.decodeFromString<LinkedHashMap<String, Long>>(
+                    prefs[trackPositionsKey] ?: "{}",
+                )
+            }
+                .getOrDefault(LinkedHashMap())
+            current.remove(trackId)
+            if (clamped > 0L) current[trackId] = clamped
+            while (current.size > 300) {
+                val eldest = current.entries.iterator().next().key
+                current.remove(eldest)
+            }
+            prefs[trackPositionsKey] = settingsJson.encodeToString<Map<String, Long>>(current)
+        }
+    }
 
     suspend fun update(transform: (Settings) -> Settings) {
         context.preferences.edit { prefs ->
