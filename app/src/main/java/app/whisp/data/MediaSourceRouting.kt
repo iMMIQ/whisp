@@ -2,6 +2,8 @@
 package app.whisp.data
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSource
@@ -175,6 +177,8 @@ class MediaSourceRouting(
     private val downloadRefresh = Channel<Unit>(Channel.CONFLATED)
     private val activeDownloads = MutableStateFlow(false)
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     val downloadManager: DownloadManager by lazy {
         val executor =
             ThreadPoolExecutor(
@@ -185,51 +189,55 @@ class MediaSourceRouting(
                     LinkedBlockingQueue(),
                 )
                 .apply { allowCoreThreadTimeOut(true) }
-        DownloadManager(
+        val manager =
+            DownloadManager(
                 context,
                 mediaDatabase,
                 downloadCache,
                 networkFactory,
                 executor,
             )
-            .apply {
-                maxParallelDownloads = 2
-                requirements = Requirements(Requirements.DEVICE_STORAGE_NOT_LOW)
-                addListener(
-                    object : DownloadManager.Listener {
-                        override fun onInitialized(manager: DownloadManager) {
-                            downloadRefresh.trySend(Unit)
-                        }
+        val configure = {
+            manager.maxParallelDownloads = 2
+            manager.requirements = Requirements(Requirements.DEVICE_STORAGE_NOT_LOW)
+            manager.addListener(
+                object : DownloadManager.Listener {
+                    override fun onInitialized(manager: DownloadManager) {
+                        downloadRefresh.trySend(Unit)
+                    }
 
-                        override fun onDownloadChanged(
-                            manager: DownloadManager,
-                            download: Download,
-                            finalException: Exception?,
-                        ) {
-                            downloadRefresh.trySend(Unit)
-                            storageChanged()
-                            finalException?.let {
-                                messages.tryEmit(
-                                    if (
-                                        generateSequence<Throwable>(it) { cause -> cause.cause }
-                                            .any { cause -> cause is DlsiteLoginRequired }
-                                    )
-                                        "DLsite 登录已过期，请在来源页重新登录"
-                                    else "下载失败，可在来源页重试",
+                    override fun onDownloadChanged(
+                        manager: DownloadManager,
+                        download: Download,
+                        finalException: Exception?,
+                    ) {
+                        downloadRefresh.trySend(Unit)
+                        storageChanged()
+                        finalException?.let {
+                            messages.tryEmit(
+                                if (
+                                    generateSequence<Throwable>(it) { cause -> cause.cause }
+                                        .any { cause -> cause is DlsiteLoginRequired }
                                 )
-                            }
+                                    "DLsite 登录已过期，请在来源页重新登录"
+                                else "下载失败，可在来源页重试",
+                            )
                         }
+                    }
 
-                        override fun onDownloadRemoved(
-                            manager: DownloadManager,
-                            download: Download,
-                        ) {
-                            downloadRefresh.trySend(Unit)
-                            storageChanged()
-                        }
-                    },
-                )
-            }
+                    override fun onDownloadRemoved(
+                        manager: DownloadManager,
+                        download: Download,
+                    ) {
+                        downloadRefresh.trySend(Unit)
+                        storageChanged()
+                    }
+                },
+            )
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) configure()
+        else mainHandler.post(configure)
+        manager
     }
 
     init {
@@ -248,9 +256,11 @@ class MediaSourceRouting(
                 sampleDownloadProgress()
             }
         }
-        // Warm caches & DownloadManager off the main thread so Application.onCreate stays fast.
+        // Warm SimpleCaches off the main thread, then instantiate DownloadManager on Main Looper.
         scope.launch(Dispatchers.IO) {
-            downloadManager
+            downloadCache
+            streamingCache
+            withContext(Dispatchers.Main.immediate) { downloadManager }
             downloadRefresh.trySend(Unit)
         }
         scope.launch(Dispatchers.Main.immediate) {

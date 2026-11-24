@@ -383,8 +383,19 @@ internal fun SleepTimerDialog(
     onStopAfterTrack: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val remainingMin = SleepTimer.remainingMinutes(timerEnd, SystemClock.elapsedRealtime())
+    var nowElapsed by remember(timerEnd) { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(timerEnd) {
+        if (timerEnd <= 0L) return@LaunchedEffect
+        while (true) {
+            nowElapsed = SystemClock.elapsedRealtime()
+            val left = timerEnd - nowElapsed
+            if (left <= 0L) break
+            kotlinx.coroutines.delay(minOf(15_000L, left.coerceAtLeast(500L)))
+        }
+    }
+    val remainingMin = SleepTimer.remainingMinutes(timerEnd, nowElapsed)
     val hasActiveTimer = remainingMin > 0 || stopAfterTrack
+    var submitted by remember { mutableStateOf(false) }
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
         Column(
             Modifier.fillMaxWidth().padding(horizontal = 24.dp).navigationBarsPadding(),
@@ -484,6 +495,8 @@ internal fun SleepTimerDialog(
                         trackStopShape,
                     )
                     .clickable {
+                        if (submitted) return@clickable
+                        submitted = true
                         onStopAfterTrack(!stopAfterTrack)
                         haptics.confirm()
                         dismiss()
@@ -539,6 +552,7 @@ internal fun SaveBookmarkDialog(
     onDismiss: () -> Unit,
 ) {
     var title by remember(draft) { mutableStateOf(draft.title) }
+    var submitted by remember(draft) { mutableStateOf(false) }
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
         Column(
             Modifier.fillMaxWidth()
@@ -582,6 +596,8 @@ internal fun SaveBookmarkDialog(
                 }
                 Button(
                     onClick = {
+                        if (submitted) return@Button
+                        submitted = true
                         onSave(title)
                         haptics.confirm()
                         dismiss()
@@ -794,11 +810,14 @@ internal fun PreciseSeekDialog(
     onSeek: (Long) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val initial = remember(trackId) { initialPosition() }.coerceIn(0, duration.coerceAtLeast(0))
-    var target by remember(trackId) { mutableLongStateOf(initial) }
-    val start = remember(trackId) { (initial - 30_000).coerceAtLeast(0) }
+    val initial =
+        remember(trackId, duration) { initialPosition() }.coerceIn(0, duration.coerceAtLeast(0))
+    var target by remember(trackId, duration) { mutableLongStateOf(initial) }
+    val start = remember(trackId, duration) { (initial - 30_000).coerceAtLeast(0) }
     val end =
-        remember(trackId) { (initial + 30_000).coerceAtMost(duration).coerceAtLeast(start + 1) }
+        remember(trackId, duration) {
+            (initial + 30_000).coerceAtMost(duration).coerceAtLeast(start + 1)
+        }
     val haptics = rememberWhispHaptics()
     WhispSheet(onDismissRequest = onDismiss) { dismiss ->
         Column(

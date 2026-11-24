@@ -10,7 +10,7 @@
 ./gradlew :app:testDebugUnitTest :app:lintDebug
 ```
 
-默认测试覆盖索引、包装目录、跨来源身份、录音版本、字幕匹配、播放队列、精确定位、进度写入、循环调度、缓存、WebDAV 和 MP3 元数据。配置专用共享后，可通过 `WHISP_SMB_TEST_CONFIG` 启用真实 Samba 合同测试。
+默认测试覆盖索引、包装目录、跨来源身份、录音版本、字幕匹配、播放队列、精确定位、进度写入、循环状态、缓存、WebDAV、NFS、DLsite 与性能优化。配置专用共享后，可通过 `WHISP_SMB_TEST_CONFIG` 启用真实 Samba 合同测试。
 
 ## 生成媒体样本
 
@@ -99,7 +99,7 @@ WebDAV 测试在设备内启动带测试鉴权和 Range 的本机服务。网络
 
 `DlsiteAccountClientTest` 和 `DlsiteFileTreeTest` 使用合成目录与 MockWebServer，覆盖会话隔离、Cookie 路径和有效期、增量购买库、授权更新、字幕关联、目录层级及跨账号身份。
 
-`DlsiteLibraryIntegrationTest` 验证已购作品检索、详情与删除、退出账号后的购买库清理，以及诊断导出的字段和容量。`LibraryMigrationIntegrationTest` 验证已有数据库升级到版本 4 时保留标题、收藏、进度、书签和离线状态。
+`DlsiteLibraryIntegrationTest` 验证已购作品检索、详情与删除、退出账号后的购买库清理，以及诊断导出的字段和容量。`LibraryMigrationIntegrationTest` 验证已有数据库升级到版本 6 时保留标题、收藏、进度、书签和离线状态。
 
 `DlsiteAccountLiveIntegrationTest` 在隔离包的官方登录页完成登录后，通过 `-e probeDlsiteAccount true` 启用，验证已购作品、附带的时间轴字幕、原生播放、暂停、跳转、音轨下载和退出账号后的离线播放。测试完成后清理该测试作品和账号会话。常规测试套件跳过这项账号验证。
 
@@ -113,7 +113,7 @@ adb shell am instrument --user 0 -w -e class app.whisp.DlsiteLiveIntegrationTest
 
 ## 提交前检查
 
-`ScannedIdentityTest` 验证本地目录增删音轨后的身份连续性，以及版本差异、未知大小和多重匹配的保守处理。`RepositoryMutationIntegrationTest` 覆盖扫描与来源更新、作品编辑、离线删除、共享封面和下载清理之间的并发行为。
+`LibraryIndexerTest` 与 `StableIdTest` 验证目录索引与按来源路径生成的稳定身份连续性。`RepositoryMutationIntegrationTest` 覆盖扫描与来源更新、作品编辑、离线删除、共享封面和下载清理之间的并发行为。
 
 `PlaybackRegressionIntegrationTest` 验证继续播放、文件结尾 A–B 循环和部分离线队列。`PlaybackSubtitleRetryIntegrationTest` 与 `PlayerStateUiIntegrationTest` 验证字幕恢复和播放器实际队列；`SourceNavigationIntegrationTest` 与 `DlsiteLoginLifecycleIntegrationTest` 验证导航、编辑草稿和官方登录页重建。这些测试使用隔离包与合成数据。
 

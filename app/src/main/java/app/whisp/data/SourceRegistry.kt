@@ -21,7 +21,6 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.Credentials
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
-import okhttp3.Request
 
 /**
  * Single registry owning protocol clients (Local/SMB/NFS/WebDAV/ASMR.ONE/DLsite), DLsite account
@@ -146,12 +145,18 @@ class SourceRegistry(
             return mapOf("Referer" to "https://www.dlsite.com/")
         val sources = knownSources.ifEmpty { runBlocking(Dispatchers.IO) { dao.sources() } }
         val source =
-            sources.firstOrNull { source ->
-                source.kindType == SourceKind.WEBDAV &&
-                    (source.root.trimEnd('/') + "/").toHttpUrlOrNull()?.let {
-                        WebDavClient.insideRoot(url, it)
-                    } == true
-            } ?: return emptyMap()
+            sources
+                .asSequence()
+                .filter { it.kindType == SourceKind.WEBDAV }
+                .mapNotNull { candidate ->
+                    val root =
+                        (candidate.root.trimEnd('/') + "/").toHttpUrlOrNull()
+                            ?: return@mapNotNull null
+                    if (WebDavClient.insideRoot(url, root)) candidate to root.encodedPath.length
+                    else null
+                }
+                .maxByOrNull { it.second }
+                ?.first ?: return emptyMap()
         if (source.username.isBlank()) return emptyMap()
         return mapOf(
             "Authorization" to
@@ -160,21 +165,13 @@ class SourceRegistry(
     }
 
     suspend fun fetchDlsiteBytes(url: String, limit: Int = 16 * 1024 * 1024): ByteArray =
-        onlineHttp.onlineBytes(
-            Request.Builder().url(url).header("Referer", "https://www.dlsite.com/").build(),
-            limit,
-        )
+        dlsite.fetchBytes(url, limit)
 
     suspend fun streamDlsiteToSink(
         url: String,
         sink: okio.BufferedSink,
         limit: Int = 16 * 1024 * 1024,
-    ): Long =
-        onlineHttp.onlineCopyToSink(
-            Request.Builder().url(url).header("Referer", "https://www.dlsite.com/").build(),
-            sink,
-            limit,
-        )
+    ): Long = dlsite.copyToSink(url, sink, limit)
 
     suspend fun fetchCatalogBytes(
         url: String,
@@ -198,13 +195,15 @@ class SourceRegistry(
     }
 
     /**
-     * Resolves an online asset URI into playback scheme routing (whisp-asmr / whisp-dlsite / raw).
+     * Resolves an online/WebDAV asset URI into source-scoped scheme routing (whisp-asmr /
+     * whisp-dlsite / whisp-webdav / raw).
      */
     suspend fun routeUri(sourceId: String?, assetId: String, rawUri: String): String {
         if (sourceId == null || rawUri.isBlank()) throw IOException("文件已移动或来源已移除")
         return when (dao.source(sourceId)?.kindType) {
             SourceKind.ASMRONE -> "whisp-asmr://$sourceId/$assetId"
             SourceKind.DLSITE -> "whisp-dlsite://$sourceId/$assetId"
+            SourceKind.WEBDAV -> "whisp-webdav://$sourceId/$assetId"
             null -> throw IOException("来源已移除")
             else -> rawUri
         }
@@ -287,7 +286,31 @@ class SourceRegistry(
                 }
             "whisp-asmr" ->
                 ResolvingDataSource.Factory(
-                        OkHttpDataSource.Factory(onlineHttp)
+                        OkHttpDataSource.Factory(
+                                onlineHttp
+                                    .newBuilder()
+                                    .addNetworkInterceptor { chain ->
+                                        val url = chain.request().url
+                                        val localLoopback =
+                                            url.host in
+                                                setOf("localhost", "127.0.0.1", "10.0.2.2") &&
+                                                runCatching {
+                                                        android.security.NetworkSecurityPolicy
+                                                            .getInstance()
+                                                            .isCleartextTrafficPermitted(url.host)
+                                                    }
+                                                    .getOrDefault(false)
+                                        if (
+                                            !((url.scheme == "https" || localLoopback) &&
+                                                url.username.isEmpty() &&
+                                                url.password.isEmpty())
+                                        ) {
+                                            throw IOException("文件地址须使用 HTTPS")
+                                        }
+                                        chain.proceed(chain.request())
+                                    }
+                                    .build(),
+                            )
                             .setDefaultRequestProperties(AsmrOneClient.MEDIA_HEADERS),
                     ) { spec ->
                         val asset = spec.uri.lastPathSegment ?: throw IOException("文件标识无效")
@@ -296,11 +319,71 @@ class SourceRegistry(
                             runBlocking(Dispatchers.IO) {
                                 val source = dao.source(sourceId) ?: throw IOException("来源已移除")
                                 require(source.kindType == SourceKind.ASMRONE) { "来源类型不匹配" }
-                                dao.track(asset)?.uri
-                                    ?: dao.attachment(asset)?.uri
-                                    ?: throw IOException("文件已移除")
+                                val raw =
+                                    dao.track(asset)?.uri
+                                        ?: dao.attachment(asset)?.uri
+                                        ?: throw IOException("文件已移除")
+                                val root =
+                                    source.root.toHttpUrlOrNull() ?: throw IOException("来源地址无效")
+                                val parsed = raw.toHttpUrlOrNull() ?: throw IOException("文件地址无效")
+                                val localTest =
+                                    root.host in setOf("localhost", "127.0.0.1", "10.0.2.2") &&
+                                        parsed.host == root.host
+                                if (
+                                    !((parsed.scheme == "https" || localTest) &&
+                                        parsed.username.isEmpty() &&
+                                        parsed.password.isEmpty())
+                                ) {
+                                    throw IOException("文件地址须使用 HTTPS")
+                                }
+                                raw
                             }
                         spec.withUri(targetUri.toUri())
+                    }
+                    .createDataSource()
+            "whisp-webdav" ->
+                ResolvingDataSource.Factory(
+                        OkHttpDataSource.Factory(
+                            http
+                                .newBuilder()
+                                .followRedirects(false)
+                                .followSslRedirects(false)
+                                .build(),
+                        ),
+                    ) { spec ->
+                        val asset = spec.uri.lastPathSegment ?: throw IOException("文件标识无效")
+                        val sourceId = spec.uri.authority ?: throw IOException("来源未关联")
+                        val (targetUri, authHeader) =
+                            runBlocking(Dispatchers.IO) {
+                                val source = dao.source(sourceId) ?: throw IOException("来源已移除")
+                                require(source.kindType == SourceKind.WEBDAV) { "来源类型不匹配" }
+                                val raw =
+                                    dao.track(asset)?.uri
+                                        ?: dao.attachment(asset)?.uri
+                                        ?: throw IOException("文件已移除")
+                                val root =
+                                    (source.root.trimEnd('/') + "/").toHttpUrlOrNull()
+                                        ?: throw IOException("来源地址无效")
+                                val target = raw.toHttpUrlOrNull() ?: throw IOException("文件地址无效")
+                                if (!WebDavClient.insideRoot(target, root)) {
+                                    throw IOException("文件地址不属于此来源")
+                                }
+                                val header =
+                                    if (source.username.isNotBlank()) {
+                                        Credentials.basic(
+                                            source.username,
+                                            secrets.decryptCached(source),
+                                            Charsets.UTF_8,
+                                        )
+                                    } else null
+                                raw to header
+                            }
+                        val extraHeaders =
+                            if (authHeader != null) mapOf("Authorization" to authHeader)
+                            else emptyMap()
+                        spec
+                            .withUri(targetUri.toUri())
+                            .withRequestHeaders(spec.httpRequestHeaders + extraHeaders)
                     }
                     .createDataSource()
             "whisp-dlsite" ->

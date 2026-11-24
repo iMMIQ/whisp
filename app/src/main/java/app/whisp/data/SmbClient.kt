@@ -49,6 +49,7 @@ class SmbClient(
 
     private val poolLock = Any()
     private val pool = mutableMapOf<PoolKey, PooledDisk>()
+    private val generations = mutableMapOf<String, Long>()
     private val cleaner by lazy {
         Executors.newSingleThreadScheduledExecutor { runnable ->
             Thread(runnable, "whisp-smb-pool-idle").apply { isDaemon = true }
@@ -75,8 +76,10 @@ class SmbClient(
 
     private fun acquireDisk(source: SourceEntity, password: String): PooledDisk {
         val key = poolKey(source, password)
+        val generation: Long
         if (idleTimeoutMs > 0L) {
             synchronized(poolLock) {
+                generation = generations[source.id] ?: 0L
                 val existing = pool[key]
                 if (existing != null && !existing.closed && !existing.invalidated) {
                     existing.idleFuture?.cancel(false)
@@ -85,40 +88,47 @@ class SmbClient(
                     return existing
                 }
             }
+        } else {
+            generation = 0L
         }
         val created = PooledDisk(key, Disk(source, password))
         if (idleTimeoutMs <= 0L) return created
         val stale = mutableListOf<PooledDisk>()
         var adopted: PooledDisk? = null
         synchronized(poolLock) {
-            val raced = pool[key]
-            if (raced != null && !raced.closed && !raced.invalidated) {
-                raced.idleFuture?.cancel(false)
-                raced.idleFuture = null
-                raced.refCount++
-                adopted = raced
+            val currentGen = generations[source.id] ?: 0L
+            if (currentGen != generation) {
+                created.invalidated = true
             } else {
-                // Evict older sessions for the same source (e.g., rotated password or changed
-                // root).
-                val iterator = pool.entries.iterator()
-                while (iterator.hasNext()) {
-                    val entry = iterator.next()
-                    if (entry.key.sourceId == source.id) {
-                        val old = entry.value
-                        old.invalidated = true
-                        old.idleFuture?.cancel(false)
-                        old.idleFuture = null
-                        iterator.remove()
-                        if (old.refCount == 0 && !old.closed) {
-                            old.closed = true
-                            stale += old
+                val raced = pool[key]
+                if (raced != null && !raced.closed && !raced.invalidated) {
+                    raced.idleFuture?.cancel(false)
+                    raced.idleFuture = null
+                    raced.refCount++
+                    adopted = raced
+                } else {
+                    // Evict older sessions for the same source (e.g., rotated password or changed
+                    // root).
+                    val iterator = pool.entries.iterator()
+                    while (iterator.hasNext()) {
+                        val entry = iterator.next()
+                        if (entry.key.sourceId == source.id) {
+                            val old = entry.value
+                            old.invalidated = true
+                            old.idleFuture?.cancel(false)
+                            old.idleFuture = null
+                            iterator.remove()
+                            if (old.refCount == 0 && !old.closed) {
+                                old.closed = true
+                                stale += old
+                            }
                         }
                     }
+                    pool[key] = created
                 }
-                pool[key] = created
             }
         }
-        stale.forEach { it.disk.close() }
+        stale.forEach { it.disk.close(force = true) }
         if (adopted != null) {
             created.disk.close()
             return adopted
@@ -128,7 +138,7 @@ class SmbClient(
 
     private fun releaseDisk(pooled: PooledDisk, broken: Boolean = false) {
         if (idleTimeoutMs <= 0L) {
-            pooled.disk.close()
+            pooled.disk.close(force = broken)
             return
         }
         var shouldCloseNow = false
@@ -155,7 +165,7 @@ class SmbClient(
                 }
             }
         }
-        if (shouldCloseNow) pooled.disk.close()
+        if (shouldCloseNow) pooled.disk.close(force = broken)
     }
 
     private fun closeIfIdle(pooled: PooledDisk) {
@@ -168,12 +178,13 @@ class SmbClient(
                 shouldClose = true
             }
         }
-        if (shouldClose) pooled.disk.close()
+        if (shouldClose) pooled.disk.close(force = true)
     }
 
     fun evict(sourceId: String) {
         val toClose = mutableListOf<PooledDisk>()
         synchronized(poolLock) {
+            generations[sourceId] = (generations[sourceId] ?: 0L) + 1L
             val iterator = pool.entries.iterator()
             while (iterator.hasNext()) {
                 val entry = iterator.next()
@@ -190,7 +201,7 @@ class SmbClient(
                 }
             }
         }
-        toClose.forEach { it.disk.close() }
+        toClose.forEach { it.disk.close(force = true) }
     }
 
     fun closeIdle() {
@@ -211,7 +222,7 @@ class SmbClient(
                 }
             }
         }
-        toClose.forEach { it.disk.close() }
+        toClose.forEach { it.disk.close(force = true) }
     }
 
     private inner class Disk(source: SourceEntity, password: String) : Closeable {
@@ -237,17 +248,24 @@ class SmbClient(
                     session!!.connectShare(address.share) as? DiskShare
                         ?: throw IOException("共享不是文件目录")
             } catch (e: Exception) {
-                close()
+                close(force = true)
                 throw failure(e)
             }
         }
 
-        override fun close() {
+        fun close(force: Boolean) {
+            if (force) {
+                runCatching { connection?.close(true) }
+                runCatching { client.close() }
+                return
+            }
             runCatching { share?.close() }
             runCatching { session?.close() }
             runCatching { connection?.close() }
             runCatching { client.close() }
         }
+
+        override fun close() = close(force = false)
     }
 
     fun check(source: SourceEntity, password: String) {
@@ -295,7 +313,8 @@ class SmbClient(
                                 entry.lastWriteTime.toEpochMillis(),
                             )
                         require(files.size <= 100_000) { "目录文件过多，请选择 ASMR 子目录" }
-                        if (directory) enqueue(path)
+                        val depth = path.count { it == '/' } + 1
+                        if (directory && depth <= 32) enqueue(path)
                     }
                 },
                 onProgress = { dirs ->
@@ -345,10 +364,9 @@ class SmbClient(
                     length = file!!.length
                     return
                 } catch (e: Exception) {
-                    closeInternal(broken = true)
-                    if (
-                        attempt == 1 || e is SMBApiException || Thread.currentThread().isInterrupted
-                    ) {
+                    val fileLevelError = e is SMBApiException
+                    closeInternal(broken = !fileLevelError)
+                    if (attempt == 1 || fileLevelError || Thread.currentThread().isInterrupted) {
                         throw failure(e)
                     }
                 }
@@ -374,7 +392,7 @@ class SmbClient(
         }
 
         private fun closeInternal(broken: Boolean) {
-            runCatching { file?.close() }
+            if (!broken) runCatching { file?.close() }
             file = null
             val current = pooled
             pooled = null

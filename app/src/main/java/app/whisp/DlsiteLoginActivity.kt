@@ -69,6 +69,8 @@ class DlsiteLoginActivity : ComponentActivity() {
                 throw e
             } catch (_: DlsiteLoginRequired) {
                 if (showFailure) error = "请先完成官方账号登录"
+            } catch (e: IllegalArgumentException) {
+                error = e.message?.takeIf(String::isNotBlank) ?: "登录验证失败，请重试"
             } catch (_: Exception) {
                 error = "登录验证失败，请重试"
             } finally {
@@ -89,10 +91,12 @@ class DlsiteLoginActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false)
         val restoredBrowser = savedInstanceState?.getBundle(BROWSER_STATE)
         if (savedInstanceState?.getBoolean(SESSION_READY) == true) ready = true
-        else
+        else {
+            WebStorage.getInstance().deleteAllData()
             CookieManager.getInstance().removeAllCookies {
                 if (!isFinishing && !isDestroyed) ready = true
             }
+        }
         setContent {
             WhispTheme {
                 Scaffold(
@@ -165,6 +169,7 @@ class DlsiteLoginActivity : ComponentActivity() {
                                         setBackgroundColor(Ink.toArgb())
                                         settings.javaScriptEnabled = true
                                         settings.domStorageEnabled = true
+                                        settings.cacheMode = WebSettings.LOAD_NO_CACHE
                                         settings.allowFileAccess = false
                                         settings.allowContentAccess = false
                                         if (Build.VERSION.SDK_INT < 30) {

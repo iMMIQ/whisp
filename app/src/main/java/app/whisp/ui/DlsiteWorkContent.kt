@@ -45,6 +45,7 @@ internal fun OfficialCircle(details: DlsiteDetails?, filter: ((AsmrFacet) -> Uni
         ) {
             Text(
                 circle,
+                Modifier.weight(1f, fill = false),
                 style = MaterialTheme.typography.titleSmall,
                 color = if (clickable) Rose else Muted,
                 maxLines = 1,
@@ -262,7 +263,7 @@ internal fun LazyListScope.dlsiteContent(
                 MetadataField("作品编号", details.rj)
                 val uri = LocalUriHandler.current
                 TextButton(
-                    onClick = { uri.openUri(dlsiteWorkUrl(details.rj)) },
+                    onClick = { runCatching { uri.openUri(dlsiteWorkUrl(details.rj)) } },
                     Modifier.align(Alignment.End),
                 ) {
                     Text("DLsite")
@@ -398,6 +399,7 @@ private fun MetadataField(label: String, value: String, click: (() -> Unit)? = n
             ) {
                 Text(
                     value,
+                    Modifier.weight(1f, fill = false),
                     style = MaterialTheme.typography.bodyMedium,
                     color = Rose,
                     fontWeight = FontWeight.Medium,
@@ -480,7 +482,7 @@ private fun RelatedLink(label: String?, work: DlsiteRelatedWork) {
     val uri = LocalUriHandler.current
     Row(
         Modifier.fillMaxWidth()
-            .clickable { uri.openUri(dlsiteWorkUrl(work.rj)) }
+            .clickable { runCatching { uri.openUri(dlsiteWorkUrl(work.rj)) } }
             .padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

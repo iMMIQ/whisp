@@ -59,6 +59,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         playerRequest = savedInstanceState?.getInt("player-request") ?: 0
+        notificationRequested = savedInstanceState?.getBoolean("notification-requested") ?: false
         if (savedInstanceState == null && intent.action == OPEN_PLAYER) playerRequest++
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
@@ -103,6 +104,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt("player-request", playerRequest)
+        outState.putBoolean("notification-requested", notificationRequested)
         super.onSaveInstanceState(outState)
     }
 }

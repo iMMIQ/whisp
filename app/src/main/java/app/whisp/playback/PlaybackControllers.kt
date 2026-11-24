@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.media3.common.Player
@@ -149,11 +150,15 @@ internal class SleepTimerController(
     var handledByAlarm: Boolean = false
         private set
 
+    var fading: Boolean = false
+        private set
+
     val handlerDeadlineMs: Long
-        get() = if (handledByAlarm) 0L else deadlineMs
+        get() = if (handledByAlarm && !fading) 0L else deadlineMs
 
     private var timerJob: Job? = null
     private var fadeJob: Job? = null
+    private var fadeWakeLock: PowerManager.WakeLock? = null
     private var savedVolume: Float? = null
     private var receiverRegistered = false
     private val action = "${context.packageName}.ACTION_SLEEP_TIMER"
@@ -256,24 +261,57 @@ internal class SleepTimerController(
         cancelFade(restoreVolume = true)
         val initialVolume = getVolume().coerceIn(0f, 1f)
         savedVolume = initialVolume
+        fading = true
+        acquireFadeWakeLock(remaining + 2_000L)
+        onChanged()
         fadeJob = scope.launch {
-            val fadeSpan = remaining.toFloat().coerceAtLeast(1f)
-            while (isActive) {
-                val left = target - SystemClock.elapsedRealtime()
-                if (left <= 0L) break
-                if (initialVolume > 0f) {
-                    val factor = (left / fadeSpan).coerceIn(0f, 1f)
-                    setVolume(initialVolume * factor)
+            try {
+                val fadeSpan = remaining.toFloat().coerceAtLeast(1f)
+                while (isActive) {
+                    val left = target - SystemClock.elapsedRealtime()
+                    if (left <= 0L) break
+                    if (initialVolume > 0f) {
+                        val factor = (left / fadeSpan).coerceIn(0f, 1f)
+                        setVolume(initialVolume * factor)
+                    }
+                    delay(minOf(200L, left))
                 }
-                delay(minOf(200L, left))
+                if (isActive && deadlineMs == target) expire()
+            } finally {
+                if (fadeJob === kotlin.coroutines.coroutineContext[Job]) {
+                    fading = false
+                    releaseFadeWakeLock()
+                }
             }
-            if (isActive && deadlineMs == target) expire()
+        }
+    }
+
+    private fun acquireFadeWakeLock(timeoutMs: Long) {
+        releaseFadeWakeLock()
+        val pm = context.getSystemService(PowerManager::class.java) ?: return
+        runCatching {
+            pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "${context.packageName}:sleep-fade")
+                .apply {
+                    setReferenceCounted(false)
+                    acquire(timeoutMs.coerceIn(1_000L, FADE_LEAD_MS + 10_000L))
+                }
+                .also { fadeWakeLock = it }
+        }
+    }
+
+    private fun releaseFadeWakeLock() {
+        val lock = fadeWakeLock
+        fadeWakeLock = null
+        if (lock != null) {
+            runCatching { if (lock.isHeld) lock.release() }
         }
     }
 
     private fun cancelFade(restoreVolume: Boolean) {
         fadeJob?.cancel()
         fadeJob = null
+        fading = false
+        releaseFadeWakeLock()
         val prev = savedVolume
         savedVolume = null
         if (restoreVolume && prev != null) setVolume(prev)
@@ -283,6 +321,8 @@ internal class SleepTimerController(
         val prev = savedVolume
         fadeJob?.cancel()
         fadeJob = null
+        fading = false
+        releaseFadeWakeLock()
         savedVolume = null
         timerJob?.cancel()
         timerJob = null
@@ -400,8 +440,23 @@ internal class AbLoopController(
     }
 
     fun onReady() {
-        if (active && endMessage == null) scheduleMessage()
-        if (active && player.isPlaying && player.currentPosition >= endMs) seekToLoopStart()
+        if (!active) return
+        val duration = player.duration.takeIf { it > 0 }
+        if (duration != null) {
+            val validated = LoopState.validate(startMs, endMs, duration, hasTrack = true)
+            if (validated == null) {
+                clear()
+                return
+            }
+            if (validated.startMs != startMs || validated.endMs != endMs) {
+                startMs = validated.startMs
+                endMs = validated.endMs
+                cancelMessage()
+                onChanged()
+            }
+        }
+        if (endMessage == null) scheduleMessage()
+        if (player.isPlaying && player.currentPosition >= endMs) seekToLoopStart()
     }
 
     fun onEndOfMediaItem(): Boolean {
@@ -430,15 +485,19 @@ internal class AbLoopController(
                 pendingLoopSeekTo == (newPosition.mediaItem?.mediaId to newPosition.positionMs)
         pendingLoopSeekTo = null
         if (!loopSeek) suppressAutoProgress = false
+        val sameTrack = oldPosition.mediaItem?.mediaId == newPosition.mediaItem?.mediaId
+        // Seeking compressed audio/video often snaps backward to the nearest keyframe/frame
+        // boundary via SEEK_ADJUSTMENT; keep the active loop intact while playback enters [A, B].
+        val keyframeSnapBeforeStart =
+            reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT &&
+                sameTrack &&
+                newPosition.positionMs <= endMs
         if (
             active &&
-                (oldPosition.mediaItem?.mediaId != newPosition.mediaItem?.mediaId ||
-                    newPosition.positionMs !in startMs..endMs)
+                !keyframeSnapBeforeStart &&
+                (!sameTrack || newPosition.positionMs !in startMs..endMs)
         ) {
-            clear(
-                recordAsSeekClear =
-                    oldPosition.mediaItem?.mediaId == newPosition.mediaItem?.mediaId,
-            )
+            clear(recordAsSeekClear = sameTrack)
         }
         return loopSeek
     }

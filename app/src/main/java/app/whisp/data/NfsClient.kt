@@ -127,17 +127,31 @@ class NfsClient(
         val address = NfsAddress.parse(source.root)
         val workerSessions = arrayOfNulls<NfsSession>(4)
         val sessionLock = Any()
+        var closed = false
         try {
             val files = mutableListOf<FileEntry>()
             walkTreeConcurrent(
                 root = "",
                 concurrency = 4,
                 listOne = { workerIndex, path ->
+                    val existing = synchronized(sessionLock) { workerSessions[workerIndex] }
                     val session =
-                        synchronized(sessionLock) {
-                            workerSessions[workerIndex]
-                                ?: connect(address).also { workerSessions[workerIndex] = it }
-                        }
+                        existing
+                            ?: connect(address).also { fresh ->
+                                val keep =
+                                    synchronized(sessionLock) {
+                                        if (closed) {
+                                            false
+                                        } else {
+                                            workerSessions[workerIndex] = fresh
+                                            true
+                                        }
+                                    }
+                                if (!keep) {
+                                    runCatching { fresh.close() }
+                                    throw kotlinx.coroutines.CancellationException("NFS 扫描已取消")
+                                }
+                            }
                     session.list(path)
                 },
                 onDirectory = { parent, entries, enqueue ->
@@ -155,7 +169,8 @@ class NfsClient(
                                 entry.modifiedMs,
                             )
                         require(files.size <= 100_000) { "目录文件过多，请选择 ASMR 子目录" }
-                        if (directory) enqueue(path)
+                        val depth = path.count { it == '/' } + 1
+                        if (directory && depth <= 32) enqueue(path)
                     }
                 },
                 onProgress = { dirs ->
@@ -164,8 +179,12 @@ class NfsClient(
             )
             return files
         } finally {
-            synchronized(sessionLock) { workerSessions.filterNotNull() }
-                .forEach { runCatching { it.close() } }
+            val toClose =
+                synchronized(sessionLock) {
+                    closed = true
+                    workerSessions.filterNotNull()
+                }
+            toClose.forEach { runCatching { it.close() } }
         }
     }
 

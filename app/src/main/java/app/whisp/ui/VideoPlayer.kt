@@ -85,7 +85,7 @@ internal fun VideoOutput(
             playback.videoVisibility(owner, false)
         }
     }
-    DisposableEffect(view, resumed, playing) {
+    DisposableEffect(view, resumed, active, playing) {
         val previous = view.keepScreenOn
         view.keepScreenOn = resumed && active && playing
         onDispose { view.keepScreenOn = previous }
@@ -137,6 +137,8 @@ internal fun FullScreenVideo(
             else ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
     }
     DisposableEffect(activity) {
+        val window = activity?.window
+        val originalBrightness = window?.attributes?.screenBrightness
         val bars = activity?.let {
             WindowCompat.getInsetsController(it.window, it.window.decorView)
         }
@@ -145,6 +147,13 @@ internal fun FullScreenVideo(
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         bars?.hide(WindowInsetsCompat.Type.systemBars())
         onDispose {
+            if (window != null && originalBrightness != null) {
+                val lp = window.attributes
+                if (lp.screenBrightness != originalBrightness) {
+                    lp.screenBrightness = originalBrightness
+                    window.attributes = lp
+                }
+            }
             bars?.show(WindowInsetsCompat.Type.systemBars())
             if (oldBehavior != null) bars.systemBarsBehavior = oldBehavior
             if (activity?.isChangingConfigurations == false)
@@ -154,19 +163,21 @@ internal fun FullScreenVideo(
     var controls by rememberSaveable(trackId) { mutableStateOf(true) }
     var locked by rememberSaveable(trackId) { mutableStateOf(false) }
     var showUnlockHint by remember { mutableStateOf(false) }
-    var scrubbing by remember { mutableStateOf(false) }
+    var scrubbing by remember(trackId) { mutableStateOf(false) }
+    var draggingHud by remember { mutableStateOf(false) }
     var interaction by remember { mutableIntStateOf(0) }
     var foreground by remember { mutableStateOf(false) }
     var hudText by remember { mutableStateOf<String?>(null) }
     var hudToken by remember { mutableIntStateOf(0) }
+    val currentState by rememberUpdatedState(state)
 
     fun flashHud(text: String) {
         hudText = text
         hudToken++
     }
 
-    LaunchedEffect(hudToken) {
-        if (hudText != null) {
+    LaunchedEffect(hudToken, draggingHud) {
+        if (!draggingHud && hudText != null) {
             delay(1100)
             hudText = null
         }
@@ -178,10 +189,14 @@ internal fun FullScreenVideo(
         }
     }
 
-    LifecycleResumeEffect(trackId) {
+    LifecycleResumeEffect(trackId, activity) {
         foreground = true
         controls = !locked
         interaction++
+        activity?.let {
+            WindowCompat.getInsetsController(it.window, it.window.decorView)
+                .hide(WindowInsetsCompat.Type.systemBars())
+        }
         onPauseOrDispose { foreground = false }
     }
     val reduced = LocalReducedMotion.current
@@ -221,9 +236,10 @@ internal fun FullScreenVideo(
                                     flashHud("+${skipSeconds} 秒")
                                 }
                                 else -> {
+                                    val wasPlaying = currentState.playWhenReady
                                     playback.togglePlay()
                                     haptics.confirm()
-                                    flashHud(if (state.playWhenReady) "已暂停" else "继续播放")
+                                    flashHud(if (wasPlaying) "已暂停" else "继续播放")
                                 }
                             }
                             interaction++
@@ -235,102 +251,130 @@ internal fun FullScreenVideo(
                     val slopPx = viewConfiguration.touchSlop
                     val audioManager =
                         context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        var totalDx = 0f
-                        var totalDy = 0f
-                        var mode = FullscreenDragMode.None
-                        val startPos = playback.currentPosition()
-                        var seekTarget = startPos
-                        val maxVol =
-                            audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15
-                        var floatVol =
-                            audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC)?.toFloat()
-                                ?: 0f
-                        val window = activity?.window
-                        var floatBrightness =
-                            window?.attributes?.screenBrightness?.takeIf { it >= 0f }
-                                ?: runCatching {
-                                        Settings.System.getInt(
-                                            context.contentResolver,
-                                            Settings.System.SCREEN_BRIGHTNESS,
-                                        ) / 255f
+                    try {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            var totalDx = 0f
+                            var totalDy = 0f
+                            var mode = FullscreenDragMode.None
+                            val startPos = playback.currentPosition()
+                            var seekTarget = startPos
+                            val maxVol =
+                                audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15
+                            var floatVol =
+                                audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC)?.toFloat()
+                                    ?: 0f
+                            val window = activity?.window
+                            var floatBrightness =
+                                window?.attributes?.screenBrightness?.takeIf { it >= 0f }
+                                    ?: runCatching {
+                                            Settings.System.getInt(
+                                                context.contentResolver,
+                                                Settings.System.SCREEN_BRIGHTNESS,
+                                            ) / 255f
+                                        }
+                                        .getOrDefault(0.5f)
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change =
+                                        event.changes.firstOrNull { it.id == down.id }
+                                            ?: event.changes.firstOrNull()
+                                            ?: break
+                                    if (!change.pressed) {
+                                        if (mode == FullscreenDragMode.Seek && active) {
+                                            playback.seek(seekTarget)
+                                        }
+                                        break
                                     }
-                                    .getOrDefault(0.5f)
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change =
-                                event.changes.firstOrNull { it.id == down.id }
-                                    ?: event.changes.firstOrNull()
-                                    ?: break
-                            if (!change.pressed) {
-                                if (mode == FullscreenDragMode.Seek && active) {
-                                    playback.seek(seekTarget)
-                                }
-                                break
-                            }
-                            val delta = change.positionChange()
-                            totalDx += delta.x
-                            totalDy += delta.y
-                            if (mode == FullscreenDragMode.None) {
-                                if (abs(totalDx) > slopPx && abs(totalDx) > abs(totalDy) * 1.2f) {
-                                    if (active && state.durationMs > 0L) {
-                                        mode = FullscreenDragMode.Seek
-                                        haptics.tick()
+                                    val delta = change.positionChange()
+                                    totalDx += delta.x
+                                    totalDy += delta.y
+                                    if (mode == FullscreenDragMode.None) {
+                                        if (
+                                            abs(totalDx) > slopPx &&
+                                                abs(totalDx) > abs(totalDy) * 1.2f
+                                        ) {
+                                            if (active && state.durationMs > 0L) {
+                                                mode = FullscreenDragMode.Seek
+                                                draggingHud = true
+                                                haptics.tick()
+                                            }
+                                        } else if (
+                                            abs(totalDy) > slopPx &&
+                                                abs(totalDy) > abs(totalDx) * 1.2f
+                                        ) {
+                                            mode =
+                                                if (down.position.x < size.width / 2f)
+                                                    FullscreenDragMode.Brightness
+                                                else FullscreenDragMode.Volume
+                                            draggingHud = true
+                                        }
                                     }
-                                } else if (
-                                    abs(totalDy) > slopPx && abs(totalDy) > abs(totalDx) * 1.2f
-                                ) {
-                                    mode =
-                                        if (down.position.x < size.width / 2f)
-                                            FullscreenDragMode.Brightness
-                                        else FullscreenDragMode.Volume
-                                }
-                            }
-                            when (mode) {
-                                FullscreenDragMode.Seek -> {
-                                    change.consume()
-                                    val spanMs =
-                                        minOf(state.durationMs, 180_000L).coerceAtLeast(30_000L)
-                                    val shift =
-                                        ((totalDx / size.width.toFloat().coerceAtLeast(1f)) *
-                                                spanMs)
-                                            .toLong()
-                                    seekTarget = (startPos + shift).coerceIn(0L, state.durationMs)
-                                    val diffSec = ((seekTarget - startPos) / 1000L).toInt()
-                                    val sign = if (diffSec >= 0) "+" else "−"
-                                    hudText = "${clock(seekTarget)} (${sign}${abs(diffSec)}s)"
-                                }
-                                FullscreenDragMode.Brightness -> {
-                                    change.consume()
-                                    val step = -delta.y / (size.height * 0.65f).coerceAtLeast(1f)
-                                    floatBrightness = (floatBrightness + step).coerceIn(0.02f, 1f)
-                                    window?.let { win ->
-                                        val lp = win.attributes
-                                        lp.screenBrightness = floatBrightness
-                                        win.attributes = lp
+                                    when (mode) {
+                                        FullscreenDragMode.Seek -> {
+                                            change.consume()
+                                            val spanMs =
+                                                minOf(state.durationMs, 180_000L)
+                                                    .coerceAtLeast(30_000L)
+                                            val shift =
+                                                ((totalDx /
+                                                        size.width.toFloat().coerceAtLeast(1f)) *
+                                                        spanMs)
+                                                    .toLong()
+                                            seekTarget =
+                                                (startPos + shift).coerceIn(0L, state.durationMs)
+                                            val diffSec = ((seekTarget - startPos) / 1000L).toInt()
+                                            val sign = if (diffSec >= 0) "+" else "−"
+                                            hudText =
+                                                "${clock(seekTarget)} (${sign}${abs(diffSec)}s)"
+                                        }
+                                        FullscreenDragMode.Brightness -> {
+                                            change.consume()
+                                            val step =
+                                                -delta.y / (size.height * 0.65f).coerceAtLeast(1f)
+                                            floatBrightness =
+                                                (floatBrightness + step).coerceIn(0.02f, 1f)
+                                            window?.let { win ->
+                                                val lp = win.attributes
+                                                lp.screenBrightness = floatBrightness
+                                                win.attributes = lp
+                                            }
+                                            hudText = "亮度 ${(floatBrightness * 100).roundToInt()}%"
+                                        }
+                                        FullscreenDragMode.Volume -> {
+                                            change.consume()
+                                            val step =
+                                                (-delta.y /
+                                                    (size.height * 0.65f).coerceAtLeast(1f)) *
+                                                    maxVol
+                                            floatVol =
+                                                (floatVol + step).coerceIn(0f, maxVol.toFloat())
+                                            val nextVol = floatVol.roundToInt()
+                                            audioManager?.setStreamVolume(
+                                                AudioManager.STREAM_MUSIC,
+                                                nextVol,
+                                                0,
+                                            )
+                                            val pct =
+                                                if (maxVol > 0) (nextVol * 100 / maxVol) else 0
+                                            hudText = "音量 $pct%"
+                                        }
+                                        FullscreenDragMode.None -> Unit
                                     }
-                                    hudText = "亮度 ${(floatBrightness * 100).roundToInt()}%"
                                 }
-                                FullscreenDragMode.Volume -> {
-                                    change.consume()
-                                    val step =
-                                        (-delta.y / (size.height * 0.65f).coerceAtLeast(1f)) *
-                                            maxVol
-                                    floatVol = (floatVol + step).coerceIn(0f, maxVol.toFloat())
-                                    val nextVol = floatVol.roundToInt()
-                                    audioManager?.setStreamVolume(
-                                        AudioManager.STREAM_MUSIC,
-                                        nextVol,
-                                        0,
-                                    )
-                                    val pct = if (maxVol > 0) (nextVol * 100 / maxVol) else 0
-                                    hudText = "音量 $pct%"
+                            } finally {
+                                if (draggingHud) {
+                                    draggingHud = false
+                                    hudToken++
                                 }
-                                FullscreenDragMode.None -> Unit
                             }
                         }
-                        if (mode != FullscreenDragMode.None) hudToken++
+                    } finally {
+                        if (draggingHud) {
+                            draggingHud = false
+                            hudToken++
+                        }
                     }
                 },
         )
@@ -468,7 +512,11 @@ internal fun FullScreenVideo(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         IconAction(
-                            Icons.Outlined.Replay10,
+                            when (skipSeconds) {
+                                5 -> Icons.Outlined.Replay5
+                                30 -> Icons.Outlined.Replay30
+                                else -> Icons.Outlined.Replay10
+                            },
                             "后退${skipSeconds}秒",
                             enabled = active,
                             haptic = HapticKind.Tick,
@@ -499,7 +547,11 @@ internal fun FullScreenVideo(
                             )
                         }
                         IconAction(
-                            Icons.Outlined.Forward10,
+                            when (skipSeconds) {
+                                5 -> Icons.Outlined.Forward5
+                                30 -> Icons.Outlined.Forward30
+                                else -> Icons.Outlined.Forward10
+                            },
                             "前进${skipSeconds}秒",
                             enabled = active,
                             haptic = HapticKind.Tick,

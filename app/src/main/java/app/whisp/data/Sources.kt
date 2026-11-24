@@ -8,8 +8,15 @@ import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.xml.XMLConstants
 import javax.xml.parsers.SAXParserFactory
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Credentials
 import okhttp3.HttpUrl
@@ -18,7 +25,9 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.xml.sax.Attributes
+import org.xml.sax.EntityResolver
 import org.xml.sax.InputSource
 import org.xml.sax.SAXException
 import org.xml.sax.ext.DefaultHandler2
@@ -137,14 +146,25 @@ class WebDavClient(private val http: OkHttpClient) {
                 SAXParserFactory.newInstance().apply {
                     isNamespaceAware = true
                 }
-            runCatching {
-                factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+            val disallowDoctype = runCatching {
+                factory.setFeature(
+                    "http://apache.org/xml/features/disallow-doctype-decl",
+                    true,
+                )
             }
+                .isSuccess
+            runCatching { factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true) }
             runCatching {
                 factory.setFeature("http://xml.org/sax/features/external-general-entities", false)
             }
             runCatching {
                 factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+            }
+            runCatching {
+                factory.setFeature(
+                    "http://apache.org/xml/features/nonvalidating/load-external-dtd",
+                    false,
+                )
             }
             val parser = factory.newSAXParser()
             val entries = mutableListOf<DavEntry>()
@@ -309,9 +329,18 @@ class WebDavClient(private val http: OkHttpClient) {
                     }
                 }
             val reader = parser.xmlReader
-            runCatching {
-                reader.setProperty("http://xml.org/sax/properties/lexical-handler", handler)
+            val lexicalRegistered = runCatching {
+                reader.setProperty(
+                    "http://xml.org/sax/properties/lexical-handler",
+                    handler,
+                )
             }
+                .isSuccess
+            if (!disallowDoctype && !lexicalRegistered) {
+                throw IOException("XML 解析器不支持安全配置")
+            }
+            reader.entityResolver = EntityResolver { _, _ -> throw DoctypeRejectedException() }
+            reader.dtdHandler = handler
             reader.contentHandler = handler
             try {
                 reader.parse(InputSource(ByteArrayInputStream(bytes)))
@@ -325,6 +354,88 @@ class WebDavClient(private val http: OkHttpClient) {
             return entries
         }
     }
+
+    private val davHttp: OkHttpClient =
+        http.newBuilder().followRedirects(false).followSslRedirects(false).build()
+
+    private fun executeInsideRoot(initial: Request, root: HttpUrl): Response {
+        var current = initial
+        repeat(6) {
+            val response = davHttp.newCall(current).execute()
+            if (response.code !in setOf(301, 302, 303, 307, 308)) return response
+            val location = response.header("Location")
+            val nextUrl = location?.let { current.url.resolve(it) }
+            val code = response.code
+            response.close()
+            if (nextUrl == null || !insideRoot(nextUrl, root)) {
+                throw IOException("文件地址不属于此来源")
+            }
+            val nextBuilder = current.newBuilder().url(nextUrl)
+            if (code == 303 && current.method != "GET" && current.method != "HEAD") {
+                nextBuilder.get()
+            }
+            current = nextBuilder.build()
+        }
+        throw IOException("WebDAV 重定向次数过多")
+    }
+
+    private suspend fun bytesInsideRoot(
+        initial: Request,
+        root: HttpUrl,
+        limit: Int,
+    ): ByteArray =
+        withContext(Dispatchers.IO) {
+            var current = initial
+            repeat(6) {
+                coroutineContext.ensureActive()
+                val next = coroutineScope {
+                    val call = davHttp.newCall(current)
+                    val done = AtomicBoolean(false)
+                    val cancelWatcher =
+                        launch(start = CoroutineStart.UNDISPATCHED) {
+                            try {
+                                awaitCancellation()
+                            } finally {
+                                if (!done.get()) call.cancel()
+                            }
+                        }
+                    try {
+                        call.execute().use { response ->
+                            if (response.code in setOf(301, 302, 303, 307, 308)) {
+                                val location = response.header("Location")
+                                val nextUrl = location?.let { current.url.resolve(it) }
+                                val code = response.code
+                                if (nextUrl == null || !insideRoot(nextUrl, root)) {
+                                    throw IOException("文件地址不属于此来源")
+                                }
+                                val nextBuilder = current.newBuilder().url(nextUrl)
+                                if (
+                                    code == 303 &&
+                                        current.method != "GET" &&
+                                        current.method != "HEAD"
+                                ) {
+                                    nextBuilder.get()
+                                }
+                                nextBuilder.build() to null
+                            } else {
+                                if (!response.isSuccessful) throw OnlineHttpException(response.code)
+                                null to boundedRead(response.body.byteStream(), limit)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        coroutineContext.ensureActive()
+                        throw e
+                    } finally {
+                        done.set(true)
+                        cancelWatcher.cancel()
+                    }
+                }
+                val body = next.second
+                if (body != null) return@withContext body
+                current = next.first!!
+            }
+            throw IOException("WebDAV 重定向次数过多")
+        }
 
     private fun authHeader(source: SourceEntity, password: String): String? =
         if (source.username.isNotEmpty())
@@ -340,8 +451,10 @@ class WebDavClient(private val http: OkHttpClient) {
             .build()
 
     fun list(url: HttpUrl, source: SourceEntity, password: String): List<DavEntry> {
+        val root = (source.root.trimEnd('/') + "/").toHttpUrl()
+        require(insideRoot(url, root)) { "文件地址不属于此来源" }
         val authorization = authHeader(source, password)
-        http.newCall(listRequest(url, authorization)).execute().use { response ->
+        executeInsideRoot(listRequest(url, authorization), root).use { response ->
             if (!response.isSuccessful) throw IOException("目录访问失败（${response.code}）")
             val bytes = response.body.byteStream().use { boundedRead(it, 8 * 1024 * 1024) }
             return parse(bytes, url)
@@ -361,8 +474,9 @@ class WebDavClient(private val http: OkHttpClient) {
                 concurrency = 4,
                 listOne = { _, directory ->
                     parse(
-                        http.onlineBytes(
+                        bytesInsideRoot(
                             listRequest(directory, authorization),
+                            root,
                             8 * 1024 * 1024,
                         ),
                         directory,
@@ -375,12 +489,10 @@ class WebDavClient(private val http: OkHttpClient) {
                             entry.url.encodedPath.trimEnd('/') == directory.encodedPath.trimEnd('/')
                         )
                             return@forEach
-                        val path =
-                            entry.url.pathSegments
-                                .drop(rootDepth)
-                                .filter { it.isNotEmpty() }
-                                .joinToString("/")
-                        if (path.isBlank() || path.split('/').any { it == ".." }) return@forEach
+                        val segments =
+                            entry.url.pathSegments.drop(rootDepth).filter { it.isNotEmpty() }
+                        val path = segments.joinToString("/")
+                        if (path.isBlank() || segments.any { it == ".." }) return@forEach
                         files +=
                             FileEntry(
                                 path,
@@ -390,7 +502,7 @@ class WebDavClient(private val http: OkHttpClient) {
                                 entry.modified,
                             )
                         check(files.size < 100_000) { "目录过大" }
-                        if (entry.directory) {
+                        if (entry.directory && segments.size <= 32) {
                             val nextDir =
                                 entry.url
                                     .newBuilder()
@@ -423,7 +535,7 @@ class WebDavClient(private val http: OkHttpClient) {
                 .url(url)
                 .apply { if (authorization != null) header("Authorization", authorization) }
                 .build()
-        http.newCall(request).execute().use { response ->
+        executeInsideRoot(request, root).use { response ->
             if (!response.isSuccessful) throw IOException("文件读取失败（${response.code}）")
             return boundedRead(response.body.byteStream(), limit)
         }
@@ -444,7 +556,7 @@ class WebDavClient(private val http: OkHttpClient) {
                 .url(url)
                 .apply { if (authorization != null) header("Authorization", authorization) }
                 .build()
-        http.newCall(request).execute().use { response ->
+        executeInsideRoot(request, root).use { response ->
             if (!response.isSuccessful) throw IOException("文件读取失败（${response.code}）")
             return copyBounded(response.body.byteStream(), sink, limit)
         }

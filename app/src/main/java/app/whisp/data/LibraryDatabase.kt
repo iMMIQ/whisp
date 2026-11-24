@@ -373,7 +373,13 @@ interface LibraryDao {
     @Query("SELECT * FROM progress ORDER BY updatedAt DESC")
     fun observeProgress(): Flow<List<ProgressEntity>>
 
-    @Query("SELECT * FROM progress ORDER BY updatedAt DESC LIMIT 1")
+    @Query(
+        """
+        SELECT * FROM progress
+        WHERE EXISTS (SELECT 1 FROM tracks WHERE tracks.workId = progress.workId)
+        ORDER BY updatedAt DESC LIMIT 1
+        """,
+    )
     fun observeLatestProgress(): Flow<ProgressEntity?>
 
     @Query("SELECT * FROM progress WHERE workId = :id")
@@ -382,7 +388,13 @@ interface LibraryDao {
     @Query("SELECT * FROM progress WHERE workId = :id")
     suspend fun progress(id: String): ProgressEntity?
 
-    @Query("SELECT * FROM progress ORDER BY updatedAt DESC LIMIT 1")
+    @Query(
+        """
+        SELECT * FROM progress
+        WHERE EXISTS (SELECT 1 FROM tracks WHERE tracks.workId = progress.workId)
+        ORDER BY updatedAt DESC LIMIT 1
+        """,
+    )
     suspend fun latestProgress(): ProgressEntity?
 
     @Upsert suspend fun saveProgress(progress: ProgressEntity)

@@ -52,11 +52,11 @@ ASMR.ONE 提供常驻搜索框，支持作品名、声优、RJ 编号与作品�
 
 作品预览展示封面、曲目和筛选标签；「加入作品库」保存作品，播放时自动加入。元数据读取失败可在预览页重试。「介绍」展示官方正文与图片，「资料」展示社团、创作者分工、发布日期、类型、标签、系列、语言版本和精确评分。作品按 RJ 编号从 DLsite 官方完整 JSON 接口读取作品名、声优、系列和封面，官方键值接口作为兼容路径。作品信息中的「更新 DLsite 元数据」支持已有的 RJ 作品；来源刷新保留手动修改的标题、声优和封面。在线作品可通过「作品信息 → 删除作品」移除，同时清理该作品的下载、书签和播放进度。
 
-在线目录使用 Paging 3 分页，内存保留最多约 100 条目录记录；作品数据库保存用户打开的作品。封面使用现有的 64 MiB 图片缓存，音频使用可调节的在线播放缓存。ASMR.ONE 的媒体请求使用独立网络客户端与站点 Referer。
+在线目录按需分页加载与去重，浏览状态按作用域保存在内存中；作品数据库保存用户打开的作品。封面使用 Coil 3 统一图片磁盘缓存，音频使用可调节的在线播放缓存。ASMR.ONE 的媒体请求使用独立网络客户端与站点 Referer。
 
 ## 构建
 
-项目使用 Kotlin、Jetpack Compose、Navigation 3、Media3、Room、DataStore、WorkManager、Coil、OkHttp 和 SMBJ。依赖版本固定在 Gradle 配置中；Material 3 使用 `1.5.0-beta01` 的公开 MotionScheme API。
+项目使用 Kotlin、Jetpack Compose、Navigation 3、Media3、Room、DataStore、WorkManager、Coil 3、OkHttp 和 SMBJ。依赖版本固定在 Gradle 配置中；Material 3 使用 `1.5.0-beta01` 的公开 MotionScheme API。
 
 构建环境为 JDK 21、Android SDK Platform 37、Build Tools 36.0.0、NDK 30.0.16248370 和 CMake 3.31.6。Gradle Wrapper 固定为 9.8.1。SDK 路径通过 Android Studio、`ANDROID_HOME` 或本机的 `local.properties` 配置。
 

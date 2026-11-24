@@ -45,7 +45,9 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
 import androidx.navigation3.runtime.entryProvider
+import androidx.navigation3.runtime.rememberDecoratedNavEntries
 import androidx.navigation3.runtime.rememberNavBackStack
+import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
 import androidx.navigationevent.NavigationEvent
 import app.whisp.AppGraph
@@ -254,6 +256,8 @@ fun WhispRoot(
             }
         }
 
+        val showMini = !isPlayerRoute && current != null && currentTrack != null
+        val showAnyBottom = showMini || showBottomNav
         SharedTransitionLayout(Modifier.fillMaxSize()) {
             val shared = this
             CompositionLocalProvider(
@@ -266,7 +270,11 @@ fun WhispRoot(
                     containerColor = bg,
                     contentWindowInsets = WindowInsets(0, 0, 0, 0),
                     snackbarHost = {
-                        SnackbarHost(snackbar) { data ->
+                        SnackbarHost(
+                            hostState = snackbar,
+                            modifier =
+                                if (!showAnyBottom) Modifier.navigationBarsPadding() else Modifier,
+                        ) { data ->
                             Snackbar(
                                 snackbarData = data,
                                 containerColor = MaterialTheme.colorScheme.inverseSurface,
@@ -277,8 +285,6 @@ fun WhispRoot(
                         }
                     },
                     bottomBar = {
-                        val showMini = !isPlayerRoute && current != null && currentTrack != null
-                        val showAnyBottom = showMini || showBottomNav
                         AnimatedVisibility(
                             showAnyBottom,
                             enter = fadeIn(tween(if (settings.reduceMotion) 100 else 200)),
@@ -289,7 +295,7 @@ fun WhispRoot(
                                     Modifier.fillMaxWidth().background(bg).navigationBarsPadding(),
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                 ) {
-                                    if (showMini) {
+                                    if (current != null && currentTrack != null) {
                                         MiniPlayer(
                                             detail = current,
                                             track = currentTrack,
@@ -344,8 +350,251 @@ fun WhispRoot(
                         }
                     },
                 ) { padding ->
+                    val navEntryProvider =
+                        entryProvider<androidx.navigation3.runtime.NavKey> {
+                            @Composable
+                            fun RouteFrame(
+                                destination: WhispRoute,
+                                content: @Composable () -> Unit,
+                            ) {
+                                var bottom by remember {
+                                    mutableStateOf(padding.calculateBottomPadding())
+                                }
+                                if (
+                                    destination == route &&
+                                        destination !is WhispRoute.Player &&
+                                        !shared.isTransitionActive
+                                ) {
+                                    SideEffect { bottom = padding.calculateBottomPadding() }
+                                }
+                                CompositionLocalProvider(
+                                    LocalArtworkVisibility provides
+                                        androidx.navigation3.ui.LocalNavAnimatedContentScope
+                                            .current,
+                                    LocalShareArtwork provides
+                                        (!miniTransition || destination is WhispRoute.Player),
+                                ) {
+                                    val bottomModifier =
+                                        when {
+                                            destination is WhispRoute.Player -> Modifier
+                                            bottom > 0.dp -> Modifier.padding(bottom = bottom)
+                                            else -> Modifier.navigationBarsPadding()
+                                        }
+                                    Box(
+                                        Modifier.fillMaxSize().background(bg).then(bottomModifier),
+                                    ) {
+                                        content()
+                                    }
+                                }
+                            }
+                            val asmrSource = sources.firstOrNull {
+                                it.kindType == SourceKind.ASMRONE
+                            }
+                            val openFacetFilter: ((AsmrFacet) -> Unit)? =
+                                asmrSource?.let { source ->
+                                    { facet: AsmrFacet ->
+                                        push(
+                                            WhispRoute.AsmrOne(
+                                                source.id,
+                                                facet.kind,
+                                                facet.name,
+                                            ),
+                                        )
+                                    }
+                                }
+                            entry<WhispRoute.Library> { destination ->
+                                RouteFrame(destination) {
+                                    LibraryPage(
+                                        graph = graph,
+                                        activeMiniWorkId = current?.work?.id,
+                                        reselectTick = libraryReselect,
+                                        open = { push(WhispRoute.Detail(it), destination) },
+                                        resumePlay = { workId ->
+                                            scope.launch {
+                                                val details =
+                                                    withContext(Dispatchers.IO) {
+                                                        graph.library.workDetails(workId)
+                                                    }
+                                                if (details != null) {
+                                                    graph.playback.playWork(details)
+                                                    push(WhispRoute.Player, destination)
+                                                } else {
+                                                    push(WhispRoute.Detail(workId), destination)
+                                                }
+                                            }
+                                        },
+                                        sources = { activeTabIndex = 1 },
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.Detail> { destination ->
+                                RouteFrame(destination) {
+                                    WorkDetailScreen(
+                                        graph = graph,
+                                        target = WorkDetailTarget.Library(destination.workId),
+                                        back = { pop(destination) },
+                                        player = { push(WhispRoute.Player, destination) },
+                                        filter = openFacetFilter,
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.Player> { destination ->
+                                RouteFrame(destination) {
+                                    PlayerPage(
+                                        detail = current,
+                                        track = currentTrack,
+                                        graph = graph,
+                                        back = { pop(destination) },
+                                        openDetail = ::openDetailFromPlayer,
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.Sources> { destination ->
+                                RouteFrame(destination) {
+                                    SourcesPage(
+                                        graph = graph,
+                                        reselectTick = sourcesReselect,
+                                        online = { push(WhispRoute.AsmrOne(it), destination) },
+                                        dlsite = { push(WhispRoute.Dlsite(it), destination) },
+                                        storage = { push(WhispRoute.Storage, destination) },
+                                        openWork = { push(WhispRoute.Detail(it), destination) },
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.Settings> { destination ->
+                                RouteFrame(destination) {
+                                    SettingsPage(
+                                        graph = graph,
+                                        openStorage = { push(WhispRoute.Storage, destination) },
+                                        reselectTick = settingsReselect,
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.Dlsite> { destination ->
+                                RouteFrame(destination) {
+                                    DlsiteLibraryPage(
+                                        graph = graph,
+                                        sourceId = destination.sourceId,
+                                        back = { pop(destination) },
+                                        openOwned = { workno ->
+                                            push(
+                                                WhispRoute.DlsiteWork(
+                                                    destination.sourceId,
+                                                    workno,
+                                                ),
+                                                destination,
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.DlsiteWork> { destination ->
+                                RouteFrame(destination) {
+                                    WorkDetailScreen(
+                                        graph = graph,
+                                        target =
+                                            WorkDetailTarget.DlsiteOwned(
+                                                destination.sourceId,
+                                                destination.workno,
+                                            ),
+                                        back = { pop(destination) },
+                                        player = { push(WhispRoute.Player, destination) },
+                                        filter = openFacetFilter,
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.AsmrOne> { destination ->
+                                RouteFrame(destination) {
+                                    val initialFacet =
+                                        if (
+                                            destination.facetKind != null &&
+                                                destination.facetName != null
+                                        )
+                                            AsmrFacet(
+                                                destination.facetKind,
+                                                destination.facetName,
+                                            )
+                                        else null
+                                    val scopeKey = initialFacet?.let {
+                                        "${destination.sourceId}|${it.kind}|${it.name}"
+                                    }
+                                    AsmrOnePage(
+                                        graph = graph,
+                                        sourceId = destination.sourceId,
+                                        initialFacet = initialFacet,
+                                        catalogScopeKey = scopeKey,
+                                        back = { pop(destination) },
+                                        open = { work ->
+                                            push(
+                                                WhispRoute.AsmrPreview(
+                                                    destination.sourceId,
+                                                    work.id,
+                                                ),
+                                                destination,
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.AsmrPreview> { destination ->
+                                RouteFrame(destination) {
+                                    WorkDetailScreen(
+                                        graph = graph,
+                                        target =
+                                            WorkDetailTarget.AsmrPreview(
+                                                destination.sourceId,
+                                                destination.workId,
+                                            ),
+                                        back = { pop(destination) },
+                                        player = { push(WhispRoute.Player, destination) },
+                                        filter = openFacetFilter,
+                                    )
+                                }
+                            }
+                            entry<WhispRoute.Storage> { destination ->
+                                RouteFrame(destination) {
+                                    StoragePage(
+                                        graph = graph,
+                                        backLabel =
+                                            if (activeTabIndex == 2)
+                                                stringResource(R.string.action_back_settings)
+                                            else stringResource(R.string.action_back_sources),
+                                        back = { pop(destination) },
+                                    )
+                                }
+                            }
+                        }
+                    // Keep one SaveableStateHolder decorator per top-level tab stack so switching
+                    // tabs preserves each tab's rememberSaveable scroll/filter/query state.
+                    val libraryEntries =
+                        rememberDecoratedNavEntries(
+                            backStack = libraryStack,
+                            entryDecorators =
+                                listOf(rememberSaveableStateHolderNavEntryDecorator()),
+                            entryProvider = navEntryProvider,
+                        )
+                    val sourcesEntries =
+                        rememberDecoratedNavEntries(
+                            backStack = sourcesStack,
+                            entryDecorators =
+                                listOf(rememberSaveableStateHolderNavEntryDecorator()),
+                            entryProvider = navEntryProvider,
+                        )
+                    val settingsEntries =
+                        rememberDecoratedNavEntries(
+                            backStack = settingsStack,
+                            entryDecorators =
+                                listOf(rememberSaveableStateHolderNavEntryDecorator()),
+                            entryProvider = navEntryProvider,
+                        )
+                    val activeEntries =
+                        when (activeTabIndex) {
+                            1 -> sourcesEntries
+                            2 -> settingsEntries
+                            else -> libraryEntries
+                        }
                     NavDisplay(
-                        backStack = stack,
+                        entries = activeEntries,
                         onBack = {
                             if (stack.size > 1) stack.removeAt(stack.lastIndex)
                             else if (activeTabIndex != 0) activeTabIndex = 0
@@ -415,213 +664,6 @@ fun WhispRoot(
                                         fadeOut(tween(180)))
                             }
                         },
-                        entryProvider =
-                            entryProvider {
-                                @Composable
-                                fun RouteFrame(
-                                    destination: WhispRoute,
-                                    content: @Composable () -> Unit,
-                                ) {
-                                    var bottom by remember {
-                                        mutableStateOf(padding.calculateBottomPadding())
-                                    }
-                                    if (
-                                        destination == route &&
-                                            destination !is WhispRoute.Player &&
-                                            !shared.isTransitionActive
-                                    ) {
-                                        SideEffect { bottom = padding.calculateBottomPadding() }
-                                    }
-                                    CompositionLocalProvider(
-                                        LocalArtworkVisibility provides
-                                            androidx.navigation3.ui.LocalNavAnimatedContentScope
-                                                .current,
-                                        LocalShareArtwork provides
-                                            (!miniTransition || destination is WhispRoute.Player),
-                                    ) {
-                                        Box(
-                                            Modifier.fillMaxSize()
-                                                .background(bg)
-                                                .padding(
-                                                    bottom =
-                                                        if (destination is WhispRoute.Player) 0.dp
-                                                        else bottom,
-                                                ),
-                                        ) {
-                                            content()
-                                        }
-                                    }
-                                }
-                                val asmrSource = sources.firstOrNull {
-                                    it.kindType == SourceKind.ASMRONE
-                                }
-                                val openFacetFilter: ((AsmrFacet) -> Unit)? =
-                                    asmrSource?.let { source ->
-                                        { facet: AsmrFacet ->
-                                            push(
-                                                WhispRoute.AsmrOne(
-                                                    source.id,
-                                                    facet.kind,
-                                                    facet.name,
-                                                ),
-                                            )
-                                        }
-                                    }
-                                entry<WhispRoute.Library> { destination ->
-                                    RouteFrame(destination) {
-                                        LibraryPage(
-                                            graph = graph,
-                                            activeMiniWorkId = current?.work?.id,
-                                            reselectTick = libraryReselect,
-                                            open = { push(WhispRoute.Detail(it), destination) },
-                                            resumePlay = { workId ->
-                                                scope.launch {
-                                                    val details =
-                                                        withContext(Dispatchers.IO) {
-                                                            graph.library.workDetails(workId)
-                                                        }
-                                                    if (details != null) {
-                                                        graph.playback.playWork(details)
-                                                        push(WhispRoute.Player, destination)
-                                                    } else {
-                                                        push(WhispRoute.Detail(workId), destination)
-                                                    }
-                                                }
-                                            },
-                                            sources = { activeTabIndex = 1 },
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.Detail> { destination ->
-                                    RouteFrame(destination) {
-                                        WorkDetailScreen(
-                                            graph = graph,
-                                            target = WorkDetailTarget.Library(destination.workId),
-                                            back = { pop(destination) },
-                                            player = { push(WhispRoute.Player, destination) },
-                                            filter = openFacetFilter,
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.Player> { destination ->
-                                    RouteFrame(destination) {
-                                        PlayerPage(
-                                            detail = current,
-                                            track = currentTrack,
-                                            graph = graph,
-                                            back = { pop(destination) },
-                                            openDetail = ::openDetailFromPlayer,
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.Sources> { destination ->
-                                    RouteFrame(destination) {
-                                        SourcesPage(
-                                            graph = graph,
-                                            reselectTick = sourcesReselect,
-                                            online = { push(WhispRoute.AsmrOne(it), destination) },
-                                            dlsite = { push(WhispRoute.Dlsite(it), destination) },
-                                            storage = { push(WhispRoute.Storage, destination) },
-                                            openWork = { push(WhispRoute.Detail(it), destination) },
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.Settings> { destination ->
-                                    RouteFrame(destination) {
-                                        SettingsPage(
-                                            graph = graph,
-                                            openStorage = { push(WhispRoute.Storage, destination) },
-                                            reselectTick = settingsReselect,
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.Dlsite> { destination ->
-                                    RouteFrame(destination) {
-                                        DlsiteLibraryPage(
-                                            graph = graph,
-                                            sourceId = destination.sourceId,
-                                            back = { pop(destination) },
-                                            openOwned = { workno ->
-                                                push(
-                                                    WhispRoute.DlsiteWork(
-                                                        destination.sourceId,
-                                                        workno,
-                                                    ),
-                                                    destination,
-                                                )
-                                            },
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.DlsiteWork> { destination ->
-                                    RouteFrame(destination) {
-                                        WorkDetailScreen(
-                                            graph = graph,
-                                            target =
-                                                WorkDetailTarget.DlsiteOwned(
-                                                    destination.sourceId,
-                                                    destination.workno,
-                                                ),
-                                            back = { pop(destination) },
-                                            player = { push(WhispRoute.Player, destination) },
-                                            filter = openFacetFilter,
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.AsmrOne> { destination ->
-                                    RouteFrame(destination) {
-                                        val initialFacet =
-                                            if (
-                                                destination.facetKind != null &&
-                                                    destination.facetName != null
-                                            )
-                                                AsmrFacet(
-                                                    destination.facetKind,
-                                                    destination.facetName,
-                                                )
-                                            else null
-                                        val scopeKey = initialFacet?.let {
-                                            "${destination.sourceId}|${it.kind}|${it.name}"
-                                        }
-                                        AsmrOnePage(
-                                            graph = graph,
-                                            sourceId = destination.sourceId,
-                                            initialFacet = initialFacet,
-                                            catalogScopeKey = scopeKey,
-                                            back = { pop(destination) },
-                                            open = { work ->
-                                                push(
-                                                    WhispRoute.AsmrPreview(
-                                                        destination.sourceId,
-                                                        work.id,
-                                                    ),
-                                                    destination,
-                                                )
-                                            },
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.AsmrPreview> { destination ->
-                                    RouteFrame(destination) {
-                                        WorkDetailScreen(
-                                            graph = graph,
-                                            target =
-                                                WorkDetailTarget.AsmrPreview(
-                                                    destination.sourceId,
-                                                    destination.workId,
-                                                ),
-                                            back = { pop(destination) },
-                                            player = { push(WhispRoute.Player, destination) },
-                                            filter = openFacetFilter,
-                                        )
-                                    }
-                                }
-                                entry<WhispRoute.Storage> { destination ->
-                                    RouteFrame(destination) {
-                                        StoragePage(graph = graph, back = { pop(destination) })
-                                    }
-                                }
-                            },
                     )
                 }
             }
@@ -774,7 +816,7 @@ private fun MiniPlayer(
                 else MaterialTheme.colorScheme.outlineVariant,
                 shape,
             )
-            .pointerInput(expandThresholdPx, swipeTrackThresholdPx) {
+            .pointerInput(expandThresholdPx, swipeTrackThresholdPx, reduced, haptics) {
                 val slopPx = viewConfiguration.touchSlop
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)

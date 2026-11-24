@@ -72,6 +72,7 @@ import app.whisp.data.isVideo
 import coil3.compose.AsyncImage
 import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
+import coil3.request.allowHardware
 import coil3.request.crossfade
 import coil3.toBitmap
 import java.util.Locale
@@ -193,12 +194,16 @@ internal fun Artwork(
     val platformContext = LocalPlatformContext.current
     val scope = rememberCoroutineScope()
     val requestData = remember(image, epoch) { image?.withEpoch(epoch) }
+    val needSoftwareBitmap = onAmbientColor != null
+    val currentOnAmbient by rememberUpdatedState(onAmbientColor)
+    val latestDiskKey by rememberUpdatedState(requestData?.diskKey)
     val imageRequest =
-        remember(requestData, reduced, platformContext) {
+        remember(requestData, reduced, platformContext, needSoftwareBitmap) {
             requestData?.let { data ->
                 ImageRequest.Builder(platformContext)
                     .data(data)
                     .crossfade(if (reduced) 0 else 200)
+                    .apply { if (needSoftwareBitmap) allowHardware(false) }
                     .build()
             }
         }
@@ -301,7 +306,7 @@ internal fun Artwork(
                         val cacheKey = requestData.diskKey
                         val cached = cachedAmbientColor(cacheKey)
                         if (cached != null) {
-                            onAmbientColor(cached)
+                            currentOnAmbient?.invoke(cached)
                         } else {
                             val resultImage = success.result.image
                             scope.launch {
@@ -313,7 +318,9 @@ internal fun Artwork(
                                         }
                                             .getOrNull()
                                     }
-                                if (sampled != null) onAmbientColor(sampled)
+                                if (sampled != null && latestDiskKey == cacheKey) {
+                                    currentOnAmbient?.invoke(sampled)
+                                }
                             }
                         }
                     }
@@ -816,17 +823,22 @@ internal fun WhispImageLightbox(
                 }
                 .pointerInput(onDismiss) {
                     val thresholdPx = 110.dp.toPx()
+                    val slopPx = viewConfiguration.touchSlop
                     awaitEachGesture {
                         awaitFirstDown(requireUnconsumed = false)
                         val velocityTracker = VelocityTracker()
                         var crossedThreshold = false
                         var dismissing = false
+                        var totalDx = 0f
+                        var totalDy = 0f
                         do {
                             val event = awaitPointerEvent()
                             val pressedCount = event.changes.count { it.pressed }
                             if (pressedCount == 0) break
                             val zoomChange = event.calculateZoom()
                             val panChange = event.calculatePan()
+                            totalDx += panChange.x
+                            totalDy += panChange.y
                             if (
                                 pressedCount > 1 ||
                                     scaleAnim.value > 1.02f ||
@@ -847,7 +859,9 @@ internal fun WhispImageLightbox(
                                     if (dismissY.value != 0f) dismissY.snapTo(0f)
                                 }
                                 event.changes.forEach { if (it.positionChanged()) it.consume() }
-                            } else if (abs(panChange.y) > abs(panChange.x) && panChange.y != 0f) {
+                            } else if (
+                                dismissing || (abs(totalDy) > slopPx && abs(totalDy) > abs(totalDx))
+                            ) {
                                 dismissing = true
                                 val nextY = dismissY.value + panChange.y
                                 event.changes.firstOrNull()?.let {
@@ -1047,12 +1061,15 @@ internal fun IconAction(
 @Composable
 internal fun WhispSheet(
     onDismissRequest: () -> Unit,
+    dismissible: Boolean = true,
     content: @Composable ColumnScope.(dismiss: () -> Unit) -> Unit,
 ) {
+    val currentDismissible by rememberUpdatedState(dismissible)
     val sheet =
         rememberBottomSheetState(
             initialValue = SheetValue.Hidden,
             enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded),
+            confirmValueChange = { target -> target != SheetValue.Hidden || currentDismissible },
         )
     val scope = rememberCoroutineScope()
     var closing by remember { mutableStateOf(false) }
@@ -1070,8 +1087,9 @@ internal fun WhispSheet(
         }
     }
     ModalBottomSheet(
-        onDismissRequest = onDismissRequest,
+        onDismissRequest = { if (currentDismissible) onDismissRequest() },
         sheetState = sheet,
+        sheetGesturesEnabled = dismissible,
         containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
         contentColor = Cream,
         dragHandle = { BottomSheetDefaults.DragHandle(color = Muted.copy(alpha = 0.45f)) },
@@ -1087,9 +1105,11 @@ internal fun SyncedSlider(
     steps: Int = 0,
     onValueChange: (Float) -> Unit,
 ) {
-    val sliderState = rememberSliderState(value = value, trackRange = range, steps = steps)
-    sliderState.value = value
-    Slider(state = sliderState, onValueChange = onValueChange)
+    key(range.start, range.endInclusive, steps) {
+        val sliderState = rememberSliderState(value = value, trackRange = range, steps = steps)
+        sliderState.value = value.coerceIn(range.start, range.endInclusive)
+        Slider(state = sliderState, onValueChange = onValueChange)
+    }
 }
 
 @Composable

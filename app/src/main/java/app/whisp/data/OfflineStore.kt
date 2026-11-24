@@ -3,6 +3,8 @@ package app.whisp.data
 
 import android.content.Context
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import androidx.core.net.toUri
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
@@ -32,7 +34,14 @@ class OfflineStore(
     private val library: LibraryStore,
     private val media: MediaSourceRouting,
     private val images: WhispImages,
+    private val detachTracks: (Set<String>) -> Unit = {},
 ) {
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private fun onMain(action: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) action() else mainHandler.post(action)
+    }
+
     private suspend fun withWork(id: String, block: suspend (WorkDetails) -> Unit) {
         library.withWorkLock(id) {
             val detail = library.dao.details(id) ?: return@withWorkLock
@@ -40,30 +49,48 @@ class OfflineStore(
         }
     }
 
+    /**
+     * Mutates the in-process [DownloadManager] directly so background cleanups (e.g. ScanWorker)
+     * never fail with ForegroundServiceStartNotAllowedException on API 26–36.
+     */
     fun removeTrackDownload(id: String) {
-        DownloadService.sendRemoveDownload(context, OfflineService::class.java, id, false)
+        onMain { media.downloadManager.removeDownload(id) }
     }
 
     fun resumeDownloads() {
-        DownloadService.sendResumeDownloads(context, OfflineService::class.java, false)
+        runCatching {
+            DownloadService.sendResumeDownloads(context, OfflineService::class.java, true)
+        }
+            .onFailure { onMain { media.downloadManager.resumeDownloads() } }
     }
 
     fun pauseDownloads() {
-        DownloadService.sendPauseDownloads(context, OfflineService::class.java, false)
+        onMain { media.downloadManager.pauseDownloads() }
     }
 
     suspend fun downloadWork(id: String) =
         withWork(id) { detail ->
             require(detail.tracks.isNotEmpty()) { "作品没有音轨" }
-            for (track in detail.tracks) {
-                val uri = library.resolveTrackUri(track, detail.work)
-                val request =
+            val requests =
+                detail.tracks.map { track ->
+                    val uri = library.resolveTrackUri(track, detail.work)
                     DownloadRequest.Builder(track.id, uri.toUri())
                         .setMimeType(MediaFormats.videoMimeType(track.fileName))
                         .setCustomCacheKey(track.id)
                         .build()
-                DownloadService.sendAddDownload(context, OfflineService::class.java, request, false)
+                }
+            for (request in requests) {
+                runCatching {
+                    DownloadService.sendAddDownload(
+                        context,
+                        OfflineService::class.java,
+                        request,
+                        true,
+                    )
+                }
+                    .onFailure { onMain { media.downloadManager.addDownload(request) } }
             }
+            resumeDownloads()
             WorkManager.getInstance(context)
                 .enqueueUniqueWork(
                     "attachments-$id",
@@ -139,10 +166,14 @@ class OfflineStore(
             }
             library.dao.attachmentsReady(id, false)
             if (detail.work.sourceId == null) {
+                val trackIds = detail.tracks.map { it.id }.toSet()
+                if (trackIds.isNotEmpty()) {
+                    withContext(Dispatchers.Main.immediate) { detachTracks(trackIds) }
+                }
                 library.dao.deleteWork(id)
                 images.purgeWorkAssets(
                     id,
-                    (detail.tracks.map { it.id } +
+                    (trackIds +
                             detail.attachments.map { it.id } +
                             listOfNotNull(detail.work.coverId))
                         .toSet(),

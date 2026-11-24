@@ -166,9 +166,19 @@ private data class AsmrTreeNodeDto(
 )
 
 class AsmrOneClient(
-    private val http: OkHttpClient,
+    baseHttp: OkHttpClient,
     private val root: HttpUrl = API_ROOT.toHttpUrl(),
 ) {
+    private val http: OkHttpClient =
+        baseHttp
+            .newBuilder()
+            .followSslRedirects(false)
+            .addNetworkInterceptor { chain ->
+                resourceUrl(chain.request().url.toString())
+                chain.proceed(chain.request())
+            }
+            .build()
+
     companion object {
         const val API_ROOT = "https://api.asmr.one/"
         val MEDIA_HEADERS = mapOf("Origin" to "https://asmr.one", "Referer" to "https://asmr.one/")

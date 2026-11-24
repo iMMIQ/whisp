@@ -57,9 +57,61 @@ data class DlsiteMetadata(
 }
 
 class DlsiteClient(
-    private val http: OkHttpClient,
+    baseHttp: OkHttpClient,
     private val root: HttpUrl = "https://www.dlsite.com/".toHttpUrl(),
 ) {
+    private val http: OkHttpClient =
+        baseHttp
+            .newBuilder()
+            .followSslRedirects(false)
+            .addNetworkInterceptor { chain ->
+                val url = chain.request().url
+                if (!isAllowedUrl(url)) throw IOException("DLsite 地址无效")
+                chain.proceed(chain.request())
+            }
+            .build()
+
+    private fun isAllowedUrl(url: HttpUrl): Boolean {
+        if (url.username.isNotEmpty() || url.password.isNotEmpty()) return false
+        val loopback = url.host in setOf("localhost", "127.0.0.1", "10.0.2.2")
+        val localTest =
+            loopback &&
+                (url.host == root.host ||
+                    runCatching {
+                            android.security.NetworkSecurityPolicy.getInstance()
+                                .isCleartextTrafficPermitted(url.host)
+                        }
+                        .getOrDefault(false))
+        if (!(url.scheme == "https" || localTest)) return false
+        return localTest ||
+            listOf("dlsite.com", "dlsite.jp").any {
+                url.host == it || url.host.endsWith(".$it")
+            }
+    }
+
+    suspend fun fetchBytes(url: String, limit: Int = 16 * 1024 * 1024): ByteArray {
+        val parsed = url.toHttpUrlOrNull() ?: throw IOException("DLsite 地址无效")
+        if (!isAllowedUrl(parsed)) throw IOException("DLsite 地址无效")
+        return http.onlineBytes(
+            Request.Builder().url(parsed).header("Referer", "https://www.dlsite.com/").build(),
+            limit,
+        )
+    }
+
+    suspend fun copyToSink(
+        url: String,
+        sink: okio.BufferedSink,
+        limit: Int = 16 * 1024 * 1024,
+    ): Long {
+        val parsed = url.toHttpUrlOrNull() ?: throw IOException("DLsite 地址无效")
+        if (!isAllowedUrl(parsed)) throw IOException("DLsite 地址无效")
+        return http.onlineCopyToSink(
+            Request.Builder().url(parsed).header("Referer", "https://www.dlsite.com/").build(),
+            sink,
+            limit,
+        )
+    }
+
     suspend fun work(number: String): DlsiteMetadata {
         val rj = number.uppercase()
         require(validDlsiteWorkno(rj)) { "作品编号无效" }

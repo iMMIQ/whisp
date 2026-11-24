@@ -146,7 +146,11 @@ class DlsiteAccountClient(
                 .loadForRequest(url)
                 .firstOrNull { it.name == "XSRF-TOKEN" }
                 ?.let {
-                    request.header("X-XSRF-TOKEN", java.net.URLDecoder.decode(it.value, "UTF-8"))
+                    val decoded = runCatching {
+                        java.net.URLDecoder.decode(it.value, "UTF-8")
+                    }
+                        .getOrDefault(it.value)
+                    request.header("X-XSRF-TOKEN", decoded)
                 }
             request.post(body.toRequestBody("application/json".toMediaType()))
         }

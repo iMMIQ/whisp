@@ -138,11 +138,19 @@ internal fun LibraryPage(
             }
         }
     val seriesGroups =
-        remember(works) {
+        remember(works, query, matchedIds) {
+            val trimmed = query.trim().lowercase()
+            val matched = matchedIds
             works
                 .filter { !it.series.isNullOrBlank() }
                 .groupBy { it.series!! }
                 .entries
+                .filter { (seriesName, members) ->
+                    trimmed.isEmpty() ||
+                        matched == null ||
+                        seriesName.lowercase().contains(trimmed) ||
+                        members.any { it.id in matched }
+                }
                 .sortedBy { it.key }
                 .map { it.key to it.value }
         }

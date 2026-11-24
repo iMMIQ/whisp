@@ -224,6 +224,7 @@ internal fun PrecisionSeekBar(
                 }
             }
         }
+        DisposableEffect(Unit) { onDispose { clear() } }
         val semanticPositionMs by remember {
             derivedStateOf { (positionLookup().coerceAtLeast(0L) / 1000L) * 1000L }
         }
@@ -251,61 +252,72 @@ internal fun PrecisionSeekBar(
                     val fineThreshold = 36.dp.toPx()
                     val thumbGrabTolerance = 26.dp.toPx()
                     val adaptiveFineWindow = if (duration in 1L..300_000L) 30_000L else 60_000L
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        val usable = (size.width - pad * 2f).coerceAtLeast(1f)
-                        val downX = (down.position.x - pad).coerceIn(0f, usable)
-                        val currentPos = positionLookup().coerceIn(0L, duration)
-                        val thumbX =
-                            if (duration > 0L) (currentPos.toFloat() / duration) * usable else 0f
-                        val grabNearThumb = abs(downX - thumbX) <= thumbGrabTolerance
-                        val session =
-                            PrecisionScrubber(
-                                durationMs = duration,
-                                widthPx = usable,
-                                startX = downX,
-                                startY = down.position.y,
-                                fineThresholdPx = fineThreshold,
-                                fineWindowMs = adaptiveFineWindow,
-                                initialPositionMs = if (grabNearThumb) currentPos else null,
-                            )
-                        drag = session
-                        preview = session.positionMs
-                        fine = false
-                        haptics.tick()
-                        scrubbingChange?.invoke(true)
-                        update(preview)
-                        updateBounds?.invoke(null)
-                        down.consume()
-
-                        var committed = true
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change =
-                                event.changes.firstOrNull { it.id == down.id }
-                                    ?: event.changes.firstOrNull()
-                                    ?: break
-                            if (!change.pressed) {
-                                if (change.isConsumed) committed = false
-                                change.consume()
-                                break
-                            }
-                            change.consume()
-                            val wasFine = session.fine
-                            val next = session.move(change.position.x - pad, change.position.y)
-                            preview = next
-                            fine = session.fine
-                            if (fine != wasFine) {
-                                haptics.tick()
-                                updateBounds?.invoke(
-                                    if (fine) session.rangeStart..session.rangeEnd else null,
+                    try {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val usable = (size.width - pad * 2f).coerceAtLeast(1f)
+                            val downX = (down.position.x - pad).coerceIn(0f, usable)
+                            val currentPos = positionLookup().coerceIn(0L, duration)
+                            val thumbX =
+                                if (duration > 0L) (currentPos.toFloat() / duration) * usable
+                                else 0f
+                            val grabNearThumb = abs(downX - thumbX) <= thumbGrabTolerance
+                            val session =
+                                PrecisionScrubber(
+                                    durationMs = duration,
+                                    widthPx = usable,
+                                    startX = downX,
+                                    startY = down.position.y,
+                                    fineThresholdPx = fineThreshold,
+                                    fineWindowMs = adaptiveFineWindow,
+                                    initialPositionMs = if (grabNearThumb) currentPos else null,
                                 )
+                            drag = session
+                            preview = session.positionMs
+                            fine = false
+                            haptics.tick()
+                            scrubbingChange?.invoke(true)
+                            update(preview)
+                            updateBounds?.invoke(null)
+                            down.consume()
+
+                            var committed = true
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change =
+                                        event.changes.firstOrNull { it.id == down.id }
+                                            ?: event.changes.firstOrNull()
+                                            ?: break
+                                    if (!change.pressed) {
+                                        if (change.isConsumed) committed = false
+                                        change.consume()
+                                        break
+                                    }
+                                    change.consume()
+                                    val wasFine = session.fine
+                                    val next =
+                                        session.move(change.position.x - pad, change.position.y)
+                                    preview = next
+                                    fine = session.fine
+                                    if (fine != wasFine) {
+                                        haptics.tick()
+                                        updateBounds?.invoke(
+                                            if (fine) session.rangeStart..session.rangeEnd
+                                            else null,
+                                        )
+                                    }
+                                    update(next)
+                                }
+                                val finalPos = preview
+                                clear()
+                                if (committed && finalPos != null) seek(finalPos)
+                            } finally {
+                                if (preview != null || drag != null) clear()
                             }
-                            update(next)
                         }
-                        val finalPos = preview
-                        clear()
-                        if (committed && finalPos != null) seek(finalPos)
+                    } finally {
+                        if (preview != null || drag != null) clear()
                     }
                 },
         ) {

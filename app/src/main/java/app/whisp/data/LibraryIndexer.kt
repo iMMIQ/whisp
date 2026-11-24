@@ -173,8 +173,8 @@ object LibraryIndexer {
                             .filter { it.value.kind == kind }
                             .minByOrNull {
                                 if (
-                                    it.key.path.substringBeforeLast('/') ==
-                                        file.path.substringBeforeLast('/')
+                                    it.key.path.substringBeforeLast('/', "") ==
+                                        file.path.substringBeforeLast('/', "")
                                 )
                                     0
                                 else 1

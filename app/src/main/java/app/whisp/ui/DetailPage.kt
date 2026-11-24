@@ -303,14 +303,17 @@ internal fun WorkDetailScreen(
                                 if (graph.playback.state.value.playWhenReady) {
                                     graph.playback.togglePlay()
                                 }
-                                graph.context.startActivity(
-                                    Intent(
-                                            Intent.ACTION_VIEW,
-                                            "https://play.dlsite.com/work/${officialPlayerWorkno}"
-                                                .toUri(),
-                                        )
-                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                                )
+                                runCatching {
+                                    graph.context.startActivity(
+                                        Intent(
+                                                Intent.ACTION_VIEW,
+                                                "https://play.dlsite.com/work/${officialPlayerWorkno}"
+                                                    .toUri(),
+                                            )
+                                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                    )
+                                }
+                                    .onFailure { graph.messages.tryEmit("未找到可打开链接的应用") }
                             },
                         ) {
                             Text("打开 DLsite Play")
@@ -388,22 +391,29 @@ internal fun WorkDetailScreen(
                             it.state == Download.STATE_DOWNLOADING ||
                                 it.state == Download.STATE_QUEUED
                         }
+                        val paused =
+                            !complete &&
+                                !active &&
+                                trackStates.any {
+                                    it.state == Download.STATE_STOPPED
+                                }
                         val pct =
                             if (detail.tracks.isEmpty()) 0f
                             else
                                 trackStates
                                     .map { it.percentDownloaded.takeIf { v -> v >= 0f } ?: 0f }
                                     .sum() / (detail.tracks.size * 100f)
-                        Triple(complete, active, pct.coerceIn(0f, 1f))
+                        listOf(complete, active, paused, pct.coerceIn(0f, 1f))
                     }
                     .distinctUntilChanged()
             }
             .collectAsStateWithLifecycle(
-                initialValue = Triple(graph.offline.isOffline(detail), false, 0f),
+                initialValue = listOf(graph.offline.isOffline(detail), false, false, 0f),
             )
-    val offline = downloadSnapshot.first
-    val downloading = downloadSnapshot.second
-    val downloadProgress = downloadSnapshot.third
+    val offline = downloadSnapshot[0] as Boolean
+    val downloading = downloadSnapshot[1] as Boolean
+    val downloadPaused = downloadSnapshot[2] as Boolean
+    val downloadProgress = downloadSnapshot[3] as Float
 
     val sections = remember(detail.tracks) { TrackSections.groups(detail.tracks) }
     val totalDurationMs =
@@ -466,11 +476,15 @@ internal fun WorkDetailScreen(
     }
 
     val listState = rememberLazyListState()
-    val headerCollapsed by remember {
-        derivedStateOf {
-            listState.firstVisibleItemIndex >= 1 || listState.firstVisibleItemScrollOffset > 520
+    val collapseThresholdPx =
+        with(androidx.compose.ui.platform.LocalDensity.current) { 180.dp.roundToPx() }
+    val headerCollapsed by
+        remember(collapseThresholdPx) {
+            derivedStateOf {
+                listState.firstVisibleItemIndex >= 1 ||
+                    listState.firstVisibleItemScrollOffset > collapseThresholdPx
+            }
         }
-    }
     val stickyClearance by
         animateDpAsState(
             targetValue = if (headerCollapsed) 52.dp else 0.dp,
@@ -539,13 +553,17 @@ internal fun WorkDetailScreen(
                                     }
                                     Box(contentAlignment = Alignment.Center) {
                                         IconAction(
-                                            if (offline) Icons.Outlined.DownloadDone
-                                            else Icons.Outlined.Download,
+                                            when {
+                                                offline -> Icons.Outlined.DownloadDone
+                                                downloadPaused -> Icons.Outlined.PauseCircleOutline
+                                                else -> Icons.Outlined.Download
+                                            },
                                             stringResource(R.string.action_download),
-                                            if (offline || downloading) Rose else Cream,
+                                            if (offline || downloading || downloadPaused) Rose
+                                            else Cream,
                                             haptic = HapticKind.Tick,
                                         ) {
-                                            if (offline || downloading) {
+                                            if (offline || downloading || downloadPaused) {
                                                 downloadManage = true
                                             } else {
                                                 scope.launch {
@@ -952,12 +970,16 @@ internal fun WorkDetailScreen(
     if (downloadManage && inLibrary) {
         WhispSheet(onDismissRequest = { downloadManage = false }) { dismiss ->
             Text(
-                if (offline) "已离线保存" else "离线下载中 · ${(downloadProgress * 100).toInt()}%",
+                when {
+                    offline -> "已离线保存"
+                    downloadPaused -> "下载已暂停 · ${(downloadProgress * 100).toInt()}%"
+                    else -> "离线下载中 · ${(downloadProgress * 100).toInt()}%"
+                },
                 style = MaterialTheme.typography.headlineSmall,
                 color = Cream,
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp),
             )
-            if (downloading) {
+            if (downloading || downloadPaused) {
                 LinearProgressIndicator(
                     progress = { downloadProgress },
                     modifier =
@@ -968,6 +990,8 @@ internal fun WorkDetailScreen(
                     color = Rose,
                     trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                 )
+            }
+            if (downloading) {
                 WhispSheetRow(
                     icon = Icons.Outlined.Pause,
                     title = "暂停下载",
@@ -976,6 +1000,7 @@ internal fun WorkDetailScreen(
                         dismiss()
                     },
                 )
+            } else if (downloadPaused) {
                 WhispSheetRow(
                     icon = Icons.Outlined.PlayArrow,
                     title = "继续下载",
@@ -1267,12 +1292,14 @@ private fun InfoDialog(
                 }
                 Button(
                     onClick = {
-                        scope.launch {
+                        val nextTitle = title.ifBlank { detail.work.title }
+                        val nextArtist = artist
+                        graph.scope.launch {
                             runCatching {
                                 graph.library.editWorkIdentity(
                                     detail.work.id,
-                                    title.ifBlank { detail.work.title },
-                                    artist,
+                                    nextTitle,
+                                    nextArtist,
                                 )
                             }
                         }

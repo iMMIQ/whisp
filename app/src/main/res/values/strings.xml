@@ -13,6 +13,7 @@
     <string name="action_exit_series">退出系列</string>
     <string name="action_back_library">返回作品库</string>
     <string name="action_back_sources">返回来源</string>
+    <string name="action_back_settings">返回设置</string>
     <string name="action_collapse_player">收起播放器</string>
     <string name="action_favorite">收藏作品</string>
     <string name="action_download">下载作品</string>
@@ -23,8 +24,8 @@
     <string name="action_shuffle">随机播放</string>
     <string name="action_previous_track">上一曲</string>
     <string name="action_next_track">下一曲</string>
-    <string name="action_rewind_10">后退十秒</string>
-    <string name="action_forward_10">前进十秒</string>
+    <string name="action_rewind_seconds">后退%1$d秒</string>
+    <string name="action_forward_seconds">前进%1$d秒</string>
     <string name="action_queue">播放队列</string>
     <string name="action_fragments">片段</string>
     <string name="action_sleep_timer">定时停止</string>

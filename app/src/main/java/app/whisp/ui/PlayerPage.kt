@@ -216,7 +216,7 @@ internal fun PlayerPage(
     val dismissOffsetY = remember { Animatable(0f) }
     val dismissThresholdPx = with(density) { 88.dp.toPx() }
     val dismissDragModifier =
-        Modifier.pointerInput(back, dismissThresholdPx, reduced) {
+        Modifier.pointerInput(back, dismissThresholdPx, reduced, haptics) {
             val velocityTracker = VelocityTracker()
             var crossed = false
             detectVerticalDragGestures(
@@ -419,6 +419,10 @@ internal fun PlayerPage(
                             )
                     },
                     onToggleInlineAb = { inlineAbBar = !inlineAbBar },
+                    onCloseInlineAb = {
+                        inlineAbBar = false
+                        playback.dismissClearedLoop()
+                    },
                     onOpenQueue = { queue = true },
                     onOpenFragments = { fragments = true },
                     onOpenTimer = { timer = true },
@@ -1020,8 +1024,14 @@ private fun EmbeddedScriptPane(
     LaunchedEffect(selected.id) {
         loading = true
         error = null
+        chunks = null
         try {
-            rawBytes = graph.library.readAsset(selected.id, 64 * 1024 * 1024)
+            val bytes = graph.library.readAsset(selected.id, 64 * 1024 * 1024)
+            rawBytes = bytes
+            chunks =
+                withContext(Dispatchers.Default) {
+                    chunkLongText(TextEncoding.decode(bytes, encoding))
+                }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1533,6 +1543,7 @@ private fun PlayerControls(
     onLongPressSubtitle: (Cue) -> Unit,
     onSaveLoopAsBookmark: () -> Unit,
     onToggleInlineAb: () -> Unit,
+    onCloseInlineAb: () -> Unit,
     onOpenQueue: () -> Unit,
     onOpenFragments: () -> Unit,
     onOpenTimer: () -> Unit,
@@ -1636,7 +1647,7 @@ private fun PlayerControls(
                 enabled = shownTrack != null,
                 playback = playback,
                 onSaveLoop = onSaveLoopAsBookmark,
-                onClose = { onToggleInlineAb() },
+                onClose = onCloseInlineAb,
             )
         } else {
             ActiveModifiersRow(
@@ -1690,7 +1701,7 @@ private fun PlayerControls(
             ) {
                 Icon(
                     rewindIconFor(settings.skipSeconds),
-                    stringResource(R.string.action_rewind_10),
+                    stringResource(R.string.action_rewind_seconds, settings.skipSeconds),
                     tint = if (shownTrack != null) Cream else Cream.copy(alpha = 0.35f),
                 )
             }
@@ -1788,7 +1799,7 @@ private fun PlayerControls(
             ) {
                 Icon(
                     forwardIconFor(settings.skipSeconds),
-                    stringResource(R.string.action_forward_10),
+                    stringResource(R.string.action_forward_seconds, settings.skipSeconds),
                     tint = if (shownTrack != null) Cream else Cream.copy(alpha = 0.35f),
                 )
             }

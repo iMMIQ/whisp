@@ -12,6 +12,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.ShuffleOrder
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import app.whisp.data.*
@@ -20,6 +21,7 @@ import app.whisp.ui.SubtitleLoader
 import com.google.common.util.concurrent.ListenableFuture
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.random.Random
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
@@ -59,6 +61,7 @@ class PlaybackCoordinator(
 
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var openJob: Job? = null
+    private var bookmarkLoopJob: Job? = null
     private var pendingStartPlaying = true
     private var queueLoadJob: Job? = null
     private val queueSnapshot = mutableMapOf<String, TrackEntity>()
@@ -100,12 +103,19 @@ class PlaybackCoordinator(
     internal fun detach(player: ExoPlayer) {
         if (activePlayer !== player) return
         player.removeListener(playerListener)
+        bookmarkLoopJob?.cancel()
+        bookmarkLoopJob = null
+        queueLoadJob?.cancel()
+        queueLoadJob = null
+        controllerFuture?.let { MediaController.releaseFuture(it) }
+        controllerFuture = null
         activePlayer = null
         activeLoop = null
         activeTimer = null
         videoToggle = null
         textToggle = null
         playerFlow.value = null
+        queueSnapshot.clear()
         state.value = PlaybackState()
         positionMs.value = 0L
         bufferedMs.value = 0L
@@ -133,6 +143,14 @@ class PlaybackCoordinator(
         activePlayer?.let {
             return it
         }
+        val existing = controllerFuture
+        if (existing != null && existing.isDone) {
+            val connected = runCatching { existing.get().isConnected }.getOrDefault(false)
+            if (!connected) {
+                MediaController.releaseFuture(existing)
+                controllerFuture = null
+            }
+        }
         val future =
             controllerFuture
                 ?: MediaController.Builder(
@@ -149,7 +167,10 @@ class PlaybackCoordinator(
                             future.get()
                             if (continuation.isActive) continuation.resume(Unit)
                         } catch (e: Exception) {
-                            if (controllerFuture === future) controllerFuture = null
+                            if (controllerFuture === future) {
+                                MediaController.releaseFuture(future)
+                                controllerFuture = null
+                            }
                             if (continuation.isActive) continuation.resumeWithException(e)
                         }
                     },
@@ -199,6 +220,8 @@ class PlaybackCoordinator(
         startPosition: Long? = null,
     ) {
         error.value = null
+        bookmarkLoopJob?.cancel()
+        bookmarkLoopJob = null
         openJob?.cancel()
         pendingStartPlaying = true
         val initialRequested = trackId ?: detail.tracks.firstOrNull()?.id
@@ -219,10 +242,11 @@ class PlaybackCoordinator(
                     reportError("音轨文件不可用，请检查来源或重新下载")
                     return@launch
                 }
-                val ordered = if (shuffle) available.shuffled() else available
+                val ordered = available
+                val shuffledIndices = if (shuffle) ordered.indices.shuffled().toIntArray() else null
                 val resume =
                     when {
-                        shuffle -> QueuePosition(0, 0L)
+                        shuffle -> QueuePosition(shuffledIndices!![0], 0L)
                         restart -> QueuePosition(0, 0L)
                         trackId != null ->
                             QueuePosition(
@@ -250,6 +274,7 @@ class PlaybackCoordinator(
                     !restart && !shuffle && startPosition == null && currentId == selectedTrack.id
                 if (continuingSame) subtitles.retry(selectedTrack.id)
                 if (continuingSame && currentQueueIds == targetIds) {
+                    queueSnapshot.clear()
                     ordered.forEach { queueSnapshot[it.id] = it }
                     player.shuffleModeEnabled = false
                     if (player.playbackState == Player.STATE_ENDED) player.seekTo(resume.index, 0)
@@ -262,9 +287,18 @@ class PlaybackCoordinator(
                     if (continuingSame) player.currentPosition.coerceAtLeast(0L)
                     else resume.positionMs
                 val items = withContext(Dispatchers.IO) { mediaItems(ordered, detail.work) }
+                queueSnapshot.clear()
                 ordered.forEach { queueSnapshot[it.id] = it }
-                player.shuffleModeEnabled = shuffle
-                player.setMediaItems(items, resume.index, resumePosition)
+                if (shuffle && shuffledIndices != null) {
+                    player.setMediaItems(items, shuffledIndices[0], 0L)
+                    player.setShuffleOrder(
+                        ShuffleOrder.DefaultShuffleOrder(shuffledIndices, Random.nextLong()),
+                    )
+                    player.shuffleModeEnabled = true
+                } else {
+                    player.shuffleModeEnabled = false
+                    player.setMediaItems(items, resume.index, resumePosition)
+                }
                 player.prepare()
                 if (pendingStartPlaying) player.play() else player.pause()
                 refreshFromPlayer(player)
@@ -282,9 +316,11 @@ class PlaybackCoordinator(
 
     fun playBookmark(detail: WorkDetails, bookmark: BookmarkEntity, repeat: Boolean = false) {
         playWork(detail, bookmark.trackId, startPosition = bookmark.positionMs)
+        val launchedOpen = openJob
         if (repeat && bookmark.endMs != null && bookmark.endMs > bookmark.positionMs) {
-            scope.launch {
-                openJob?.join()
+            bookmarkLoopJob = scope.launch {
+                launchedOpen?.join()
+                if (launchedOpen?.isCancelled == true) return@launch
                 if (state.value.trackId == bookmark.trackId) {
                     setLoop(bookmark.positionMs, bookmark.endMs)
                 }
@@ -298,7 +334,16 @@ class PlaybackCoordinator(
             state.update { it.copy(playWhenReady = pendingStartPlaying) }
             return
         }
-        val player = activePlayer ?: return
+        val player = activePlayer
+        if (player == null || player.mediaItemCount == 0) {
+            openJob = scope.launch {
+                val detail = withContext(Dispatchers.IO) { library.latestDetails() }
+                if (detail != null) {
+                    playWork(detail)
+                }
+            }
+            return
+        }
         if (player.playWhenReady) {
             player.pause()
         } else {

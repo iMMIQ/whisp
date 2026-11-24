@@ -30,7 +30,8 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             PendingIntent.getActivity(
                 applicationContext,
                 0,
-                Intent(applicationContext, MainActivity::class.java),
+                Intent(applicationContext, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
         val notification =
@@ -63,7 +64,14 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         if (graph.library.dao.source(sourceId) == null) return Result.success()
         var scanStarted = false
         return try {
-            setForeground(getForegroundInfo())
+            try {
+                setForeground(getForegroundInfo())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: IllegalStateException) {
+                // Foreground service start can be disallowed for background/out-of-quota workers
+                // on API 31+; continue scanning inside the WorkManager JobScheduler window.
+            }
             scanStarted = true
             graph.sync.scan(sourceId)
             Result.success()

@@ -17,26 +17,33 @@ internal class ProgressWriter(
     private val writes = Mutex()
     private var latest: ProgressEntity? = null
     private var immediateRequested = false
+    private var wakeNow = CompletableDeferred<Unit>()
 
     init {
         scope.launch {
             for (immediate in signal) {
-                val skipDelay =
+                val (skipDelay, wake) =
                     synchronized(pending) {
                         val value = immediate || immediateRequested
                         immediateRequested = false
-                        value
+                        val nextWake = CompletableDeferred<Unit>()
+                        wakeNow = nextWake
+                        value to nextWake
                     }
                 // Merge the callbacks produced by a single pause/seek/transition unless shutting
-                // down.
-                if (!skipDelay) delay(150)
+                // down; saveImmediate() completes [wake] to bypass waiting immediately.
+                if (!skipDelay) withTimeoutOrNull(150) { wake.await() }
                 try {
                     flush()
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     failed(e)
-                    delay(5000)
+                    val retryWake =
+                        synchronized(pending) {
+                            CompletableDeferred<Unit>().also { wakeNow = it }
+                        }
+                    withTimeoutOrNull(5000) { retryWake.await() }
                     signal.trySend(false)
                 }
             }
@@ -58,6 +65,7 @@ internal class ProgressWriter(
             ) {
                 if (immediate && pending.isNotEmpty()) {
                     immediateRequested = true
+                    wakeNow.complete(Unit)
                     signal.trySend(true)
                 }
                 return@synchronized
@@ -65,7 +73,10 @@ internal class ProgressWriter(
             latest = progress
             pending.remove(progress.workId)
             pending[progress.workId] = progress
-            if (immediate) immediateRequested = true
+            if (immediate) {
+                immediateRequested = true
+                wakeNow.complete(Unit)
+            }
             signal.trySend(immediate)
             Unit
         }

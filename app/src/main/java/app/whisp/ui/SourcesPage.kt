@@ -320,6 +320,11 @@ internal fun SourcesPage(
                     work.offlineAttachments &&
                         trackIds.all { downloads[it]?.state == Download.STATE_COMPLETED }
                 val failed = states.any { it.state == Download.STATE_FAILED }
+                val active = states.any {
+                    it.state == Download.STATE_DOWNLOADING || it.state == Download.STATE_QUEUED
+                }
+                val paused =
+                    !complete && !active && states.any { it.state == Download.STATE_STOPPED }
                 val percentage =
                     states.map { it.percentDownloaded.takeIf { value -> value >= 0 } ?: 0f }.sum() /
                         trackIds.size.coerceAtLeast(1)
@@ -352,6 +357,7 @@ internal fun SourcesPage(
                                 when {
                                     complete -> "已离线保存"
                                     failed -> "下载失败"
+                                    paused -> "已暂停 · ${percentage.toInt()}%"
                                     else -> "下载中 · ${percentage.toInt()}%"
                                 },
                                 style =
@@ -601,7 +607,8 @@ private fun RemoteDialog(graph: AppGraph, kind: SourceKind, dismiss: () -> Unit)
             SourceKind.NFS -> "NFS"
             else -> "WebDAV"
         }
-    WhispSheet(onDismissRequest = { if (!connecting) dismiss() }) { close ->
+    WhispSheet(onDismissRequest = { if (!connecting) dismiss() }, dismissible = !connecting) { close
+        ->
         Column(
             Modifier.fillMaxWidth()
                 .verticalScroll(rememberScrollState())

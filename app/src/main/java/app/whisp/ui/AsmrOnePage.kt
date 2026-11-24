@@ -84,8 +84,10 @@ class AsmrCatalogController(
                 )
         }
         refreshJob = scope.launch {
+            val currentJob = coroutineContext[Job]
             try {
                 val page = withContext(Dispatchers.IO) { fetchPage(active, 1) }
+                if (refreshJob !== currentJob) return@launch
                 recordFacets(page.works)
                 state.value =
                     AsmrCatalogState(
@@ -97,6 +99,7 @@ class AsmrCatalogController(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                if (refreshJob !== currentJob) return@launch
                 state.update {
                     it.copy(refreshing = false, refreshError = e.message ?: "连接失败")
                 }
@@ -118,8 +121,10 @@ class AsmrCatalogController(
         val nextPage = current.page + 1
         state.update { it.copy(appending = true, appendError = null) }
         appendJob = scope.launch {
+            val currentJob = coroutineContext[Job]
             try {
                 val page = withContext(Dispatchers.IO) { fetchPage(active, nextPage) }
+                if (appendJob !== currentJob) return@launch
                 recordFacets(page.works)
                 state.update { prev ->
                     val seen = prev.items.mapTo(HashSet()) { it.workId }
@@ -133,6 +138,7 @@ class AsmrCatalogController(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                if (appendJob !== currentJob) return@launch
                 state.update {
                     it.copy(appending = false, appendError = e.message ?: "加载失败")
                 }

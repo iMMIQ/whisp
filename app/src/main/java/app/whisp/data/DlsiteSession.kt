@@ -27,27 +27,26 @@ class DlsiteSession(snapshot: String = "", private val changed: (String) -> Unit
         fun trusted(url: HttpUrl) = url.scheme == "https" && url.host in hosts && url.port == 443
 
         fun fromBrowser(headers: Map<String, String>): String {
-            val entries = buildList {
-                headers.forEach { (origin, header) ->
-                    val url = origin.toHttpUrl()
-                    require(trusted(url))
-                    header.split(';').forEach { item ->
-                        val name = item.substringBefore('=').trim()
-                        val value = item.substringAfter('=', "").trim()
-                        if (
-                            name.isNotBlank() &&
-                                !name.startsWith("_ga") &&
-                                !name.startsWith("_vwo") &&
-                                !name.startsWith("_vis")
-                        ) {
-                            Cookie.parse(url, "$name=$value; Path=/; Secure; HttpOnly")?.let {
-                                cookie ->
-                                add(SavedCookie(origin, cookie.toString()))
-                            }
+            val seen = LinkedHashMap<Pair<String, String>, SavedCookie>()
+            headers.forEach { (origin, header) ->
+                val url = origin.toHttpUrl()
+                require(trusted(url))
+                header.split(';').forEach { item ->
+                    val name = item.substringBefore('=').trim()
+                    val value = item.substringAfter('=', "").trim()
+                    if (
+                        name.isNotBlank() &&
+                            !name.startsWith("_ga") &&
+                            !name.startsWith("_vwo") &&
+                            !name.startsWith("_vis")
+                    ) {
+                        Cookie.parse(url, "$name=$value; Path=/; Secure; HttpOnly")?.let { cookie ->
+                            seen[origin to cookie.name] = SavedCookie(origin, cookie.toString())
                         }
                     }
                 }
             }
+            val entries = seen.values.toList().takeLast(200)
             return sessionJson.encodeToString(entries)
         }
     }

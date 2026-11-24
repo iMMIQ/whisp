@@ -46,7 +46,11 @@ private val SegmentLibrary = Color(0xFF756885)
 
 @OptIn(FlowPreview::class)
 @Composable
-internal fun StoragePage(graph: AppGraph, back: () -> Unit) {
+internal fun StoragePage(
+    graph: AppGraph,
+    backLabel: String = stringResource(R.string.action_back_sources),
+    back: () -> Unit,
+) {
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
     var usage by remember { mutableStateOf<StorageUsage?>(null) }
     var clearing by remember { mutableStateOf(false) }
@@ -72,7 +76,7 @@ internal fun StoragePage(graph: AppGraph, back: () -> Unit) {
         ) {
             IconAction(
                 Icons.AutoMirrored.Outlined.ArrowBack,
-                stringResource(R.string.action_back_sources),
+                backLabel,
                 Cream,
                 action = back,
             )

@@ -97,6 +97,7 @@ class PlaybackService : MediaLibraryService() {
                     if (sleepingForOffload == sleeping) return
                     sleepingForOffload = sleeping
                     if (sleeping) saveProgress()
+                    reconcileWakeMode()
                     reconcileCheckpoint()
                 }
             },
@@ -223,7 +224,10 @@ class PlaybackService : MediaLibraryService() {
                         session: MediaSession,
                         controller: MediaSession.ControllerInfo,
                     ): MediaSession.ConnectionResult {
-                        if (!controller.isTrusted && controller.packageName != packageName)
+                        val isSelf =
+                            controller.uid == android.os.Process.myUid() &&
+                                controller.packageName == packageName
+                        if (!controller.isTrusted && !isSelf)
                             return MediaSession.ConnectionResult.reject()
                         val commands =
                             MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
@@ -468,11 +472,10 @@ class PlaybackService : MediaLibraryService() {
                 scheme == "file" ||
                 scheme == "content" ||
                 (trackId != null && trackId in graph.media.completedDownloads.value)
-        val fullyBuffered =
-            !player.isLoading &&
-                player.playbackState == Player.STATE_READY &&
-                player.bufferedPercentage >= 100
-        val desired = if (isLocal || fullyBuffered) C.WAKE_MODE_LOCAL else C.WAKE_MODE_NETWORK
+        val idleBetweenBursts = !player.isLoading && player.playbackState == Player.STATE_READY
+        val desired =
+            if (isLocal || sleepingForOffload || idleBetweenBursts) C.WAKE_MODE_LOCAL
+            else C.WAKE_MODE_NETWORK
         if (desired != currentWakeMode) {
             currentWakeMode = desired
             player.setWakeMode(desired)

@@ -7,6 +7,7 @@ import android.util.Base64
 import java.io.IOException
 import java.security.GeneralSecurityException
 import java.security.KeyStore
+import java.security.ProviderException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -23,15 +24,21 @@ class SecretStore {
         }
 
     @Synchronized
-    private fun key(forceReload: Boolean = false): SecretKey {
-        if (!forceReload)
+    private fun key(forceReload: Boolean = false, recreate: Boolean = false): SecretKey {
+        if (!forceReload && !recreate)
             cachedKey?.let {
                 return it
             }
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (store.getKey(alias, null) as? SecretKey)?.let {
-            cachedKey = it
-            return it
+        if (recreate) {
+            cachedKey = null
+            synchronized(cache) { cache.clear() }
+            runCatching { store.deleteEntry(alias) }
+        } else {
+            (store.getKey(alias, null) as? SecretKey)?.let {
+                cachedKey = it
+                return it
+            }
         }
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
             .apply {
@@ -49,15 +56,25 @@ class SecretStore {
             .also { cachedKey = it }
     }
 
+    private fun isKeystoreFailure(e: Throwable): Boolean =
+        e is GeneralSecurityException || e is ProviderException
+
     fun encrypt(value: String): String {
         if (value.isEmpty()) return ""
         return try {
             encryptWith(value, key())
-        } catch (_: GeneralSecurityException) {
+        } catch (first: Exception) {
+            if (!isKeystoreFailure(first)) throw first
             try {
                 encryptWith(value, key(forceReload = true))
-            } catch (e: GeneralSecurityException) {
-                throw SecretStoreException("无法加密保存来源凭据", e)
+            } catch (second: Exception) {
+                if (!isKeystoreFailure(second)) throw second
+                try {
+                    encryptWith(value, key(recreate = true))
+                } catch (third: Exception) {
+                    if (!isKeystoreFailure(third)) throw third
+                    throw SecretStoreException("无法加密保存来源凭据", third)
+                }
             }
         }
     }
@@ -81,11 +98,13 @@ class SecretStore {
         if (bytes.size < 28) throw SecretStoreException("来源凭据已损坏，请重新配置或登录")
         return try {
             decryptWith(bytes, key())
-        } catch (_: GeneralSecurityException) {
+        } catch (first: Exception) {
+            if (!isKeystoreFailure(first)) throw first
             try {
                 decryptWith(bytes, key(forceReload = true))
-            } catch (e: GeneralSecurityException) {
-                throw SecretStoreException("来源凭据已失效，请重新配置或登录", e)
+            } catch (second: Exception) {
+                if (!isKeystoreFailure(second)) throw second
+                throw SecretStoreException("来源凭据已失效，请重新配置或登录", second)
             }
         }
     }

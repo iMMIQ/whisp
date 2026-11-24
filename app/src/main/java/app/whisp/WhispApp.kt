@@ -39,6 +39,7 @@ class AppGraph(val context: Context) {
         OkHttpClient.Builder()
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
+            .followSslRedirects(false)
             .build()
 
     // Share underlying ConnectionPool & Dispatcher threads with [http] to cut memory and TLS churn.
@@ -47,11 +48,13 @@ class AppGraph(val context: Context) {
             .newBuilder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
+            .followSslRedirects(false)
             .build()
 
     val messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val storageChanges = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
+    private val legacyOfflineDir = File(context.filesDir, "offline/attachments")
     private val offlineDir = File(context.filesDir, "offline/assets")
     private val customArtworkDir = File(context.filesDir, "custom-artwork")
 
@@ -114,6 +117,7 @@ class AppGraph(val context: Context) {
     }
 
     init {
+        migrateLegacyOfflineDir(legacyOfflineDir, offlineDir)
         var libraryRef: LibraryStore? = null
         media =
             MediaSourceRouting(
@@ -154,9 +158,33 @@ class AppGraph(val context: Context) {
                 downloadCacheBytes = { media.downloadCache.cacheSpace },
                 storageChanged = { storageChanges.tryEmit(Unit) },
             )
-        offline = OfflineStore(context, library, media, images)
+        offline = OfflineStore(context, library, media, images) { playback.detachTracks(it) }
         playback = PlaybackCoordinator(context, mainScope, library, images, settings, messages)
     }
+}
+
+internal fun migrateLegacyOfflineDir(legacyDir: File, targetDir: File) {
+    if (!legacyDir.isDirectory) return
+    if (!targetDir.exists()) {
+        targetDir.parentFile?.mkdirs()
+        if (legacyDir.renameTo(targetDir)) return
+    }
+    targetDir.mkdirs()
+    legacyDir.listFiles()?.forEach { source ->
+        if (!source.isFile) return@forEach
+        val destination = File(targetDir, source.name)
+        if (!destination.exists()) {
+            if (!source.renameTo(destination)) {
+                runCatching {
+                    source.copyTo(destination, overwrite = false)
+                    source.delete()
+                }
+            }
+        } else {
+            source.delete()
+        }
+    }
+    if (legacyDir.list().isNullOrEmpty()) legacyDir.delete()
 }
 
 class WhispApp : Application(), SingletonImageLoader.Factory {

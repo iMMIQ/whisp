@@ -55,7 +55,6 @@ CI 将 ccache 容量限制为 200 MiB，以 NDK、CMake 版本和原生源码生
 | Compose BOM / Material 3 | 2026.09.00 / 1.5.0-beta01 |
 | Activity / Core | 1.13.0 / 1.19.1 |
 | Lifecycle / Navigation 3 | 2.11.0 / 1.2.0 |
-| Paging 3 | 3.5.2 |
 | Media3 / SMBJ | 1.11.1 / 0.15.0 |
 | libnfs / Android NDK / CMake | 8.0.0 / 30.0.16248370 / 3.31.6 |
 | Room / DataStore / WorkManager | 2.8.5 / 1.2.1 / 2.12.0 |
@@ -80,22 +79,22 @@ Room 与 WorkManager 的扩展 API 随主模块提供。测试服务器使用 Mo
 | 文件原子替换 | Java NIO `Files.move` |
 | HTTP / SMB 传输 | OkHttp / SMBJ |
 | NFS 协议与随机读取 | libnfs，共用 Media3 远程文件适配层 |
-| 在线目录分页、缓存与重试 | AndroidX Paging 3 |
+| 在线目录分页与重试 | `AsmrCatalogController` + kotlinx.serialization |
 | 播放、下载与音频缓存 | Media3 |
 | 视频画面、生命周期与等比例显示 | Media3 PlayerSurface 与 Compose ContentScale |
 | 索引、设置与任务 | Room / DataStore / WorkManager |
 
-应用负责作品目录识别、录音分组、字幕阅读锚点、多编码字幕台本识别、精细定位手势和按作品合并的进度写入。LRC 解析服务于多时间标签与偏移量；远程音频扫描通过少量分段请求读取 MP3、FLAC、WAV、Ogg/Opus 和 M4A 文件头时长，音频解码由 Media3 负责。
+应用负责作品目录识别、录音分组、字幕阅读锚点、多编码字幕台本识别、精细定位手势和按作品合并的进度写入。LRC 解析服务于多时间标签与偏移量；音频与视频时长由 Media3 播放准备后回写，扫描阶段不额外触发远程音轨读取。
 
-在线播放缓存的淘汰器与图片文件缓存负责运行时容量调整、永久资料分区及文件变化通知。图片优化使用 Android Bitmap API，编码参数与容量限制由应用定义。
+在线播放缓存的淘汰器负责运行时容量调整；图片缓存统一由 Coil 3 磁盘/内存缓存与永久离线资料目录共同承担。
 
 ## API 与兼容范围
 
-ASMR.ONE 使用公开的作品列表、搜索、作品信息和曲目接口；端点见 `AsmrOneClient`。Paging 3 负责分页、缓存、取消与重试，JSON 使用 kotlinx.serialization 解析。作品在加入或播放时写入 Room，来源更新刷新已加入的作品。
+ASMR.ONE 使用公开的作品列表、搜索、作品信息和曲目接口；端点见 `AsmrOneClient`。`AsmrCatalogController` 负责分页、取消与重试，JSON 使用 kotlinx.serialization 解析。作品在加入或播放时写入 Room，来源更新刷新已加入的作品。
 
-RJ 作品元数据由 `DlsiteClient` 优先读取 DLsite 官方 `maniax/api/=/product.json?workno=RJ…`，解析结构化声优与封面；`maniax/product/info/ajax` 是兼容接口，以响应中的作品键校验省略编号字段的合法数据。Jsoup 1.23.2 负责标题实体解码和作品介绍的结构化提取，Compose 按段落、标题与图片顺序渲染。AJAX 接口提供精确评分与销量，介绍与统计按需读取。标题、声优、系列和封面写入统一作品实体；元数据请求使用独立网络客户端。预览数据保存在 ViewModel 中，加入或播放时统一提交事务。
+RJ 作品元数据由 `DlsiteClient` 优先读取 DLsite 官方 `maniax/api/=/product.json?workno=RJ…`，解析结构化声优与封面；`maniax/product/info/ajax` 是兼容接口，以响应中的作品键校验省略编号字段的合法数据。Jsoup 1.23.2 负责标题实体解码和作品介绍的结构化提取，Compose 按段落、标题与图片顺序渲染。AJAX 接口提供精确评分与销量，介绍与统计按需读取。标题、声优、系列和封面写入统一作品实体；元数据请求使用独立网络客户端。预览数据保存在内存状态中，加入或播放时统一提交事务。
 
-ASMR.ONE 检索使用 Paging 3，有界实体缓存最多 256 项，最近搜索最多 20 条。RJ 和官方作品链接解析后直达作品接口，声优、社团、标签按名称组成查询条件。SavedStateHandle 保存已提交查询；Navigation 3 保存列表位置。数据库第 3 版通过自动迁移增加独立元数据表，kotlinx.serialization 保存规范化快照，删除作品时由外键清理。Room 自动迁移保留已有作品、下载状态、书签和进度，官方原始声优用于区分后续手动编辑。
+ASMR.ONE 检索支持最近搜索（最多 20 条）与作用域独立的分页列表状态；RJ 和官方作品链接解析后直达作品接口，声优、社团、标签按名称组成查询条件，Navigation 3 为每个顶层标签页独立保存返回栈与列表状态。数据库当前为第 6 版：版本 1–4 通过 Room 自动迁移演进，版本 4→5（`MIGRATION_4_5`）引入外键级联并内联曲目与附件 URI，版本 5→6（`MIGRATION_5_6`）补充常用查询与排序索引；迁移保留已有作品、下载状态、书签和进度，官方原始声优用于区分后续手动编辑。
 
 在线媒体使用 `whisp-asmr` 位置标识与独立 HTTP 数据源，播放、字幕及下载共享同一地址映射。作品 ID 由站点编号建立，曲目与资料 ID 由作品和相对路径建立。位置 ID 包含来源、媒体 ID 与 URL，使多个媒体可以共用同一文件地址。刷新保留标题编辑、收藏、书签和播放进度。
 

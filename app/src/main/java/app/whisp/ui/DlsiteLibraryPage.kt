@@ -232,7 +232,7 @@ internal fun DlsiteLibraryPage(
             confirmLabel = "确认退出",
             onConfirm = {
                 confirmingLogout = false
-                scope.launch { graph.sync.removeSource(sourceId) }
+                graph.scope.launch { graph.sync.removeSource(sourceId) }
                 back()
             },
             onDismiss = { confirmingLogout = false },
