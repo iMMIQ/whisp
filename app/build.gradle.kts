@@ -47,8 +47,8 @@ android {
         applicationId = "app.whisp"
         minSdk = 28
         targetSdk = 36
-        versionCode = 24
-        versionName = "0.5.0-rc.4"
+        versionCode = 25
+        versionName = "0.5.0-rc.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake {
@@ -110,6 +110,7 @@ android {
     testOptions { unitTests.isIncludeAndroidResources = true }
     sourceSets.named("androidTest") { assets.srcDir("$projectDir/schemas") }
     packaging {
+        jniLibs.excludes += setOf("lib/armeabi-v7a/**", "lib/x86/**")
         resources.excludes +=
             setOf(
                 "/META-INF/{AL2.0,LGPL2.1}",
