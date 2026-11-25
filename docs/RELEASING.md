@@ -45,15 +45,13 @@ python3 tools/check-public-content.py
 ### 2. 构建多架构与通用签名 APK
 
 ```sh
-./gradlew -PsplitApks :app:assembleRelease :app:lintRelease
+./gradlew -Pabis=arm64-v8a,x86_64 -PsplitApks :app:assembleRelease :app:lintRelease
 ```
 
-产物位于 `app/build/outputs/apk/release/`，核对所有 5 个 APK 的版本号、目标 ABI 与签名完整性：
+产物位于 `app/build/outputs/apk/release/`，核对所有 3 个 APK 的版本号、目标 ABI 与签名完整性：
 
 - `app-arm64-v8a-release.apk`
-- `app-armeabi-v7a-release.apk`
 - `app-x86_64-release.apk`
-- `app-x86-release.apk`
 - `app-universal-release.apk`
 
 可使用 `apksigner verify --print-certs <apk>` 验证签名证书指纹无误。
@@ -73,7 +71,7 @@ sha256sum app/build/outputs/apk/release/*.apk <source-archive>.zip > SHA256SUMS
 
 ### 4. 创建预发布草稿等待验收
 
-在 GitHub Releases 创建 **Pre-release 草稿（Draft）**，上传全部 5 个 APK、配套源码归档与 `SHA256SUMS`，交由项目维护者验收。
+在 GitHub Releases 创建 **Pre-release 草稿（Draft）**，上传全部 3 个 APK、配套源码归档与 `SHA256SUMS`，交由项目维护者验收。
 
 ---
 
@@ -93,7 +91,7 @@ sha256sum app/build/outputs/apk/release/*.apk <source-archive>.zip > SHA256SUMS
 
 | 产物 | 用途 |
 | --- | --- |
-| 4 个分架构 Release APK（`arm64-v8a` / `armeabi-v7a` / `x86_64` / `x86`） | 供已知设备架构用户下载，体积更小 |
-| `app-universal-release.apk` | 覆盖全部四种 ABI 的通用安装包 |
+| 2 个 64 位分架构 Release APK（`arm64-v8a` / `x86_64`） | 供已知设备架构用户下载，体积更小 |
+| `app-universal-release.apk` | 覆盖全部 64 位 ABI 的通用安装包 |
 | 配套源码归档（含 `third_party/libnfs/`） | 满足 LGPL 源码分发与原生共享库独立重建要求 |
 | `SHA256SUMS` | 供用户校验所有安装包与源码归档完整性 |

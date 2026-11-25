@@ -11,6 +11,8 @@ HSPLapp/whisp/playback/PlaybackService$*;->**(**)**
 HSPLapp/whisp/playback/PlaybackCoordinator;->**(**)**
 Lapp/whisp/playback/PlaybackCoordinator;
 HSPLapp/whisp/playback/PlaybackCoordinator$*;->**(**)**
+HSPLapp/whisp/playback/WhispAudioProcessor;->**(**)**
+Lapp/whisp/playback/WhispAudioProcessor;
 HSPLapp/whisp/playback/AbLoopController;->**(**)**
 Lapp/whisp/playback/AbLoopController;
 HSPLapp/whisp/playback/SleepTimerController;->**(**)**
@@ -39,7 +41,28 @@ HSPLapp/whisp/ui/WhispRootKt;->**(**)**
 HSPLapp/whisp/ui/LibraryPageKt;->**(**)**
 HSPLapp/whisp/ui/DetailPageKt;->**(**)**
 HSPLapp/whisp/ui/PlayerPageKt;->**(**)**
+HSPLapp/whisp/ui/PlayerControlsKt;->**(**)**
+HSPLapp/whisp/ui/PlayerSubtitlePaneKt;->**(**)**
 HSPLapp/whisp/ui/PrecisionSeekBarKt;->**(**)**
 HSPLapp/whisp/ui/ComponentsKt;->**(**)**
+HSPLapp/whisp/ui/WhispIcons;->**(**)**
 HSPLapp/whisp/ui/SubtitleLoader;->**(**)**
 Lapp/whisp/ui/SubtitleLoader;
+# Core framework hot paths (Compose, Navigation 3, Room, DataStore, Media3, Coil 3, OkHttp).
+HSPLandroidx/compose/runtime/ComposerImpl;->**(**)**
+HSPLandroidx/compose/runtime/CompositionImpl;->**(**)**
+HSPLandroidx/compose/runtime/Recomposer;->**(**)**
+HSPLandroidx/compose/runtime/snapshots/SnapshotKt;->**(**)**
+HSPLandroidx/compose/ui/node/LayoutNode;->**(**)**
+HSPLandroidx/compose/ui/platform/AndroidComposeView;->**(**)**
+HSPLandroidx/compose/foundation/lazy/LazyListKt;->**(**)**
+HSPLandroidx/compose/foundation/lazy/grid/LazyGridKt;->**(**)**
+HSPLandroidx/navigation3/ui/NavDisplayKt;->**(**)**
+HSPLandroidx/room/RoomDatabase;->**(**)**
+HSPLandroidx/datastore/core/DataStoreImpl;->**(**)**
+HSPLandroidx/media3/exoplayer/ExoPlayerImpl;->**(**)**
+HSPLandroidx/media3/exoplayer/ExoPlayerImplInternal;->**(**)**
+HSPLandroidx/media3/exoplayer/audio/DefaultAudioSink;->**(**)**
+HSPLandroidx/media3/session/MediaSessionImpl;->**(**)**
+HSPLcoil3/RealImageLoader;->**(**)**
+HSPLokhttp3/internal/connection/RealCall;->**(**)**

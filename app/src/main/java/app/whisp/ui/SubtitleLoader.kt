@@ -53,9 +53,9 @@ class SubtitleLoader(
                 .collect(::onEncodingChanged)
         }
         scope.launch {
-            settings.trackSubtitleSelections.collect { selections ->
+            library.trackStates.collect { states ->
                 val active = currentTrackId ?: return@collect
-                val next = selections[active]
+                val next = states[active]?.subtitleSelectionOrNull()
                 if (next != lastSelection) {
                     lastSelection = next
                     load(active, force = true, allowDeferred = false)
@@ -103,7 +103,7 @@ class SubtitleLoader(
         prefetchJob = scope.launch {
             runCatching {
                 val track = library.track(trackId) ?: return@launch
-                val selection = settings.subtitleSelectionFor(trackId)
+                val selection = library.subtitleSelectionFor(trackId)
                 val primaryId = selection?.primaryId ?: track.subtitleId ?: return@launch
                 if (attachmentCache[primaryId] != null) return@launch
                 val parsed = fetchAndParseAttachment(primaryId, requestedEncoding) ?: return@launch
@@ -115,7 +115,7 @@ class SubtitleLoader(
     }
 
     fun load(id: String?, force: Boolean = false, allowDeferred: Boolean = true) {
-        val selection = id?.let { settings.subtitleSelectionFor(it) }
+        val selection = id?.let { library.subtitleSelectionFor(it) }
         if (
             !force &&
                 id != null &&

@@ -9,8 +9,8 @@ import java.nio.ByteBuffer
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
-import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
  * Low-overhead PCM audio processor for ASMR / voice listening:
@@ -32,6 +32,8 @@ class WhispAudioProcessor : BaseAudioProcessor() {
     private var envelope: Float = 0f
     private var attackCoeff: Float = 0.05f
     private var releaseCoeff: Float = 0.002f
+    private var pcm16Scratch = ShortArray(0)
+    private var pcmFloatScratch = FloatArray(0)
 
     override fun onConfigure(
         inputAudioFormat: AudioProcessor.AudioFormat,
@@ -55,6 +57,8 @@ class WhispAudioProcessor : BaseAudioProcessor() {
 
     override fun onReset() {
         envelope = 0f
+        pcm16Scratch = ShortArray(0)
+        pcmFloatScratch = FloatArray(0)
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
@@ -88,44 +92,54 @@ class WhispAudioProcessor : BaseAudioProcessor() {
         night: Boolean,
     ) {
         if (channels == 2) {
-            if (!night) {
-                // Bit-exact integer fast path for stereo swap / mono downmix without float
-                // roundtrip.
-                while (input.remaining() >= 4) {
-                    val rawL = input.short
-                    val rawR = input.short
+            val frames = input.remaining() / 4
+            val sampleCount = frames * 2
+            if (sampleCount > 0) {
+                if (pcm16Scratch.size < sampleCount) pcm16Scratch = ShortArray(sampleCount)
+                val samples = pcm16Scratch
+                val inShorts = input.asShortBuffer()
+                inShorts.get(samples, 0, sampleCount)
+                input.position(input.position() + sampleCount * 2)
+                if (!night) {
+                    // Bit-exact integer fast path on contiguous array without float roundtrip.
+                    var i = 0
                     if (mono) {
-                        val m = ((rawL.toInt() + rawR.toInt()) / 2).toShort()
-                        output.putShort(m)
-                        output.putShort(m)
+                        while (i < sampleCount) {
+                            val m = ((samples[i].toInt() + samples[i + 1].toInt()) / 2).toShort()
+                            samples[i] = m
+                            samples[i + 1] = m
+                            i += 2
+                        }
                     } else if (swap) {
-                        output.putShort(rawR)
-                        output.putShort(rawL)
-                    } else {
-                        output.putShort(rawL)
-                        output.putShort(rawR)
+                        while (i < sampleCount) {
+                            val tmp = samples[i]
+                            samples[i] = samples[i + 1]
+                            samples[i + 1] = tmp
+                            i += 2
+                        }
+                    }
+                } else {
+                    var i = 0
+                    while (i < sampleCount) {
+                        var l = samples[i] * INV_PCM16
+                        var r = samples[i + 1] * INV_PCM16
+                        if (mono) {
+                            val m = (l + r) * 0.5f
+                            l = m
+                            r = m
+                        } else if (swap) {
+                            val tmp = l
+                            l = r
+                            r = tmp
+                        }
+                        val gain = computeNightGain(max(abs(l), abs(r)))
+                        samples[i] = floatToPcm16(softClip(l * gain))
+                        samples[i + 1] = floatToPcm16(softClip(r * gain))
+                        i += 2
                     }
                 }
-                while (input.hasRemaining()) output.put(input.get())
-                return
-            }
-            while (input.remaining() >= 4) {
-                var l = input.short / 32768f
-                var r = input.short / 32768f
-                if (mono) {
-                    val m = (l + r) * 0.5f
-                    l = m
-                    r = m
-                } else if (swap) {
-                    val tmp = l
-                    l = r
-                    r = tmp
-                }
-                val gain = computeNightGain(max(abs(l), abs(r)))
-                l = softClip(l * gain)
-                r = softClip(r * gain)
-                output.putShort(floatToPcm16(l))
-                output.putShort(floatToPcm16(r))
+                output.asShortBuffer().put(samples, 0, sampleCount)
+                output.position(output.position() + sampleCount * 2)
             }
             while (input.hasRemaining()) output.put(input.get())
             return
@@ -136,7 +150,7 @@ class WhispAudioProcessor : BaseAudioProcessor() {
             val startPos = input.position()
             var sum = 0f
             for (c in 0 until channels) {
-                val sample = input.getShort(startPos + c * 2) / 32768f
+                val sample = input.getShort(startPos + c * 2) * INV_PCM16
                 sum += sample
                 peak = max(peak, abs(sample))
             }
@@ -144,7 +158,8 @@ class WhispAudioProcessor : BaseAudioProcessor() {
             val monoVal = if (mono && channels > 1) sum / channels else 0f
             for (c in 0 until channels) {
                 val raw =
-                    if (mono && channels > 1) monoVal else input.getShort(startPos + c * 2) / 32768f
+                    if (mono && channels > 1) monoVal
+                    else input.getShort(startPos + c * 2) * INV_PCM16
                 val processed = if (night) softClip(raw * gain) else raw
                 output.putShort(floatToPcm16(processed))
             }
@@ -162,25 +177,37 @@ class WhispAudioProcessor : BaseAudioProcessor() {
         night: Boolean,
     ) {
         if (channels == 2) {
-            while (input.remaining() >= 8) {
-                var l = input.float
-                var r = input.float
-                if (mono) {
-                    val m = (l + r) * 0.5f
-                    l = m
-                    r = m
-                } else if (swap) {
-                    val tmp = l
-                    l = r
-                    r = tmp
+            val frames = input.remaining() / 8
+            val sampleCount = frames * 2
+            if (sampleCount > 0) {
+                if (pcmFloatScratch.size < sampleCount) pcmFloatScratch = FloatArray(sampleCount)
+                val samples = pcmFloatScratch
+                input.asFloatBuffer().get(samples, 0, sampleCount)
+                input.position(input.position() + sampleCount * 4)
+                var i = 0
+                while (i < sampleCount) {
+                    var l = samples[i]
+                    var r = samples[i + 1]
+                    if (mono) {
+                        val m = (l + r) * 0.5f
+                        l = m
+                        r = m
+                    } else if (swap) {
+                        val tmp = l
+                        l = r
+                        r = tmp
+                    }
+                    if (night) {
+                        val gain = computeNightGain(max(abs(l), abs(r)))
+                        l = softClip(l * gain)
+                        r = softClip(r * gain)
+                    }
+                    samples[i] = l
+                    samples[i + 1] = r
+                    i += 2
                 }
-                if (night) {
-                    val gain = computeNightGain(max(abs(l), abs(r)))
-                    l = softClip(l * gain)
-                    r = softClip(r * gain)
-                }
-                output.putFloat(l)
-                output.putFloat(r)
+                output.asFloatBuffer().put(samples, 0, sampleCount)
+                output.position(output.position() + sampleCount * 4)
             }
             while (input.hasRemaining()) output.put(input.get())
             return
@@ -215,8 +242,8 @@ class WhispAudioProcessor : BaseAudioProcessor() {
         val makeup = 1.42f
         val threshold = 0.16f
         if (env <= threshold) return makeup
-        val ratio = 4.0f
-        val compressed = threshold * (env / threshold).toDouble().pow(1.0 / ratio).toFloat()
+        // 4:1 compression ratio: (env / threshold)^(1/4) == sqrt(sqrt(env / threshold)).
+        val compressed = threshold * sqrt(sqrt(env * INV_THRESHOLD))
         val target = (compressed / env) * makeup
         // Hard ceiling around -2.5 dBFS (0.75) so sudden claps or laughs stay comfortable at night.
         val ceilingGain = if (env > 0.0001f) 0.75f / env else makeup
@@ -234,4 +261,9 @@ class WhispAudioProcessor : BaseAudioProcessor() {
 
     private fun floatToPcm16(sample: Float): Short =
         (sample.coerceIn(-1f, 1f) * 32768f).roundToInt().coerceIn(-32768, 32767).toShort()
+
+    companion object {
+        private const val INV_PCM16 = 1f / 32768f
+        private const val INV_THRESHOLD = 1f / 0.16f
+    }
 }

@@ -21,13 +21,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.InsertDriveFile
-import androidx.compose.material.icons.automirrored.outlined.OpenInNew
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -286,7 +279,7 @@ internal fun WorkDetailScreen(
         ) {
             Box(Modifier.align(Alignment.TopStart).padding(8.dp)) {
                 IconAction(
-                    Icons.AutoMirrored.Outlined.ArrowBack,
+                    WhispIcons.AutoMirrored.Outlined.ArrowBack,
                     if (isPreview) "返回检索" else stringResource(R.string.action_back_library),
                     action = back,
                 )
@@ -294,7 +287,7 @@ internal fun WorkDetailScreen(
             when {
                 officialPlayerWorkno != null ->
                     WhispEmptyState(
-                        icon = Icons.AutoMirrored.Outlined.OpenInNew,
+                        icon = WhispIcons.AutoMirrored.Outlined.OpenInNew,
                         title = "使用官方播放器",
                         subtitle = "该作品可在 DLsite Play 中播放。",
                     ) {
@@ -333,7 +326,7 @@ internal fun WorkDetailScreen(
                     }
                 previewError != null ->
                     WhispEmptyState(
-                        icon = Icons.Outlined.CloudOff,
+                        icon = WhispIcons.Outlined.CloudOff,
                         title = "加载失败",
                         subtitle = previewError,
                     ) {
@@ -532,7 +525,7 @@ internal fun WorkDetailScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
                             IconAction(
-                                Icons.AutoMirrored.Outlined.ArrowBack,
+                                WhispIcons.AutoMirrored.Outlined.ArrowBack,
                                 if (isPreview) "返回检索"
                                 else stringResource(R.string.action_back_library),
                                 action = back,
@@ -540,8 +533,8 @@ internal fun WorkDetailScreen(
                             if (inLibrary) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                                     IconAction(
-                                        if (detail.work.favorite) Icons.Filled.Favorite
-                                        else Icons.Outlined.FavoriteBorder,
+                                        if (detail.work.favorite) WhispIcons.Filled.Favorite
+                                        else WhispIcons.Outlined.FavoriteBorder,
                                         stringResource(R.string.action_favorite),
                                         if (detail.work.favorite) Rose else Cream,
                                         enabled = true,
@@ -554,9 +547,10 @@ internal fun WorkDetailScreen(
                                     Box(contentAlignment = Alignment.Center) {
                                         IconAction(
                                             when {
-                                                offline -> Icons.Outlined.DownloadDone
-                                                downloadPaused -> Icons.Outlined.PauseCircleOutline
-                                                else -> Icons.Outlined.Download
+                                                offline -> WhispIcons.Outlined.DownloadDone
+                                                downloadPaused ->
+                                                    WhispIcons.Outlined.PauseCircleOutline
+                                                else -> WhispIcons.Outlined.Download
                                             },
                                             stringResource(R.string.action_download),
                                             if (offline || downloading || downloadPaused) Rose
@@ -594,7 +588,7 @@ internal fun WorkDetailScreen(
                                         }
                                     }
                                     IconAction(
-                                        Icons.Outlined.MoreHoriz,
+                                        WhispIcons.Outlined.MoreHoriz,
                                         stringResource(R.string.action_work_info),
                                         haptic = HapticKind.Tick,
                                     ) {
@@ -667,7 +661,7 @@ internal fun WorkDetailScreen(
                             modifier = Modifier.weight(1f).height(52.dp),
                             shape = RoundedCornerShape(16.dp),
                         ) {
-                            Icon(Icons.Filled.PlayArrow, null)
+                            Icon(WhispIcons.Filled.PlayArrow, null)
                             Spacer(Modifier.width(8.dp))
                             Text(
                                 when {
@@ -691,7 +685,7 @@ internal fun WorkDetailScreen(
                             contentAlignment = Alignment.Center,
                         ) {
                             IconAction(
-                                Icons.Outlined.Shuffle,
+                                WhispIcons.Outlined.Shuffle,
                                 stringResource(R.string.action_shuffle),
                                 Cream,
                                 haptic = HapticKind.Tick,
@@ -710,7 +704,7 @@ internal fun WorkDetailScreen(
                             modifier = Modifier.weight(1f).height(52.dp),
                             shape = RoundedCornerShape(16.dp),
                         ) {
-                            Icon(Icons.Filled.PlayArrow, null)
+                            Icon(WhispIcons.Filled.PlayArrow, null)
                             Spacer(Modifier.width(6.dp))
                             Text(
                                 if (savingPreview) "准备中" else "立即试听",
@@ -727,7 +721,7 @@ internal fun WorkDetailScreen(
                             modifier = Modifier.height(52.dp),
                             shape = RoundedCornerShape(16.dp),
                         ) {
-                            Icon(Icons.Outlined.Add, null)
+                            Icon(WhispIcons.Outlined.Add, null)
                             Spacer(Modifier.width(6.dp))
                             Text(
                                 if (savingPreview) "加入中" else "加入作品库",
@@ -818,7 +812,7 @@ internal fun WorkDetailScreen(
                                         )
                                     }
                                     IconAction(
-                                        Icons.Outlined.PlayArrow,
+                                        WhispIcons.Outlined.PlayArrow,
                                         "播放${section.title}",
                                         Rose,
                                         haptic = HapticKind.Confirm,
@@ -889,7 +883,9 @@ internal fun WorkDetailScreen(
                             }
                         }
                         items(scripts, key = { it.id }) {
-                            ResourceRow(it.title, Icons.Outlined.Description) { attachment = it }
+                            ResourceRow(it.title, WhispIcons.Outlined.Description) {
+                                attachment = it
+                            }
                         }
                         if (extras.isNotEmpty()) {
                             item(key = "header-extras") {
@@ -910,8 +906,8 @@ internal fun WorkDetailScreen(
                         items(extras, key = { it.id }) {
                             ResourceRow(
                                 it.title,
-                                if (it.kind == "image") Icons.Outlined.Image
-                                else Icons.AutoMirrored.Outlined.InsertDriveFile,
+                                if (it.kind == "image") WhispIcons.Outlined.Image
+                                else WhispIcons.AutoMirrored.Outlined.InsertDriveFile,
                             ) {
                                 attachment = it
                             }
@@ -938,7 +934,7 @@ internal fun WorkDetailScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconAction(
-                    Icons.AutoMirrored.Outlined.ArrowBack,
+                    WhispIcons.AutoMirrored.Outlined.ArrowBack,
                     if (isPreview) "返回检索" else stringResource(R.string.action_back_library),
                     action = back,
                 )
@@ -951,7 +947,7 @@ internal fun WorkDetailScreen(
                     modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
                 )
                 IconAction(
-                    Icons.Filled.PlayArrow,
+                    WhispIcons.Filled.PlayArrow,
                     stringResource(R.string.action_play_work),
                     Rose,
                     haptic = HapticKind.Confirm,
@@ -993,7 +989,7 @@ internal fun WorkDetailScreen(
             }
             if (downloading) {
                 WhispSheetRow(
-                    icon = Icons.Outlined.Pause,
+                    icon = WhispIcons.Outlined.Pause,
                     title = "暂停下载",
                     onClick = {
                         graph.offline.pauseDownloads()
@@ -1002,7 +998,7 @@ internal fun WorkDetailScreen(
                 )
             } else if (downloadPaused) {
                 WhispSheetRow(
-                    icon = Icons.Outlined.PlayArrow,
+                    icon = WhispIcons.Outlined.PlayArrow,
                     title = "继续下载",
                     onClick = {
                         graph.offline.resumeDownloads()
@@ -1011,7 +1007,7 @@ internal fun WorkDetailScreen(
                 )
             }
             WhispSheetRow(
-                icon = Icons.Outlined.DeleteOutline,
+                icon = WhispIcons.Outlined.DeleteOutline,
                 title = "移除离线副本",
                 subtitle = "清理此作品已下载的本地音频与附件",
                 tint = MaterialTheme.colorScheme.error,
@@ -1078,7 +1074,7 @@ private fun ResourceRow(title: String, icon: ImageVector, click: () -> Unit) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f).padding(horizontal = 14.dp),
         )
-        Icon(Icons.Outlined.ChevronRight, null, tint = Muted, modifier = Modifier.size(18.dp))
+        Icon(WhispIcons.Outlined.ChevronRight, null, tint = Muted, modifier = Modifier.size(18.dp))
     }
 }
 

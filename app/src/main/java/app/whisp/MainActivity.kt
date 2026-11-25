@@ -21,8 +21,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -37,6 +35,7 @@ import app.whisp.system.WhispWidgetProvider
 import app.whisp.ui.Cream
 import app.whisp.ui.Muted
 import app.whisp.ui.Rose
+import app.whisp.ui.WhispIcons
 import app.whisp.ui.WhispRoot
 import app.whisp.ui.WhispTheme
 import kotlinx.coroutines.flow.combine
@@ -324,7 +323,7 @@ private fun AppLockScreen(error: String?, onUnlock: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             Icon(
-                Icons.Outlined.Fingerprint,
+                WhispIcons.Outlined.Fingerprint,
                 contentDescription = "应用已锁定",
                 tint = Rose,
                 modifier = Modifier.size(56.dp),

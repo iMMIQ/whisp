@@ -7,10 +7,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.OpenInNew
-import androidx.compose.material.icons.outlined.ChevronRight
-import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -53,7 +49,7 @@ internal fun OfficialCircle(details: DlsiteDetails?, filter: ((AsmrFacet) -> Uni
             )
             if (clickable) {
                 Icon(
-                    Icons.Outlined.ChevronRight,
+                    WhispIcons.Outlined.ChevronRight,
                     null,
                     tint = Rose.copy(alpha = 0.8f),
                     modifier = Modifier.size(16.dp),
@@ -78,7 +74,7 @@ internal fun WorkContentTabs(
             onRefresh?.let { refresh ->
                 {
                     IconAction(
-                        Icons.Outlined.Refresh,
+                        WhispIcons.Outlined.Refresh,
                         if (tab == "介绍") "刷新作品介绍" else "刷新作品资料",
                         Muted,
                         action = refresh,
@@ -268,7 +264,7 @@ internal fun LazyListScope.dlsiteContent(
                 ) {
                     Text("DLsite")
                     Spacer(Modifier.width(6.dp))
-                    Icon(Icons.AutoMirrored.Outlined.OpenInNew, null, Modifier.size(16.dp))
+                    Icon(WhispIcons.AutoMirrored.Outlined.OpenInNew, null, Modifier.size(16.dp))
                 }
             }
         }
@@ -407,7 +403,7 @@ private fun MetadataField(label: String, value: String, click: (() -> Unit)? = n
                     overflow = TextOverflow.Ellipsis,
                 )
                 Icon(
-                    Icons.Outlined.ChevronRight,
+                    WhispIcons.Outlined.ChevronRight,
                     null,
                     tint = Rose.copy(alpha = 0.8f),
                     modifier = Modifier.size(16.dp),
@@ -506,7 +502,7 @@ private fun RelatedLink(label: String?, work: DlsiteRelatedWork) {
             }
         }
         Icon(
-            Icons.AutoMirrored.Outlined.OpenInNew,
+            WhispIcons.AutoMirrored.Outlined.OpenInNew,
             "查看 DLsite 作品",
             Modifier.size(18.dp),
             tint = Muted,

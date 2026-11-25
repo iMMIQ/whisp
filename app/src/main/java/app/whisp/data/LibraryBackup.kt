@@ -30,6 +30,7 @@ data class BackupProgress(
     val workId: String,
     val rj: String? = null,
     val trackId: String,
+    val trackRelativePath: String? = null,
     val positionMs: Long,
     val updatedAt: Long,
 )
@@ -40,27 +41,42 @@ data class BackupBookmark(
     val workId: String,
     val rj: String? = null,
     val trackId: String,
+    val trackRelativePath: String? = null,
     val positionMs: Long,
     val title: String,
     val endMs: Long? = null,
 )
 
+@Serializable
+data class BackupTrackState(
+    val workId: String,
+    val rj: String? = null,
+    val trackId: String,
+    val trackRelativePath: String? = null,
+    val positionMs: Long = 0L,
+    val subtitleOffsetMs: Long = 0L,
+    val primarySubtitleId: String? = null,
+    val primarySubtitlePath: String? = null,
+    val secondarySubtitleId: String? = null,
+    val secondarySubtitlePath: String? = null,
+    val updatedAt: Long = 0L,
+)
+
 /**
- * Privacy-preserving local backup snapshot for SAF export/import. Strictly excludes source
- * credentials, passwords, cookies, and raw remote paths.
+ * Privacy-preserving local backup snapshot (v2) for SAF export/import. Strictly excludes source
+ * credentials, passwords, cookies, and raw remote paths, while recording relative paths so progress
+ * / bookmarks / per-track subtitle settings can migrate cleanly across sources for the same RJ.
  */
 @Serializable
 data class WhispBackupSnapshot(
-    val version: Int = 1,
+    val version: Int = 2,
     val exportedAt: Long = System.currentTimeMillis(),
     val settings: Settings = Settings(),
-    val trackSubtitleOffsets: Map<String, Long> = emptyMap(),
-    val trackSubtitleSelections: Map<String, TrackSubtitleSelection> = emptyMap(),
-    val trackPositions: Map<String, Long> = emptyMap(),
     val deviceAudioProfiles: Map<String, DeviceAudioProfile> = emptyMap(),
     val works: List<BackupWorkCustomization> = emptyList(),
     val progress: List<BackupProgress> = emptyList(),
     val bookmarks: List<BackupBookmark> = emptyList(),
+    val trackStates: List<BackupTrackState> = emptyList(),
 )
 
 data class BackupRestoreSummary(
@@ -74,7 +90,7 @@ object LibraryBackup {
 
     fun decode(raw: String): WhispBackupSnapshot {
         val decoded = backupJson.decodeFromString<WhispBackupSnapshot>(raw)
-        require(decoded.version in 1..2) { "不支持的备份文件版本（v${decoded.version}）" }
+        require(decoded.version == 2) { "不支持的备份文件版本（v${decoded.version}）" }
         return decoded
     }
 
@@ -85,8 +101,21 @@ object LibraryBackup {
         withContext(Dispatchers.IO) {
             library.flushPlaybackProgress()
             val settings = settingsStore.settingsUpdates.first()
+            val deviceProfiles = settingsStore.currentDeviceAudioProfiles()
             val allWorks = library.dao.allWorks()
             val rjByWorkId = allWorks.associate { it.id to it.rj }
+            val workIds = allWorks.map { it.id }
+            val tracksById =
+                workIds
+                    .chunked(500)
+                    .flatMap { library.dao.tracksForWorks(it) }
+                    .associateBy { it.id }
+            val attachmentsById =
+                workIds
+                    .chunked(500)
+                    .flatMap { library.dao.attachmentsForWorks(it) }
+                    .associateBy { it.id }
+
             val customizedWorks =
                 allWorks
                     .filter {
@@ -111,6 +140,7 @@ object LibraryBackup {
                         workId = p.workId,
                         rj = rjByWorkId[p.workId],
                         trackId = p.trackId,
+                        trackRelativePath = tracksById[p.trackId]?.relativePath,
                         positionMs = p.positionMs,
                         updatedAt = p.updatedAt,
                     )
@@ -122,22 +152,44 @@ object LibraryBackup {
                         workId = b.workId,
                         rj = rjByWorkId[b.workId],
                         trackId = b.trackId,
+                        trackRelativePath = tracksById[b.trackId]?.relativePath,
                         positionMs = b.positionMs,
                         title = b.title,
                         endMs = b.endMs,
                     )
                 }
+            val trackStateList =
+                library.dao.allTrackStates().mapNotNull { state ->
+                    val track = tracksById[state.trackId] ?: return@mapNotNull null
+                    BackupTrackState(
+                        workId = track.workId,
+                        rj = rjByWorkId[track.workId],
+                        trackId = state.trackId,
+                        trackRelativePath = track.relativePath,
+                        positionMs = state.positionMs,
+                        subtitleOffsetMs = state.subtitleOffsetMs,
+                        primarySubtitleId = state.primarySubtitleId,
+                        primarySubtitlePath =
+                            state.primarySubtitleId?.let {
+                                attachmentsById[it]?.relativePath
+                            },
+                        secondarySubtitleId = state.secondarySubtitleId,
+                        secondarySubtitlePath =
+                            state.secondarySubtitleId?.let {
+                                attachmentsById[it]?.relativePath
+                            },
+                        updatedAt = state.updatedAt,
+                    )
+                }
             WhispBackupSnapshot(
-                version = 1,
+                version = 2,
                 exportedAt = System.currentTimeMillis(),
                 settings = settings,
-                trackSubtitleOffsets = settingsStore.trackSubtitleOffsets.value,
-                trackSubtitleSelections = settingsStore.trackSubtitleSelections.value,
-                trackPositions = settingsStore.trackPositions.value,
-                deviceAudioProfiles = settingsStore.deviceAudioProfiles.value,
+                deviceAudioProfiles = deviceProfiles,
                 works = customizedWorks,
                 progress = progressList,
                 bookmarks = bookmarkList,
+                trackStates = trackStateList,
             )
         }
 
@@ -146,11 +198,8 @@ object LibraryBackup {
         library: LibraryStore,
         settingsStore: SettingsStore,
     ): BackupRestoreSummary {
-        settingsStore.replaceBackupMaps(
+        settingsStore.restoreBackup(
             settings = snapshot.settings,
-            subtitleOffsets = snapshot.trackSubtitleOffsets,
-            subtitleSelections = snapshot.trackSubtitleSelections,
-            trackPositions = snapshot.trackPositions,
             deviceProfiles = snapshot.deviceAudioProfiles,
         )
         return withContext(Dispatchers.IO) {
@@ -164,9 +213,44 @@ object LibraryBackup {
                     existingWorks
                         .filter { !it.rj.isNullOrBlank() }
                         .associateBy { it.rj!!.uppercase() }
+                val tracksCache = HashMap<String, List<TrackEntity>>()
+                val attachmentsCache = HashMap<String, List<AttachmentEntity>>()
+
+                suspend fun tracksOf(workId: String): List<TrackEntity> =
+                    tracksCache.getOrPut(workId) { library.dao.tracksForWork(workId) }
+
+                suspend fun attachmentsOf(workId: String): List<AttachmentEntity> =
+                    attachmentsCache.getOrPut(workId) {
+                        library.dao.attachmentsForWorks(listOf(workId))
+                    }
 
                 fun resolveWork(workId: String, rj: String?): WorkEntity? =
                     byId[workId] ?: rj?.uppercase()?.let(byRj::get)
+
+                suspend fun resolveTrackId(
+                    workId: String,
+                    trackId: String,
+                    relativePath: String?,
+                ): String? {
+                    val tracks = tracksOf(workId)
+                    if (tracks.any { it.id == trackId }) return trackId
+                    val path = relativePath?.takeIf(String::isNotBlank) ?: return null
+                    return tracks.firstOrNull { it.relativePath == path }?.id
+                }
+
+                suspend fun resolveAttachmentId(
+                    workId: String,
+                    attachmentId: String?,
+                    relativePath: String?,
+                ): String? {
+                    if (attachmentId == null && relativePath == null) return null
+                    val attachments = attachmentsOf(workId)
+                    if (attachmentId != null && attachments.any { it.id == attachmentId }) {
+                        return attachmentId
+                    }
+                    val path = relativePath?.takeIf(String::isNotBlank) ?: return null
+                    return attachments.firstOrNull { it.relativePath == path }?.id
+                }
 
                 for (entry in snapshot.works) {
                     val target = resolveWork(entry.workId, entry.rj) ?: continue
@@ -187,37 +271,65 @@ object LibraryBackup {
 
                 for (entry in snapshot.progress) {
                     val target = resolveWork(entry.workId, entry.rj) ?: continue
-                    val tracks = library.dao.tracksForWork(target.id)
-                    if (tracks.any { it.id == entry.trackId }) {
-                        val existing = library.dao.progress(target.id)
-                        if (existing == null || entry.updatedAt >= existing.updatedAt) {
-                            library.dao.saveProgressIfValid(
-                                target.id,
-                                entry.trackId,
-                                entry.positionMs.coerceAtLeast(0L),
-                                entry.updatedAt,
-                            )
-                            restoredProgress++
-                        }
+                    val resolvedTrackId =
+                        resolveTrackId(target.id, entry.trackId, entry.trackRelativePath)
+                            ?: continue
+                    val existing = library.dao.progress(target.id)
+                    if (existing == null || entry.updatedAt >= existing.updatedAt) {
+                        library.dao.saveProgressIfValid(
+                            target.id,
+                            resolvedTrackId,
+                            entry.positionMs.coerceAtLeast(0L),
+                            entry.updatedAt,
+                        )
+                        restoredProgress++
                     }
                 }
 
                 for (entry in snapshot.bookmarks) {
                     val target = resolveWork(entry.workId, entry.rj) ?: continue
-                    val tracks = library.dao.tracksForWork(target.id)
-                    if (tracks.any { it.id == entry.trackId }) {
-                        library.dao.saveBookmark(
-                            BookmarkEntity(
-                                id = entry.id,
-                                workId = target.id,
-                                trackId = entry.trackId,
-                                positionMs = entry.positionMs.coerceAtLeast(0L),
-                                title = entry.title,
-                                endMs = entry.endMs,
-                            ),
+                    val resolvedTrackId =
+                        resolveTrackId(target.id, entry.trackId, entry.trackRelativePath)
+                            ?: continue
+                    library.dao.saveBookmark(
+                        BookmarkEntity(
+                            id = entry.id,
+                            workId = target.id,
+                            trackId = resolvedTrackId,
+                            positionMs = entry.positionMs.coerceAtLeast(0L),
+                            title = entry.title,
+                            endMs = entry.endMs,
+                        ),
+                    )
+                    restoredBookmarks++
+                }
+
+                for (entry in snapshot.trackStates) {
+                    val target = resolveWork(entry.workId, entry.rj) ?: continue
+                    val resolvedTrackId =
+                        resolveTrackId(target.id, entry.trackId, entry.trackRelativePath)
+                            ?: continue
+                    val primaryId =
+                        resolveAttachmentId(
+                            target.id,
+                            entry.primarySubtitleId,
+                            entry.primarySubtitlePath,
                         )
-                        restoredBookmarks++
-                    }
+                    val secondaryId =
+                        resolveAttachmentId(
+                                target.id,
+                                entry.secondarySubtitleId,
+                                entry.secondarySubtitlePath,
+                            )
+                            ?.takeIf { it != primaryId }
+                    library.dao.upsertTrackStateIfValid(
+                        trackId = resolvedTrackId,
+                        positionMs = entry.positionMs.coerceAtLeast(0L),
+                        offsetMs = entry.subtitleOffsetMs.coerceIn(-10_000L, 10_000L),
+                        primaryId = primaryId,
+                        secondaryId = secondaryId,
+                        updatedAt = entry.updatedAt.coerceAtLeast(0L),
+                    )
                 }
             }
             BackupRestoreSummary(restoredWorks, restoredProgress, restoredBookmarks)

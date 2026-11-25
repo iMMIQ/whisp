@@ -13,11 +13,6 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.ChevronRight
-import androidx.compose.material.icons.outlined.FileDownload
-import androidx.compose.material.icons.outlined.FileUpload
-import androidx.compose.material.icons.outlined.Storage
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -537,7 +532,7 @@ internal fun SettingsPage(
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(12.dp),
                         ) {
-                            Icon(Icons.Outlined.FileUpload, null, Modifier.size(18.dp))
+                            Icon(WhispIcons.Outlined.FileUpload, null, Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
                             Text("导出备份")
                         }
@@ -547,7 +542,7 @@ internal fun SettingsPage(
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(12.dp),
                         ) {
-                            Icon(Icons.Outlined.FileDownload, null, Modifier.size(18.dp))
+                            Icon(WhispIcons.Outlined.FileDownload, null, Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
                             Text("恢复备份")
                         }
@@ -577,7 +572,7 @@ internal fun SettingsPage(
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(
-                            Icons.Outlined.Storage,
+                            WhispIcons.Outlined.Storage,
                             null,
                             tint = Rose,
                             modifier = Modifier.size(20.dp),
@@ -599,7 +594,7 @@ internal fun SettingsPage(
                         )
                     }
                     Icon(
-                        Icons.Outlined.ChevronRight,
+                        WhispIcons.Outlined.ChevronRight,
                         null,
                         tint = Muted,
                         modifier = Modifier.size(20.dp),

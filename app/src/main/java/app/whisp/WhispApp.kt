@@ -19,8 +19,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import okhttp3.OkHttpClient
 
 /**
- * Flat dependency container replacing the monolithic LibraryRepository and AppViewModel God
- * objects. Dependencies form an acyclic DAG from storage primitives up to playback coordination.
+ * Flat dependency container forming an acyclic DAG from storage primitives up to playback
+ * coordination, with lazy initialization for non-cold-start protocol clients and services.
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 class AppGraph(val context: Context) {
@@ -29,53 +29,108 @@ class AppGraph(val context: Context) {
 
     val database: LibraryDatabase =
         Room.databaseBuilder(context, LibraryDatabase::class.java, "whisp.db")
-            .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
+            .fallbackToDestructiveMigration(dropAllTables = true)
             .build()
 
-    val secrets = SecretStore()
+    val secrets by lazy { SecretStore() }
     val settings = SettingsStore(context, scope)
-    val audioDevices = AudioDeviceMonitor(context)
-    val dlsiteDiagnostics = DlsiteDiagnostics(context)
+    val audioDevices by lazy { AudioDeviceMonitor(context) }
+    val dlsiteDiagnostics by lazy { DlsiteDiagnostics(context) }
 
-    val http: OkHttpClient =
+    val http: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .followSslRedirects(false)
             .build()
+    }
 
     // Share underlying ConnectionPool & Dispatcher threads with [http] to cut memory and TLS churn.
-    val onlineHttp: OkHttpClient =
+    val onlineHttp: OkHttpClient by lazy {
         http
             .newBuilder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .followSslRedirects(false)
             .build()
+    }
 
     val messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val storageChanges = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
-    private val legacyOfflineDir = File(context.filesDir, "offline/attachments")
     private val offlineDir = File(context.filesDir, "offline/assets")
     private val customArtworkDir = File(context.filesDir, "custom-artwork")
 
-    val sources =
+    val sources by lazy {
         SourceRegistry(
             context,
             scope,
             database.library(),
             secrets,
-            http,
-            onlineHttp,
-            dlsiteDiagnostics,
+            { http },
+            { onlineHttp },
+            { dlsiteDiagnostics },
         )
+    }
 
-    val library: LibraryStore
-    val media: MediaSourceRouting
-    val images: WhispImages
-    val offline: OfflineStore
-    val playback: PlaybackCoordinator
+    val media: MediaSourceRouting by lazy {
+        MediaSourceRouting(
+            context = context,
+            scope = scope,
+            sources = sources,
+            headersFor = { uri -> sources.headersFor(uri, library.sourceList.value) },
+            storageChanged = { storageChanges.tryEmit(Unit) },
+            streamingCacheMiBUpdates = settings.streamingCacheMiBUpdates,
+            wifiOnlyDownloadsUpdates = settings.wifiOnlyDownloadsUpdates,
+            messages = messages,
+        )
+    }
+
+    val library: LibraryStore by lazy {
+        LibraryStore(
+            context = context,
+            scope = scope,
+            database = database,
+            sources = sources,
+            media = media,
+            offlineDir = offlineDir,
+            customArtworkDir = customArtworkDir,
+            storageChanged = { storageChanges.tryEmit(Unit) },
+        )
+    }
+
+    val images: WhispImages by lazy {
+        WhispImages(
+            context = context,
+            scope = scope,
+            dao = database.library(),
+            sources = sources,
+            offlineDir = offlineDir,
+            customArtworkDir = customArtworkDir,
+            readAsset = { id, limit -> library.readAsset(id, limit) },
+            streamAsset = { id, sink, limit -> library.streamAssetToSink(id, sink, limit) },
+            streamingCacheBytes = { media.streamingCache.cacheSpace },
+            downloadCacheBytes = { media.downloadCache.cacheSpace },
+            storageChanged = { storageChanges.tryEmit(Unit) },
+        )
+    }
+
+    val offline: OfflineStore by lazy {
+        OfflineStore(context, library, media, images) { playback.detachTracks(it) }
+    }
+
+    val playback: PlaybackCoordinator by lazy {
+        PlaybackCoordinator(
+            context,
+            mainScope,
+            library,
+            images,
+            settings,
+            audioDevices,
+            messages,
+        )
+    }
+
     val sync: LibrarySync by lazy {
         LibrarySync(
             context = context,
@@ -88,9 +143,11 @@ class AppGraph(val context: Context) {
             detachTracks = { playback.detachTracks(it) },
         )
     }
+
     val dlsiteLoader: app.whisp.ui.DlsiteDetailsLoader by lazy {
         app.whisp.ui.DlsiteDetailsLoader(mainScope, library, sources.dlsite)
     }
+
     val asmrCatalog: app.whisp.ui.AsmrCatalogController by lazy {
         app.whisp.ui.AsmrCatalogController(
             scope = mainScope,
@@ -98,6 +155,7 @@ class AppGraph(val context: Context) {
             rememberSearch = settings::rememberAsmrSearch,
         )
     }
+
     private val scopedAsmrCatalogs =
         object : LinkedHashMap<String, app.whisp.ui.AsmrCatalogController>(8, 0.75f, true) {
             override fun removeEldestEntry(
@@ -117,86 +175,6 @@ class AppGraph(val context: Context) {
             }
         }
     }
-
-    init {
-        migrateLegacyOfflineDir(legacyOfflineDir, offlineDir)
-        var libraryRef: LibraryStore? = null
-        media =
-            MediaSourceRouting(
-                context = context,
-                scope = scope,
-                sources = sources,
-                headersFor = { uri ->
-                    sources.headersFor(uri, libraryRef?.sourceList?.value.orEmpty())
-                },
-                storageChanged = { storageChanges.tryEmit(Unit) },
-                streamingCacheMiBUpdates = settings.streamingCacheMiBUpdates,
-                wifiOnlyDownloadsUpdates = settings.wifiOnlyDownloadsUpdates,
-                messages = messages,
-            )
-        library =
-            LibraryStore(
-                context = context,
-                scope = scope,
-                database = database,
-                sources = sources,
-                media = media,
-                offlineDir = offlineDir,
-                customArtworkDir = customArtworkDir,
-                storageChanged = { storageChanges.tryEmit(Unit) },
-            )
-        libraryRef = library
-        images =
-            WhispImages(
-                context = context,
-                scope = scope,
-                dao = database.library(),
-                settings = settings,
-                sources = sources,
-                offlineDir = offlineDir,
-                customArtworkDir = customArtworkDir,
-                readAsset = { id, limit -> library.readAsset(id, limit) },
-                streamAsset = { id, sink, limit -> library.streamAssetToSink(id, sink, limit) },
-                streamingCacheBytes = { media.streamingCache.cacheSpace },
-                downloadCacheBytes = { media.downloadCache.cacheSpace },
-                storageChanged = { storageChanges.tryEmit(Unit) },
-            )
-        offline = OfflineStore(context, library, media, images) { playback.detachTracks(it) }
-        playback =
-            PlaybackCoordinator(
-                context,
-                mainScope,
-                library,
-                images,
-                settings,
-                audioDevices,
-                messages,
-            )
-    }
-}
-
-internal fun migrateLegacyOfflineDir(legacyDir: File, targetDir: File) {
-    if (!legacyDir.isDirectory) return
-    if (!targetDir.exists()) {
-        targetDir.parentFile?.mkdirs()
-        if (legacyDir.renameTo(targetDir)) return
-    }
-    targetDir.mkdirs()
-    legacyDir.listFiles()?.forEach { source ->
-        if (!source.isFile) return@forEach
-        val destination = File(targetDir, source.name)
-        if (!destination.exists()) {
-            if (!source.renameTo(destination)) {
-                runCatching {
-                    source.copyTo(destination, overwrite = false)
-                    source.delete()
-                }
-            }
-        } else {
-            source.delete()
-        }
-    }
-    if (legacyDir.list().isNullOrEmpty()) legacyDir.delete()
 }
 
 class WhispApp : Application(), SingletonImageLoader.Factory {

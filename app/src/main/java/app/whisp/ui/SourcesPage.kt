@@ -13,9 +13,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.Login
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -50,13 +47,13 @@ import kotlinx.coroutines.withContext
 
 private fun sourceIcon(kind: SourceKind?): ImageVector =
     when (kind) {
-        SourceKind.LOCAL -> Icons.Outlined.FolderOpen
-        SourceKind.SMB -> Icons.Outlined.Dns
-        SourceKind.NFS -> Icons.Outlined.Lan
-        SourceKind.WEBDAV -> Icons.Outlined.CloudQueue
-        SourceKind.ASMRONE -> Icons.Outlined.Headphones
-        SourceKind.DLSITE -> Icons.Outlined.AccountCircle
-        null -> Icons.Outlined.CloudQueue
+        SourceKind.LOCAL -> WhispIcons.Outlined.FolderOpen
+        SourceKind.SMB -> WhispIcons.Outlined.Dns
+        SourceKind.NFS -> WhispIcons.Outlined.Lan
+        SourceKind.WEBDAV -> WhispIcons.Outlined.CloudQueue
+        SourceKind.ASMRONE -> WhispIcons.Outlined.Headphones
+        SourceKind.DLSITE -> WhispIcons.Outlined.AccountCircle
+        null -> WhispIcons.Outlined.CloudQueue
     }
 
 private fun sourceLabel(kind: SourceKind?): String =
@@ -173,13 +170,13 @@ internal fun SourcesPage(
                 modifier = Modifier.weight(1f),
             )
             IconAction(
-                Icons.Outlined.Storage,
+                WhispIcons.Outlined.Storage,
                 "存储管理",
                 Muted,
                 haptic = HapticKind.Tick,
                 action = storage,
             )
-            IconAction(Icons.Outlined.Add, "添加来源", Cream, haptic = HapticKind.Tick) {
+            IconAction(WhispIcons.Outlined.Add, "添加来源", Cream, haptic = HapticKind.Tick) {
                 adding = true
             }
         }
@@ -254,12 +251,12 @@ internal fun SourcesPage(
                             strokeWidth = 2.dp,
                         )
                     } else if (source.kindType in setOf(SourceKind.ASMRONE, SourceKind.DLSITE)) {
-                        IconAction(Icons.Outlined.MoreVert, "管理${source.name}", Muted) {
+                        IconAction(WhispIcons.Outlined.MoreVert, "管理${source.name}", Muted) {
                             selectedId = source.id
                         }
                     } else {
                         IconAction(
-                            Icons.Outlined.Refresh,
+                            WhispIcons.Outlined.Refresh,
                             "刷新${source.name}",
                             Muted,
                             haptic = HapticKind.Tick,
@@ -272,13 +269,13 @@ internal fun SourcesPage(
             if (sources.isEmpty()) {
                 item {
                     WhispEmptyState(
-                        icon = Icons.Outlined.CreateNewFolder,
+                        icon = WhispIcons.Outlined.CreateNewFolder,
                         title = "尚未配置媒体来源",
                         subtitle = "支持本地目录、SMB、NFS、WebDAV、ASMR.ONE 与 DLsite",
                         modifier = Modifier.padding(top = 36.dp),
                     ) {
                         FilledTonalButton(onClick = { adding = true }) {
-                            Icon(Icons.Outlined.CreateNewFolder, null)
+                            Icon(WhispIcons.Outlined.CreateNewFolder, null)
                             Spacer(Modifier.width(10.dp))
                             Text("添加作品")
                         }
@@ -298,7 +295,7 @@ internal fun SourcesPage(
                             modifier = Modifier.weight(1f),
                         )
                         IconAction(
-                            Icons.Outlined.PlayArrow,
+                            WhispIcons.Outlined.PlayArrow,
                             "继续下载",
                             Rose,
                             haptic = HapticKind.Tick,
@@ -306,7 +303,7 @@ internal fun SourcesPage(
                             graph.offline.resumeDownloads()
                         }
                         IconAction(
-                            Icons.Outlined.Pause,
+                            WhispIcons.Outlined.Pause,
                             "暂停下载",
                             Muted,
                             haptic = HapticKind.Tick,
@@ -375,7 +372,8 @@ internal fun SourcesPage(
                             )
                         }
                         IconAction(
-                            if (complete) Icons.Outlined.DeleteOutline else Icons.Outlined.Refresh,
+                            if (complete) WhispIcons.Outlined.DeleteOutline
+                            else WhispIcons.Outlined.Refresh,
                             if (complete) "移除离线副本" else "重试下载",
                             Muted,
                             haptic = HapticKind.Tick,
@@ -411,7 +409,7 @@ internal fun SourcesPage(
             )
             Column(Modifier.verticalScroll(rememberScrollState()).navigationBarsPadding()) {
                 WhispSheetRow(
-                    icon = Icons.Outlined.AccountCircle,
+                    icon = WhispIcons.Outlined.AccountCircle,
                     title = "DLsite",
                     subtitle = "登录 viviON ID 同步已购音声",
                     onClick = {
@@ -420,7 +418,7 @@ internal fun SourcesPage(
                     },
                 )
                 WhispSheetRow(
-                    icon = Icons.Outlined.Headphones,
+                    icon = WhispIcons.Outlined.Headphones,
                     title = "ASMR.ONE",
                     subtitle = "浏览公开作品目录与在线字幕",
                     onClick = {
@@ -429,7 +427,7 @@ internal fun SourcesPage(
                     },
                 )
                 WhispSheetRow(
-                    icon = Icons.Outlined.FolderOpen,
+                    icon = WhispIcons.Outlined.FolderOpen,
                     title = "本地目录",
                     subtitle = "授权扫描设备中的音频与视频文件夹",
                     onClick = {
@@ -438,7 +436,7 @@ internal fun SourcesPage(
                     },
                 )
                 WhispSheetRow(
-                    icon = Icons.Outlined.Dns,
+                    icon = WhispIcons.Outlined.Dns,
                     title = "SMB",
                     subtitle = "连接局域网 SMB 2/3 文件共享",
                     onClick = {
@@ -447,7 +445,7 @@ internal fun SourcesPage(
                     },
                 )
                 WhispSheetRow(
-                    icon = Icons.Outlined.CloudQueue,
+                    icon = WhispIcons.Outlined.CloudQueue,
                     title = "WebDAV",
                     subtitle = "通过 HTTPS 挂载远程媒体库",
                     onClick = {
@@ -456,7 +454,7 @@ internal fun SourcesPage(
                     },
                 )
                 WhispSheetRow(
-                    icon = Icons.Outlined.Lan,
+                    icon = WhispIcons.Outlined.Lan,
                     title = "NFS",
                     subtitle = "直连 NAS 导出目录（NFS 3 / 4.0 / 4.2）",
                     onClick = {
@@ -491,7 +489,7 @@ internal fun SourcesPage(
                 }
                 if (source.kindType in setOf(SourceKind.ASMRONE, SourceKind.DLSITE)) {
                     WhispSheetRow(
-                        icon = Icons.Outlined.Explore,
+                        icon = WhispIcons.Outlined.Explore,
                         title = "浏览",
                         onClick = {
                             dismiss()
@@ -504,7 +502,7 @@ internal fun SourcesPage(
                     )
                 } else {
                     WhispSheetRow(
-                        icon = Icons.Outlined.Refresh,
+                        icon = WhispIcons.Outlined.Refresh,
                         title = "刷新",
                         subtitle = "重新扫描此来源的音频与字幕",
                         onClick = {
@@ -515,7 +513,7 @@ internal fun SourcesPage(
                 }
                 if (source.kindType == SourceKind.ASMRONE) {
                     WhispSheetRow(
-                        icon = Icons.Outlined.Refresh,
+                        icon = WhispIcons.Outlined.Refresh,
                         title = "更新已加入作品",
                         onClick = {
                             graph.sync.scheduleScan(source.id)
@@ -525,7 +523,7 @@ internal fun SourcesPage(
                 }
                 if (source.kindType == SourceKind.DLSITE) {
                     WhispSheetRow(
-                        icon = Icons.Outlined.Refresh,
+                        icon = WhispIcons.Outlined.Refresh,
                         title = "同步已购作品",
                         onClick = {
                             graph.sync.scheduleScan(source.id)
@@ -533,7 +531,7 @@ internal fun SourcesPage(
                         },
                     )
                     WhispSheetRow(
-                        icon = Icons.AutoMirrored.Outlined.Login,
+                        icon = WhispIcons.AutoMirrored.Outlined.Login,
                         title = "重新登录",
                         onClick = {
                             dismiss()
@@ -545,7 +543,7 @@ internal fun SourcesPage(
                     )
                 }
                 WhispSheetRow(
-                    icon = Icons.Outlined.DeleteOutline,
+                    icon = WhispIcons.Outlined.DeleteOutline,
                     title = if (source.kindType == SourceKind.DLSITE) "退出账号" else "移除来源",
                     tint = MaterialTheme.colorScheme.error,
                     onClick = {
@@ -642,7 +640,7 @@ private fun RemoteDialog(graph: AppGraph, kind: SourceKind, dismiss: () -> Unit)
                                 },
                                 label = { Text("${svc.name} (${svc.host})") },
                                 leadingIcon = {
-                                    Icon(Icons.Outlined.Lan, null, Modifier.size(16.dp))
+                                    Icon(WhispIcons.Outlined.Lan, null, Modifier.size(16.dp))
                                 },
                             )
                         }

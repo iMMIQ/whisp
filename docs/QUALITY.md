@@ -127,6 +127,6 @@ GitHub Actions 流水线定义在 [.github/workflows/quality.yml](../.github/wor
 ## 编译器与工具链说明
 
 - **严格编译**：Kotlin 启用 `allWarningsAsErrors = true`，C++ 原生桥接启用 `-Wall -Wextra -Werror`。
-- **SDK 目标范围**：`compileSdk = 37`、`targetSdk = 36`、`minSdk = 26`。Release Lint 可能会提示面向 API 37 的前瞻性适配建议，属于预期追踪项。
+- **SDK 目标范围**：`compileSdk = 37`、`targetSdk = 36`、`minSdk = 28`。Release Lint 可能会提示面向 API 37 的前瞻性适配建议，属于预期追踪项。
 - **Material 3 与 Compose 实验 API**：Material 3 固定为 `1.5.0-beta01` 以使用公开的 `MotionScheme` API；共享元素转场依赖 Compose 实验 API，并由设备端 UI 回归测试守护。
 - **上游弃用提示**：Gradle 9.8 报告的 `Configuration.setVisible` 弃用警告来自 AGP 9.4.1 内部实现，待后续 AGP 升级跟进。

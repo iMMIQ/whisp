@@ -14,8 +14,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,6 +28,7 @@ import app.whisp.data.DlsiteSession
 import app.whisp.ui.Cream
 import app.whisp.ui.Ink
 import app.whisp.ui.Muted
+import app.whisp.ui.WhispIcons
 import app.whisp.ui.WhispTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -113,7 +112,11 @@ class DlsiteLoginActivity : ComponentActivity() {
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 IconButton(onClick = { finish() }) {
-                                    Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回", tint = Cream)
+                                    Icon(
+                                        WhispIcons.AutoMirrored.Outlined.ArrowBack,
+                                        "返回",
+                                        tint = Cream,
+                                    )
                                 }
                                 Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
                                     Text(

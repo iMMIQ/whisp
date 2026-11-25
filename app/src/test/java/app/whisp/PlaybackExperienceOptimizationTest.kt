@@ -249,25 +249,27 @@ class PlaybackExperienceOptimizationTest {
     }
 
     @Test
-    fun settingsStorePersistsPerTrackSubtitleOffsetSelectionAndPosition() = runBlocking {
+    fun typedSettingsStorePersistsGlobalSettingsProfilesAndSearchHistory() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         try {
             val store = SettingsStore(RuntimeEnvironment.getApplication(), scope)
-            store.setTrackSubtitleOffset("track-a", 1250L)
-            store.setTrackSubtitleOffset("track-b", -500L)
-            store.setTrackSubtitleSelection("track-a", TrackSubtitleSelection("sub-zh", "sub-ja"))
-            store.rememberTrackPosition("track-a", 42_000L)
+            store.update { it.copy(volumeGain = 0.65f, nightDynamics = true) }
+            store.saveDeviceAudioProfile(
+                "bluetooth|sleepbuds",
+                DeviceAudioProfile(swapChannels = true, volumeGain = 0.55f),
+            )
+            store.rememberAsmrSearch("RJ01234567")
 
-            val offsets = store.trackSubtitleOffsets.first { it["track-a"] == 1250L }
-            assertEquals(1250L, offsets["track-a"])
-            assertEquals(-500L, offsets["track-b"])
+            val updated = store.settingsUpdates.first { it.nightDynamics }
+            assertEquals(0.65f, updated.volumeGain, 0.001f)
 
-            val selections = store.trackSubtitleSelections.first { it["track-a"] != null }
-            assertEquals("sub-zh", selections["track-a"]?.primaryId)
-            assertEquals("sub-ja", selections["track-a"]?.secondaryId)
+            val profile = store.deviceAudioProfileFor("bluetooth|sleepbuds")
+            assertNotNull(profile)
+            assertTrue(profile!!.swapChannels)
+            assertEquals(0.55f, profile.volumeGain, 0.001f)
 
-            val positions = store.trackPositions.first { it["track-a"] == 42_000L }
-            assertEquals(42_000L, positions["track-a"])
+            val history = store.asmrSearchHistory.first { "RJ01234567" in it }
+            assertEquals("RJ01234567", history.first())
 
             // Normalization clamps audio parameters cleanly.
             val normalized = Settings(volumeGain = 0.01f, sleepFadeSeconds = 999).normalized()

@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "b32f3759260f2ea3305912b052c57ad1",
+    "identityHash": "361f6548c18ca147c4f9ac40a3eba5f3",
     "entities": [
       {
         "tableName": "sources",
@@ -65,7 +65,7 @@
       },
       {
         "tableName": "works",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `rj` TEXT, `title` TEXT NOT NULL, `originalTitle` TEXT NOT NULL, `artist` TEXT NOT NULL, `series` TEXT, `coverId` TEXT, `favorite` INTEGER NOT NULL, `addedAt` INTEGER NOT NULL, `offlineAttachments` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `rj` TEXT, `title` TEXT NOT NULL, `originalTitle` TEXT NOT NULL, `artist` TEXT NOT NULL, `series` TEXT, `coverId` TEXT, `favorite` INTEGER NOT NULL, `addedAt` INTEGER NOT NULL, `offlineAttachments` INTEGER NOT NULL, `originalArtist` TEXT NOT NULL, `coverUrl` TEXT, `origin` TEXT NOT NULL, `sourceId` TEXT, PRIMARY KEY(`id`), FOREIGN KEY(`sourceId`) REFERENCES `sources`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL )",
         "fields": [
           {
             "fieldPath": "id",
@@ -123,6 +123,28 @@
             "columnName": "offlineAttachments",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "originalArtist",
+            "columnName": "originalArtist",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "coverUrl",
+            "columnName": "coverUrl",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceId",
+            "columnName": "sourceId",
+            "affinity": "TEXT"
           }
         ],
         "primaryKey": {
@@ -130,11 +152,105 @@
           "columnNames": [
             "id"
           ]
-        }
+        },
+        "indices": [
+          {
+            "name": "index_works_sourceId",
+            "unique": false,
+            "columnNames": [
+              "sourceId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_works_sourceId` ON `${TABLE_NAME}` (`sourceId`)"
+          },
+          {
+            "name": "index_works_coverId",
+            "unique": false,
+            "columnNames": [
+              "coverId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_works_coverId` ON `${TABLE_NAME}` (`coverId`)"
+          },
+          {
+            "name": "index_works_addedAt",
+            "unique": false,
+            "columnNames": [
+              "addedAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_works_addedAt` ON `${TABLE_NAME}` (`addedAt`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "sources",
+            "onDelete": "SET NULL",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "sourceId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "works_fts",
+        "createSql": "CREATE VIRTUAL TABLE IF NOT EXISTS `${TABLE_NAME}` USING FTS4(`title` TEXT NOT NULL, `rj` TEXT, `artist` TEXT NOT NULL, `originalTitle` TEXT NOT NULL, tokenize=unicode61 `separators=_-./()[]【】「」『』`, content=`works`)",
+        "fields": [
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "rj",
+            "columnName": "rj",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "artist",
+            "columnName": "artist",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "originalTitle",
+            "columnName": "originalTitle",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": []
+        },
+        "ftsVersion": "FTS4",
+        "ftsOptions": {
+          "tokenizer": "unicode61",
+          "tokenizerArgs": [
+            "separators=_-./()[]【】「」『』"
+          ],
+          "contentTable": "works",
+          "languageIdColumnName": "",
+          "matchInfo": "FTS4",
+          "notIndexedColumns": [],
+          "prefixSizes": [],
+          "preferredOrder": "ASC"
+        },
+        "contentSyncTriggers": [
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_works_fts_BEFORE_UPDATE BEFORE UPDATE ON `works` BEGIN DELETE FROM `works_fts` WHERE `docid`=OLD.`rowid`; END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_works_fts_BEFORE_DELETE BEFORE DELETE ON `works` BEGIN DELETE FROM `works_fts` WHERE `docid`=OLD.`rowid`; END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_works_fts_AFTER_UPDATE AFTER UPDATE ON `works` BEGIN INSERT INTO `works_fts`(`docid`, `title`, `rj`, `artist`, `originalTitle`) VALUES (NEW.`rowid`, NEW.`title`, NEW.`rj`, NEW.`artist`, NEW.`originalTitle`); END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_works_fts_AFTER_INSERT AFTER INSERT ON `works` BEGIN INSERT INTO `works_fts`(`docid`, `title`, `rj`, `artist`, `originalTitle`) VALUES (NEW.`rowid`, NEW.`title`, NEW.`rj`, NEW.`artist`, NEW.`originalTitle`); END"
+        ]
       },
       {
         "tableName": "tracks",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `title` TEXT NOT NULL, `fileName` TEXT NOT NULL, `relativePath` TEXT NOT NULL, `order` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `subtitleId` TEXT, `scriptId` TEXT, `bonus` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `title` TEXT NOT NULL, `fileName` TEXT NOT NULL, `relativePath` TEXT NOT NULL, `order` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `subtitleId` TEXT, `scriptId` TEXT, `bonus` INTEGER NOT NULL, `uri` TEXT NOT NULL, `size` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
         "fields": [
           {
             "fieldPath": "id",
@@ -193,6 +309,18 @@
             "columnName": "bonus",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "uri",
+            "columnName": "uri",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "size",
+            "columnName": "size",
+            "affinity": "INTEGER",
+            "notNull": true
           }
         ],
         "primaryKey": {
@@ -203,19 +331,134 @@
         },
         "indices": [
           {
-            "name": "index_tracks_workId",
+            "name": "index_tracks_workId_order_id",
             "unique": false,
             "columnNames": [
-              "workId"
+              "workId",
+              "order",
+              "id"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_tracks_workId` ON `${TABLE_NAME}` (`workId`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_tracks_workId_order_id` ON `${TABLE_NAME}` (`workId`, `order`, `id`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "works",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "workId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "tracks_fts",
+        "createSql": "CREATE VIRTUAL TABLE IF NOT EXISTS `${TABLE_NAME}` USING FTS4(`title` TEXT NOT NULL, `fileName` TEXT NOT NULL, tokenize=unicode61 `separators=_-./()[]【】「」『』`, content=`tracks`)",
+        "fields": [
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fileName",
+            "columnName": "fileName",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": []
+        },
+        "ftsVersion": "FTS4",
+        "ftsOptions": {
+          "tokenizer": "unicode61",
+          "tokenizerArgs": [
+            "separators=_-./()[]【】「」『』"
+          ],
+          "contentTable": "tracks",
+          "languageIdColumnName": "",
+          "matchInfo": "FTS4",
+          "notIndexedColumns": [],
+          "prefixSizes": [],
+          "preferredOrder": "ASC"
+        },
+        "contentSyncTriggers": [
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_tracks_fts_BEFORE_UPDATE BEFORE UPDATE ON `tracks` BEGIN DELETE FROM `tracks_fts` WHERE `docid`=OLD.`rowid`; END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_tracks_fts_BEFORE_DELETE BEFORE DELETE ON `tracks` BEGIN DELETE FROM `tracks_fts` WHERE `docid`=OLD.`rowid`; END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_tracks_fts_AFTER_UPDATE AFTER UPDATE ON `tracks` BEGIN INSERT INTO `tracks_fts`(`docid`, `title`, `fileName`) VALUES (NEW.`rowid`, NEW.`title`, NEW.`fileName`); END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_tracks_fts_AFTER_INSERT AFTER INSERT ON `tracks` BEGIN INSERT INTO `tracks_fts`(`docid`, `title`, `fileName`) VALUES (NEW.`rowid`, NEW.`title`, NEW.`fileName`); END"
+        ]
+      },
+      {
+        "tableName": "track_state",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `subtitleOffsetMs` INTEGER NOT NULL, `primarySubtitleId` TEXT, `secondarySubtitleId` TEXT, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`trackId`), FOREIGN KEY(`trackId`) REFERENCES `tracks`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "trackId",
+            "columnName": "trackId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "positionMs",
+            "columnName": "positionMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "subtitleOffsetMs",
+            "columnName": "subtitleOffsetMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "primarySubtitleId",
+            "columnName": "primarySubtitleId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "secondarySubtitleId",
+            "columnName": "secondarySubtitleId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "trackId"
+          ]
+        },
+        "foreignKeys": [
+          {
+            "table": "tracks",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "trackId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
           }
         ]
       },
       {
         "tableName": "attachments",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `title` TEXT NOT NULL, `fileName` TEXT NOT NULL, `relativePath` TEXT NOT NULL, `kind` TEXT NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `title` TEXT NOT NULL, `fileName` TEXT NOT NULL, `relativePath` TEXT NOT NULL, `kind` TEXT NOT NULL, `uri` TEXT NOT NULL, `size` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
         "fields": [
           {
             "fieldPath": "id",
@@ -252,6 +495,18 @@
             "columnName": "kind",
             "affinity": "TEXT",
             "notNull": true
+          },
+          {
+            "fieldPath": "uri",
+            "columnName": "uri",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "size",
+            "columnName": "size",
+            "affinity": "INTEGER",
+            "notNull": true
           }
         ],
         "primaryKey": {
@@ -270,85 +525,59 @@
             "orders": [],
             "createSql": "CREATE INDEX IF NOT EXISTS `index_attachments_workId` ON `${TABLE_NAME}` (`workId`)"
           }
+        ],
+        "foreignKeys": [
+          {
+            "table": "works",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "workId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
         ]
       },
       {
-        "tableName": "locations",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assetId` TEXT NOT NULL, `sourceId` TEXT NOT NULL, `uri` TEXT NOT NULL, `size` INTEGER NOT NULL, `modified` INTEGER NOT NULL, `generation` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "tableName": "attachments_fts",
+        "createSql": "CREATE VIRTUAL TABLE IF NOT EXISTS `${TABLE_NAME}` USING FTS4(`fileName` TEXT NOT NULL, tokenize=unicode61 `separators=_-./()[]【】「」『』`, content=`attachments`)",
         "fields": [
           {
-            "fieldPath": "id",
-            "columnName": "id",
+            "fieldPath": "fileName",
+            "columnName": "fileName",
             "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "assetId",
-            "columnName": "assetId",
-            "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "sourceId",
-            "columnName": "sourceId",
-            "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "uri",
-            "columnName": "uri",
-            "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "size",
-            "columnName": "size",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "modified",
-            "columnName": "modified",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "generation",
-            "columnName": "generation",
-            "affinity": "INTEGER",
             "notNull": true
           }
         ],
         "primaryKey": {
           "autoGenerate": false,
-          "columnNames": [
-            "id"
-          ]
+          "columnNames": []
         },
-        "indices": [
-          {
-            "name": "index_locations_assetId",
-            "unique": false,
-            "columnNames": [
-              "assetId"
-            ],
-            "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_locations_assetId` ON `${TABLE_NAME}` (`assetId`)"
-          },
-          {
-            "name": "index_locations_sourceId",
-            "unique": false,
-            "columnNames": [
-              "sourceId"
-            ],
-            "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_locations_sourceId` ON `${TABLE_NAME}` (`sourceId`)"
-          }
+        "ftsVersion": "FTS4",
+        "ftsOptions": {
+          "tokenizer": "unicode61",
+          "tokenizerArgs": [
+            "separators=_-./()[]【】「」『』"
+          ],
+          "contentTable": "attachments",
+          "languageIdColumnName": "",
+          "matchInfo": "FTS4",
+          "notIndexedColumns": [],
+          "prefixSizes": [],
+          "preferredOrder": "ASC"
+        },
+        "contentSyncTriggers": [
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_attachments_fts_BEFORE_UPDATE BEFORE UPDATE ON `attachments` BEGIN DELETE FROM `attachments_fts` WHERE `docid`=OLD.`rowid`; END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_attachments_fts_BEFORE_DELETE BEFORE DELETE ON `attachments` BEGIN DELETE FROM `attachments_fts` WHERE `docid`=OLD.`rowid`; END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_attachments_fts_AFTER_UPDATE AFTER UPDATE ON `attachments` BEGIN INSERT INTO `attachments_fts`(`docid`, `fileName`) VALUES (NEW.`rowid`, NEW.`fileName`); END",
+          "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_attachments_fts_AFTER_INSERT AFTER INSERT ON `attachments` BEGIN INSERT INTO `attachments_fts`(`docid`, `fileName`) VALUES (NEW.`rowid`, NEW.`fileName`); END"
         ]
       },
       {
         "tableName": "progress",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`workId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`workId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`workId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`workId`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
         "fields": [
           {
             "fieldPath": "workId",
@@ -380,11 +609,35 @@
           "columnNames": [
             "workId"
           ]
-        }
+        },
+        "indices": [
+          {
+            "name": "index_progress_updatedAt",
+            "unique": false,
+            "columnNames": [
+              "updatedAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_progress_updatedAt` ON `${TABLE_NAME}` (`updatedAt`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "works",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "workId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
       },
       {
         "tableName": "bookmarks",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `title` TEXT NOT NULL, `endMs` INTEGER, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `title` TEXT NOT NULL, `endMs` INTEGER, PRIMARY KEY(`id`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
         "fields": [
           {
             "fieldPath": "id",
@@ -437,13 +690,133 @@
             ],
             "orders": [],
             "createSql": "CREATE INDEX IF NOT EXISTS `index_bookmarks_workId` ON `${TABLE_NAME}` (`workId`)"
+          },
+          {
+            "name": "index_bookmarks_positionMs",
+            "unique": false,
+            "columnNames": [
+              "positionMs"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_bookmarks_positionMs` ON `${TABLE_NAME}` (`positionMs`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "works",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "workId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "dlsite_metadata",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`workId` TEXT NOT NULL, `snapshot` TEXT NOT NULL, PRIMARY KEY(`workId`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "workId",
+            "columnName": "workId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshot",
+            "columnName": "snapshot",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "workId"
+          ]
+        },
+        "foreignKeys": [
+          {
+            "table": "works",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "workId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "dlsite_purchases",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sourceId` TEXT NOT NULL, `workno` TEXT NOT NULL, `purchasedAt` INTEGER NOT NULL, `snapshot` TEXT NOT NULL, PRIMARY KEY(`sourceId`, `workno`), FOREIGN KEY(`sourceId`) REFERENCES `sources`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "sourceId",
+            "columnName": "sourceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "workno",
+            "columnName": "workno",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "purchasedAt",
+            "columnName": "purchasedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshot",
+            "columnName": "snapshot",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "sourceId",
+            "workno"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_dlsite_purchases_sourceId",
+            "unique": false,
+            "columnNames": [
+              "sourceId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_dlsite_purchases_sourceId` ON `${TABLE_NAME}` (`sourceId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "sources",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "sourceId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
           }
         ]
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b32f3759260f2ea3305912b052c57ad1')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '361f6548c18ca147c4f9ac40a3eba5f3')"
     ]
   }
 }

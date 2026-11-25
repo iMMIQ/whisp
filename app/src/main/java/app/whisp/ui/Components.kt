@@ -25,9 +25,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -248,7 +245,7 @@ internal fun Artwork(
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
-                    Icons.Outlined.Headphones,
+                    WhispIcons.Outlined.Headphones,
                     description,
                     tint = Muted.copy(alpha = .42f),
                     modifier =
@@ -367,7 +364,7 @@ internal fun WorkCard(
                 ) {
                     if (offline) {
                         Icon(
-                            Icons.Outlined.DownloadDone,
+                            WhispIcons.Outlined.DownloadDone,
                             null,
                             tint = Cream.copy(alpha = 0.9f),
                             modifier = Modifier.size(12.dp),
@@ -375,7 +372,7 @@ internal fun WorkCard(
                     }
                     if (work.favorite) {
                         Icon(
-                            Icons.Filled.Favorite,
+                            WhispIcons.Filled.Favorite,
                             null,
                             tint = Rose,
                             modifier = Modifier.size(12.dp),
@@ -496,7 +493,7 @@ internal fun TrackRow(track: TrackEntity, active: Boolean, click: () -> Unit) {
         )
         if (active) {
             Icon(
-                Icons.Outlined.GraphicEq,
+                WhispIcons.Outlined.GraphicEq,
                 null,
                 tint = Rose,
                 modifier = Modifier.padding(end = 6.dp).size(16.dp),
@@ -504,7 +501,7 @@ internal fun TrackRow(track: TrackEntity, active: Boolean, click: () -> Unit) {
         }
         if (track.isVideo) {
             Icon(
-                Icons.Outlined.Videocam,
+                WhispIcons.Outlined.Videocam,
                 "视频",
                 tint = if (active) Rose.copy(alpha = 0.85f) else Muted,
                 modifier = Modifier.padding(end = 6.dp).size(16.dp),
@@ -512,7 +509,7 @@ internal fun TrackRow(track: TrackEntity, active: Boolean, click: () -> Unit) {
         }
         if (track.subtitleId != null) {
             Icon(
-                Icons.Outlined.Subtitles,
+                WhispIcons.Outlined.Subtitles,
                 "含字幕",
                 tint = if (active) Rose.copy(alpha = 0.85f) else Muted,
                 modifier = Modifier.padding(end = 8.dp).size(16.dp),
@@ -549,17 +546,17 @@ internal fun WhispSearchBar(
         textStyle = MaterialTheme.typography.bodyMedium.copy(color = Cream, fontSize = 15.sp),
         placeholder = { Text(placeholder, color = Muted.copy(alpha = 0.8f), fontSize = 15.sp) },
         leadingIcon = {
-            Icon(Icons.Outlined.Search, null, tint = Muted, modifier = Modifier.size(20.dp))
+            Icon(WhispIcons.Outlined.Search, null, tint = Muted, modifier = Modifier.size(20.dp))
         },
         trailingIcon = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (value.isNotEmpty()) {
-                    IconAction(Icons.Outlined.Close, clearLabel, Muted) {
+                    IconAction(WhispIcons.Outlined.Close, clearLabel, Muted) {
                         if (onClear != null) onClear() else onValueChange("")
                     }
                 }
                 if (onSubmit != null) {
-                    IconAction(Icons.Outlined.Search, submitLabel, Rose, action = onSubmit)
+                    IconAction(WhispIcons.Outlined.Search, submitLabel, Rose, action = onSubmit)
                 }
             }
         },
@@ -732,7 +729,7 @@ internal fun WhispSheetRow(
             }
         }
         Icon(
-            Icons.Outlined.ChevronRight,
+            WhispIcons.Outlined.ChevronRight,
             null,
             tint = if (enabled) Muted.copy(alpha = 0.7f) else Muted.copy(alpha = 0.25f),
             modifier = Modifier.size(18.dp),
@@ -939,7 +936,7 @@ internal fun WhispImageLightbox(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f).padding(start = 12.dp),
                     )
-                    IconAction(Icons.Outlined.Close, "关闭预览", Cream, action = onDismiss)
+                    IconAction(WhispIcons.Outlined.Close, "关闭预览", Cream, action = onDismiss)
                 }
             }
         }

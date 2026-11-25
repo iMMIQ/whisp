@@ -14,10 +14,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.DarkMode
-import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -207,7 +203,7 @@ internal fun PdfViewerDialog(
                 Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconAction(Icons.Outlined.Close, "关闭文档", Cream, action = dismiss)
+                IconAction(WhispIcons.Outlined.Close, "关闭文档", Cream, action = dismiss)
                 Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
                     Text(
                         attachment.title,
@@ -228,7 +224,8 @@ internal fun PdfViewerDialog(
                     }
                 }
                 IconAction(
-                    if (nightInvert) Icons.Outlined.DarkMode else Icons.Outlined.LightMode,
+                    if (nightInvert) WhispIcons.Outlined.DarkMode
+                    else WhispIcons.Outlined.LightMode,
                     if (nightInvert) "切换为纸质原色" else "切换为夜间护眼反色",
                     tint = if (nightInvert) Rose else Cream,
                     haptic = HapticKind.Tick,

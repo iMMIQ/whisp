@@ -29,7 +29,8 @@ if(NOT WHISP_BUILD_HOST_TESTS)
 
     add_library(whisp_nfs SHARED nfs_bridge.cpp)
     target_compile_features(whisp_nfs PRIVATE cxx_std_17)
-    target_compile_options(whisp_nfs PRIVATE -Wall -Wextra -Werror -fvisibility=hidden)
+    target_compile_options(whisp_nfs PRIVATE -Wall -Wextra -Werror -fvisibility=hidden
+                                             -fno-exceptions -fno-rtti)
     target_include_directories(whisp_nfs PRIVATE ${libnfs_SOURCE_DIR}/include)
     target_link_libraries(whisp_nfs PRIVATE nfs)
     if(NOT ANDROID)

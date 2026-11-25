@@ -499,7 +499,7 @@ class PlaybackCoordinator(
         val workId = item.mediaMetadata.extras?.getString("workId") ?: return
         val pos = player.currentPosition.coerceAtLeast(0L)
         val cues = subtitles.cues.value
-        val offsetMs = settings.subtitleOffsetFor(trackId)
+        val offsetMs = library.subtitleOffsetFor(trackId)
         val cueIndex = SubtitleTimeline.anchor(cues, (pos - offsetMs).coerceAtLeast(0L))
         val title =
             cues.getOrNull(cueIndex)?.text?.takeIf { it.isNotBlank() }

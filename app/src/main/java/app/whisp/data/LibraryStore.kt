@@ -79,16 +79,25 @@ class LibraryStore(
     }
 
     val progress: StateFlow<List<ProgressEntity>> by lazy {
-        dao.observeProgress().stateIn(scope, SharingStarted.Eagerly, emptyList())
+        dao.observeProgress().stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
     }
 
-    val trackSummaries: StateFlow<List<TrackSummary>> by lazy {
-        dao.observeTrackSummaries()
-            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+    val workProgressSummaries: StateFlow<Map<String, WorkProgressSummary>> by lazy {
+        dao.observeWorkProgressSummaries()
+            .map { list -> list.associateBy { it.workId } }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyMap())
+    }
+
+    val trackStates: StateFlow<Map<String, TrackStateEntity>> by lazy {
+        dao.observeTrackStates()
+            .map { list -> list.associateBy { it.trackId } }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
     }
 
     val bookmarks: StateFlow<List<BookmarkEntity>> by lazy {
-        dao.observeBookmarks().stateIn(scope, SharingStarted.Eagerly, emptyList())
+        dao.observeBookmarks().stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
     }
 
     private val progressWriter =
@@ -136,7 +145,45 @@ class LibraryStore(
     }
 
     suspend fun searchWorkIds(query: String): Set<String> =
-        withContext(Dispatchers.IO) { dao.searchWorkIds("%${query.trim()}%").toSet() }
+        withContext(Dispatchers.IO) {
+            val trimmed = query.trim()
+            if (trimmed.isEmpty()) return@withContext emptySet()
+            val ftsQuery = buildFtsQueryOrNull(trimmed)
+            if (ftsQuery != null) {
+                runCatching { dao.searchWorkIdsFts(ftsQuery).toSet() }
+                    .getOrElse { dao.searchWorkIds("%$trimmed%").toSet() }
+            } else {
+                dao.searchWorkIds("%$trimmed%").toSet()
+            }
+        }
+
+    fun subtitleOffsetFor(trackId: String?): Long =
+        trackId?.let { trackStates.value[it]?.subtitleOffsetMs } ?: 0L
+
+    fun subtitleSelectionFor(trackId: String?): TrackSubtitleSelection? = trackId?.let {
+        trackStates.value[it]?.subtitleSelectionOrNull()
+    }
+
+    fun savedTrackPosition(trackId: String?): Long =
+        trackId?.let { trackStates.value[it]?.positionMs } ?: 0L
+
+    fun observeTrackState(trackId: String): Flow<TrackStateEntity?> = dao.observeTrackState(trackId)
+
+    suspend fun setTrackSubtitleOffset(trackId: String, offsetMs: Long) {
+        val clamped = offsetMs.coerceIn(-10_000L, 10_000L)
+        dao.upsertTrackSubtitleOffset(trackId, clamped, System.currentTimeMillis())
+    }
+
+    suspend fun setTrackSubtitleSelection(trackId: String, selection: TrackSubtitleSelection?) {
+        val primary = selection?.primaryId
+        val secondary = selection?.secondaryId?.takeIf { it != primary }
+        dao.upsertTrackSubtitleSelection(trackId, primary, secondary, System.currentTimeMillis())
+    }
+
+    suspend fun rememberTrackPosition(trackId: String, positionMs: Long) {
+        val clamped = positionMs.coerceAtLeast(0L)
+        dao.upsertTrackPosition(trackId, clamped, System.currentTimeMillis())
+    }
 
     suspend fun toggleFavorite(id: String) = dao.toggleFavorite(id)
 
@@ -394,4 +441,15 @@ class LibraryStore(
             )
         return id
     }
+}
+
+private val ftsAsciiWordQuery = Regex("^[A-Za-z0-9\\s_-]+$")
+private val ftsTokenSplit = Regex("[\\s_-]+")
+
+internal fun buildFtsQueryOrNull(query: String): String? {
+    val trimmed = query.trim()
+    if (trimmed.isEmpty() || !ftsAsciiWordQuery.matches(trimmed)) return null
+    val tokens = ftsTokenSplit.split(trimmed).filter { it.length >= 2 }
+    if (tokens.isEmpty()) return null
+    return tokens.joinToString(" ") { "$it*" }
 }

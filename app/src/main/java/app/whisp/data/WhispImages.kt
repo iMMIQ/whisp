@@ -5,7 +5,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
-import android.util.Log
 import android.util.LruCache
 import coil3.ImageLoader
 import coil3.decode.DataSource
@@ -23,7 +22,6 @@ import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -77,7 +75,6 @@ class WhispImages(
     private val context: Context,
     scope: CoroutineScope,
     private val dao: LibraryDao,
-    private val settings: SettingsStore,
     private val sources: SourceRegistry,
     private val offlineDir: File,
     private val customArtworkDir: File,
@@ -134,33 +131,7 @@ class WhispImages(
         scope.launch(Dispatchers.IO) {
             offlineDir.mkdirs()
             customArtworkDir.mkdirs()
-            runCatching { migrateLegacyOnce() }
-                .onFailure {
-                    Log.w(
-                        "WhispStorage",
-                        "Legacy image migration skipped: ${it.javaClass.simpleName}",
-                    )
-                }
         }
-    }
-
-    private suspend fun migrateLegacyOnce() {
-        if (settings.settingsUpdates.first().legacyImagesMigrated) return
-        val legacyDir = File(context.filesDir, "artwork")
-        if (legacyDir.isDirectory) {
-            for (work in dao.allWorks()) {
-                val id = work.coverId ?: continue
-                val old = File(legacyDir, id)
-                if (old.isFile && id == stableId("${work.id}|custom-cover")) {
-                    val target = File(customArtworkDir, id)
-                    if (!target.isFile) atomicFile(target, old.readBytes())
-                }
-            }
-            legacyDir.deleteRecursively()
-        }
-        File(context.cacheDir, "artwork").deleteRecursively()
-        File(context.cacheDir, "previews").deleteRecursively()
-        settings.update { it.copy(legacyImagesMigrated = true) }
     }
 
     fun durableFile(id: String?): File? = id?.let { asset ->

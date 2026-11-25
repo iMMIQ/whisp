@@ -18,8 +18,8 @@ flowchart TD
     IMG["WhispImages (Coil 3)"]
     ROUTE["MediaSourceRouting (Media3 Cache / DownloadManager)"]
     SRC["SourceRegistry"]
-    DB["Room LibraryDatabase (v6)"]
-    SET["SettingsStore (DataStore) & SecretStore (Keystore)"]
+    DB["Room LibraryDatabase (v1 + FTS4)"]
+    SET["SettingsStore (Typed DataStore) & SecretStore (Keystore)"]
     PROTO["Local SAF / SMBJ / libnfs JNI / WebDAV / ASMR.ONE / DLsite"]
 
     UI --> PB
@@ -65,40 +65,32 @@ flowchart TD
 
 ## 数据存储与身份模型
 
-### Room 数据库（Schema v6）
+### Room 数据库（Schema v1，FTS4 + 单曲状态表）
 
 数据库定义位于 [LibraryDatabase.kt](../app/src/main/java/app/whisp/data/LibraryDatabase.kt)，导出 Schema 存放在 `app/schemas/app.whisp.data.LibraryDatabase/`。
 
 | 表名 | 用途与关系 |
 | --- | --- |
 | `sources` | 来源配置（`local` / `smb` / `nfs` / `webdav` / `asmrone` / `dlsite`）、加密凭据密文、上次扫描时间与错误信息 |
-| `works` | 作品元数据（RJ 编号、当前与原始标题/声优、系列、封面、收藏、来源归属 `sourceId` ON DELETE SET NULL） |
-| `tracks` | 音视频轨条目（相对路径、排序、时长、默认字幕/台本 ID、附赠标记、内联 `uri` 与大小；外键级联删除） |
-| `attachments` | 字幕、台本、图片与 PDF 附赠资料（`kind`: `subtitle` / `script` / `extra-text` / `image` / `document`；外键级联删除） |
-| `progress` | 每部作品的最新播放位置（`workId` 为主键，支持快速续播查询；外键级联删除） |
+| `works` / `works_fts` | 作品元数据与 Room FTS4 倒排索引表（`sourceId` ON DELETE SET NULL） |
+| `tracks` / `tracks_fts` | 音视频轨条目与 FTS4 索引表（复合索引 `(workId, order, id)`；外键级联删除） |
+| `track_state` | 单曲独立播放进度、字幕时间轴偏移与主/副双字幕选择（外键指向 `tracks(id)` 级联删除，无 LRU 条数上限） |
+| `attachments` / `attachments_fts` | 字幕、台本、图片与 PDF 附赠资料与 FTS4 索引表（外键级联删除） |
+| `progress` | 每部作品的最新播放位置（`workId` 为主键，首页通过 SQL 聚合视图 `WorkProgressSummary` 计算进度占比） |
 | `bookmarks` | 作品片段书签，支持时间点书签与带 `endMs` 的区间书签（外键级联删除） |
 | `dlsite_metadata` | 按作品缓存的 DLsite 结构化介绍、创作者分工、标签与评分快照（外键级联删除） |
 | `dlsite_purchases` | 按 DLsite 账号 `sourceId` 隔离缓存的已购音声目录（外键级联删除） |
 
-迁移演进：
-- **v1 → v4**：Room `AutoMigration` 自动演进。
-- **v4 → v5（`MIGRATION_4_5`）**：移除旧 `locations` 表，将 `uri` 与 `size` 内联至 `tracks` / `attachments`，并为所有子表补齐外键级联约束。
-- **v5 → v6（`MIGRATION_5_6`）**：为 `works(coverId)`、`works(addedAt)`、`tracks(workId, order, id)`、`progress(updatedAt)`、`bookmarks(positionMs)` 补充高频查询与排序索引。
-
 ### 稳定身份与状态持久化
 
 - **稳定 ID**：统一通过 `stableId()` 对标识串做 Okio SHA-256 后取前 128 位十六进制编码。本地/NAS 作品按 `$sourceId|$root` 生成，确保增删单条音轨时不破坏作品身份、收藏、书签和进度；同时记录 `originalTitle` / `originalArtist`，来源刷新时自动保留用户手动编辑过的标题、声优与自定义封面。
-- **设置与单曲记忆（`SettingsStore`）**：基于 Jetpack DataStore Preferences，全局设置序列化为单个 JSON 键（兼容读取 v0.5 之前的分散旧键）。同时维护有上限的 LRU 映射：
-  - 单曲字幕选择（主/副双字幕，最多 200 条）
-  - 单曲字幕时间轴偏移（±10 秒，最多 200 条）
-  - 单曲独立进度记忆（最多 300 条）
-  - ASMR.ONE 最近搜索历史（最多 20 条）
+- **全局设置（`SettingsStore`）**：基于类型化 `DataStore<AppPreferences>`（直接序列化 JSON，去除 Preferences Protobuf 双层包装与历史旧键回退），保存全局开关、按耳机设备听感配置（最多 24 条）与 ASMR.ONE 搜索历史（最多 20 条）；单曲进度、字幕偏移与双字幕选择全部存储在 Room `track_state` 表中随音轨级联清理。
 - **进度写入防抖（`ProgressWriter`）**：按 `workId` 保留待落盘队列并合并 150 ms 内的连续事件（如快速拖动/切曲）；暂停、退出与定时停止调用 `saveImmediate()` 立即落盘；写入失败时自动退避重试。
 
 ### 缓存与离线存储体系
 
 - **在线播放流式缓存**：Media3 `SimpleCache` 搭配自定义 `AdjustableCacheEvictor`（仅使用 `Cache` 公开 API 与独立锁维护 LRU，支持运行时动态调整 64 / 128 / 256 / 512 MiB 上限）。
-- **离线下载**：Media3 `DownloadManager` + `OfflineService` 管理音视频离线缓存；字幕、台本与封面等附赠资产由 `OfflineStore` 原子写入应用私有目录 `files/offline/assets/`（自动兼容迁移旧目录 `files/offline/attachments/`）。
+- **离线下载**：Media3 `DownloadManager` + `OfflineService` 管理音视频离线缓存；字幕、台本与封面等附赠资产由 `OfflineStore` 原子写入应用私有目录 `files/offline/assets/`。
 - **图片缓存**：Coil 3 统一承担内存与磁盘封面缓存，结合永久离线资产目录与自定义封面目录 `files/custom-artwork/`。
 
 ---
@@ -148,4 +140,4 @@ flowchart TD
 - **UI 与导航**：Jetpack Compose + Material 3（使用 `1.5.0-beta01` 公开的 `MotionScheme` 动效接口）+ Navigation 3（每个顶层标签页独立维护返回栈与滚动状态）+ Coil 3。
 - **媒体与后台**：AndroidX Media3（ExoPlayer、Session、OkHttp DataSource、UI Compose）+ WorkManager + Room + DataStore。
 - **网络与协议**：OkHttp 5 + Okio + kotlinx.serialization + Jsoup + SMBJ + `libnfs 8.0.0`。
-- **SDK 策略**：`compileSdk = 37`，`targetSdk = 36`，`minSdk = 26`，构建期开启 Kotlin `allWarningsAsErrors = true`。
+- **SDK 策略**：`compileSdk = 37`，`targetSdk = 36`，`minSdk = 28`，仅支持 64 位 ABI（`arm64-v8a` / `x86_64`），构建期开启 Kotlin `allWarningsAsErrors = true`。

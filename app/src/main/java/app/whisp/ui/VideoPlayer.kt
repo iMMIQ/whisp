@@ -19,11 +19,6 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.QueueMusic
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButtonDefaults
@@ -519,7 +514,7 @@ internal fun FullScreenVideo(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Icon(Icons.Outlined.Lock, "解锁画面", tint = Rose, modifier = Modifier.size(18.dp))
+                Icon(WhispIcons.Outlined.Lock, "解锁画面", tint = Rose, modifier = Modifier.size(18.dp))
                 Text("点击解锁", style = MaterialTheme.typography.labelLarge, color = Cream)
             }
         }
@@ -538,7 +533,7 @@ internal fun FullScreenVideo(
                     .padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconAction(Icons.Outlined.FullscreenExit, "退出全屏", action = exit)
+                IconAction(WhispIcons.Outlined.FullscreenExit, "退出全屏", action = exit)
                 Text(
                     title,
                     style = MaterialTheme.typography.titleMedium,
@@ -548,7 +543,8 @@ internal fun FullScreenVideo(
                     overflow = TextOverflow.Ellipsis,
                 )
                 IconAction(
-                    if (fillScreen) Icons.Outlined.FitScreen else Icons.Outlined.AspectRatio,
+                    if (fillScreen) WhispIcons.Outlined.FitScreen
+                    else WhispIcons.Outlined.AspectRatio,
                     if (fillScreen) "适应画面" else "填满屏幕",
                     tint = if (fillScreen) Rose else Cream,
                     haptic = HapticKind.Tick,
@@ -558,7 +554,7 @@ internal fun FullScreenVideo(
                     interaction++
                 }
                 IconAction(
-                    Icons.Outlined.LockOpen,
+                    WhispIcons.Outlined.LockOpen,
                     "锁定防误触",
                     haptic = HapticKind.Confirm,
                 ) {
@@ -566,7 +562,7 @@ internal fun FullScreenVideo(
                     controls = false
                     showUnlockHint = true
                 }
-                IconAction(Icons.Outlined.Headphones, "只听声音", haptic = HapticKind.Tick) {
+                IconAction(WhispIcons.Outlined.Headphones, "只听声音", haptic = HapticKind.Tick) {
                     playback.setAudioOnly(true)
                     exit()
                 }
@@ -670,7 +666,7 @@ internal fun FullScreenVideo(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             IconAction(
-                                Icons.Outlined.SkipPrevious,
+                                WhispIcons.Outlined.SkipPrevious,
                                 "上一曲",
                                 enabled = active && (state.hasPrevious || state.trackId != null),
                                 haptic = HapticKind.Tick,
@@ -708,8 +704,8 @@ internal fun FullScreenVideo(
                                     ),
                             ) {
                                 Icon(
-                                    if (state.playWhenReady) Icons.Filled.Pause
-                                    else Icons.Filled.PlayArrow,
+                                    if (state.playWhenReady) WhispIcons.Filled.Pause
+                                    else WhispIcons.Filled.PlayArrow,
                                     if (state.playWhenReady) "暂停" else "播放",
                                     modifier = Modifier.size(26.dp),
                                 )
@@ -729,7 +725,7 @@ internal fun FullScreenVideo(
                                 )
                             }
                             IconAction(
-                                Icons.Outlined.SkipNext,
+                                WhispIcons.Outlined.SkipNext,
                                 "下一曲",
                                 enabled = active && state.hasNext,
                                 haptic = HapticKind.Tick,
@@ -740,7 +736,7 @@ internal fun FullScreenVideo(
                         }
                         if (hasQueue && onOpenQueue != null) {
                             IconAction(
-                                Icons.AutoMirrored.Outlined.QueueMusic,
+                                WhispIcons.AutoMirrored.Outlined.QueueMusic,
                                 "播放队列",
                                 Cream,
                                 haptic = HapticKind.Tick,

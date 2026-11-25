@@ -8,9 +8,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
@@ -89,7 +86,7 @@ internal fun DlsiteLibraryPage(
             Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconAction(Icons.AutoMirrored.Outlined.ArrowBack, "返回来源", action = back)
+            IconAction(WhispIcons.AutoMirrored.Outlined.ArrowBack, "返回来源", action = back)
             Text(
                 "已购作品",
                 Modifier.weight(1f).padding(start = 4.dp),
@@ -97,7 +94,7 @@ internal fun DlsiteLibraryPage(
                 color = Cream,
             )
             Box {
-                IconAction(Icons.Outlined.MoreVert, "管理 DLsite 账号") { menu = true }
+                IconAction(WhispIcons.Outlined.MoreVert, "管理 DLsite 账号") { menu = true }
                 DropdownMenu(
                     expanded = menu,
                     onDismissRequest = { menu = false },
@@ -217,8 +214,8 @@ internal fun DlsiteLibraryPage(
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     WhispEmptyState(
                         icon =
-                            if (query.isBlank()) Icons.Outlined.AccountCircle
-                            else Icons.Outlined.Search,
+                            if (query.isBlank()) WhispIcons.Outlined.AccountCircle
+                            else WhispIcons.Outlined.Search,
                         title = if (query.isBlank()) "暂无已购音声" else "没有匹配的作品",
                     )
                 }

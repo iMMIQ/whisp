@@ -17,9 +17,6 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -64,7 +61,7 @@ internal fun LibraryPage(
 ) {
     val works by graph.library.works.collectAsStateWithLifecycle()
     val progressList by graph.library.progress.collectAsStateWithLifecycle()
-    val trackSummaries by graph.library.trackSummaries.collectAsStateWithLifecycle()
+    val progressSummaries by graph.library.workProgressSummaries.collectAsStateWithLifecycle()
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf("全部") }
     var series by rememberSaveable { mutableStateOf<String?>(null) }
@@ -107,7 +104,6 @@ internal fun LibraryPage(
     }
 
     val progressByWork = remember(progressList) { progressList.associateBy { it.workId } }
-    val tracksByWork = remember(trackSummaries) { trackSummaries.groupBy { it.workId } }
     val sortProgress = if (settings.librarySort == LibrarySort.RECENT) progressByWork else null
 
     val filtered =
@@ -184,7 +180,7 @@ internal fun LibraryPage(
                 )
             }
             IconAction(
-                Icons.Outlined.Search,
+                WhispIcons.Outlined.Search,
                 stringResource(R.string.action_search_works),
                 tint = if (searching || query.isNotBlank()) Rose else Cream,
                 haptic = HapticKind.Tick,
@@ -193,7 +189,7 @@ internal fun LibraryPage(
                 if (!searching) query = ""
             }
             IconAction(
-                Icons.Outlined.SwapVert,
+                WhispIcons.Outlined.SwapVert,
                 stringResource(R.string.action_toggle_order),
                 tint = if (settings.librarySort != LibrarySort.ADDED_DESC) Rose else Cream,
                 haptic = HapticKind.Tick,
@@ -228,7 +224,7 @@ internal fun LibraryPage(
                 if (series != null) {
                     {
                         IconAction(
-                            Icons.Outlined.Close,
+                            WhispIcons.Outlined.Close,
                             stringResource(R.string.action_exit_series),
                             Muted,
                             haptic = HapticKind.Tick,
@@ -242,12 +238,12 @@ internal fun LibraryPage(
             works.isEmpty() ->
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     WhispEmptyState(
-                        icon = Icons.Outlined.LibraryMusic,
+                        icon = WhispIcons.Outlined.LibraryMusic,
                         title = "作品库还是空的",
                         subtitle = "添加本地目录、NAS 或在线来源即可开始收听",
                     ) {
                         FilledTonalButton(onClick = sources) {
-                            Icon(Icons.Outlined.CreateNewFolder, null)
+                            Icon(WhispIcons.Outlined.CreateNewFolder, null)
                             Spacer(Modifier.width(10.dp))
                             Text(stringResource(R.string.action_add_works))
                         }
@@ -257,7 +253,7 @@ internal fun LibraryPage(
                 if (seriesGroups.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         WhispEmptyState(
-                            icon = Icons.Outlined.FolderOpen,
+                            icon = WhispIcons.Outlined.FolderOpen,
                             title = "暂无系列分类",
                             subtitle = "带有系列信息的作品会自动归类到这里",
                         )
@@ -278,25 +274,25 @@ internal fun LibraryPage(
                     when {
                         query.isNotBlank() ->
                             WhispEmptyState(
-                                icon = Icons.Outlined.Search,
+                                icon = WhispIcons.Outlined.Search,
                                 title = "没有找到匹配的作品",
                                 subtitle = "尝试更换关键词、声优名或 RJ 编号",
                             )
                         tab == "收藏" ->
                             WhispEmptyState(
-                                icon = Icons.Outlined.FavoriteBorder,
+                                icon = WhispIcons.Outlined.FavoriteBorder,
                                 title = "暂无收藏作品",
                                 subtitle = "在作品页或播放器点击爱心即可收藏",
                             )
                         tab == "离线" ->
                             WhispEmptyState(
-                                icon = Icons.Outlined.DownloadDone,
+                                icon = WhispIcons.Outlined.DownloadDone,
                                 title = "暂无已离线作品",
                                 subtitle = "在作品详情页点击下载按钮即可离线保存",
                             )
                         else ->
                             WhispEmptyState(
-                                icon = Icons.Outlined.Headphones,
+                                icon = WhispIcons.Outlined.Headphones,
                                 title = "暂无作品",
                             )
                     }
@@ -310,12 +306,7 @@ internal fun LibraryPage(
                     onClick = { open(it.id) },
                     state = grid,
                     tag = "library-grid",
-                    progressOf = { work ->
-                        workProgressFraction(
-                            tracksByWork[work.id].orEmpty(),
-                            progressByWork[work.id],
-                        )
-                    },
+                    progressOf = { work -> progressSummaries[work.id]?.fraction() },
                     offlineOf = { it.offlineAttachments },
                     header =
                         latestResume?.let { (work, progress) ->
@@ -367,7 +358,7 @@ internal fun LibraryPage(
                         )
                         if (selected) {
                             Icon(
-                                Icons.Outlined.Check,
+                                WhispIcons.Outlined.Check,
                                 null,
                                 tint = Rose,
                                 modifier = Modifier.size(20.dp),
@@ -447,7 +438,12 @@ private fun ContinueListeningBanner(
             },
             contentAlignment = Alignment.Center,
         ) {
-            Icon(Icons.Filled.PlayArrow, "立即继续收听", tint = Rose, modifier = Modifier.size(24.dp))
+            Icon(
+                WhispIcons.Filled.PlayArrow,
+                "立即继续收听",
+                tint = Rose,
+                modifier = Modifier.size(24.dp),
+            )
         }
     }
 }
@@ -507,6 +503,6 @@ private fun SeriesCard(name: String, works: List<WorkEntity>, onClick: () -> Uni
                 modifier = Modifier.padding(top = 3.dp),
             )
         }
-        Icon(Icons.Outlined.ChevronRight, null, tint = Muted)
+        Icon(WhispIcons.Outlined.ChevronRight, null, tint = Muted)
     }
 }

@@ -50,7 +50,7 @@ jobs:
       - name: Check and build
         run: |
           ./gradlew -Pccache -Pabis=x86_64 qualityCheck :app:assembleDebugAndroidTest
-          ./gradlew -Pccache -PsplitApks :app:assembleRelease
+          ./gradlew -Pccache -Pabis=arm64-v8a,x86_64 -PsplitApks :app:assembleRelease
       - name: Native cache statistics
         if: always()
         run: ccache --show-stats

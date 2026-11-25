@@ -12,13 +12,6 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.LibraryMusic
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -853,18 +846,18 @@ private fun WhispNavRail(activeTabIndex: Int, onSelect: (Int) -> Unit) {
     val tabs =
         listOf(
             NavTabItem(
-                Icons.Filled.LibraryMusic,
-                Icons.Outlined.LibraryMusic,
+                WhispIcons.Filled.LibraryMusic,
+                WhispIcons.Outlined.LibraryMusic,
                 stringResource(R.string.nav_library),
             ),
             NavTabItem(
-                Icons.Filled.Folder,
-                Icons.Outlined.FolderOpen,
+                WhispIcons.Filled.Folder,
+                WhispIcons.Outlined.FolderOpen,
                 stringResource(R.string.nav_sources),
             ),
             NavTabItem(
-                Icons.Filled.Settings,
-                Icons.Outlined.Settings,
+                WhispIcons.Filled.Settings,
+                WhispIcons.Outlined.Settings,
                 stringResource(R.string.nav_settings),
             ),
         )
@@ -911,18 +904,18 @@ private fun WhispBottomNav(activeTabIndex: Int, onSelect: (Int) -> Unit) {
     val tabs =
         listOf(
             NavTabItem(
-                Icons.Filled.LibraryMusic,
-                Icons.Outlined.LibraryMusic,
+                WhispIcons.Filled.LibraryMusic,
+                WhispIcons.Outlined.LibraryMusic,
                 stringResource(R.string.nav_library),
             ),
             NavTabItem(
-                Icons.Filled.Folder,
-                Icons.Outlined.FolderOpen,
+                WhispIcons.Filled.Folder,
+                WhispIcons.Outlined.FolderOpen,
                 stringResource(R.string.nav_sources),
             ),
             NavTabItem(
-                Icons.Filled.Settings,
-                Icons.Outlined.Settings,
+                WhispIcons.Filled.Settings,
+                WhispIcons.Outlined.Settings,
                 stringResource(R.string.nav_settings),
             ),
         )
@@ -1153,7 +1146,7 @@ private fun MiniPlayer(
                     (offsetX.value / swipeTrackThresholdPx.coerceAtLeast(1f)).coerceIn(-1f, 1f)
                 if (swipeFraction > 0.15f) {
                     Icon(
-                        Icons.Outlined.SkipPrevious,
+                        WhispIcons.Outlined.SkipPrevious,
                         null,
                         tint = Rose.copy(alpha = swipeFraction.coerceIn(0f, 1f)),
                         modifier =
@@ -1161,7 +1154,7 @@ private fun MiniPlayer(
                     )
                 } else if (swipeFraction < -0.15f) {
                     Icon(
-                        Icons.Outlined.SkipNext,
+                        WhispIcons.Outlined.SkipNext,
                         null,
                         tint = Rose.copy(alpha = (-swipeFraction).coerceIn(0f, 1f)),
                         modifier =
@@ -1208,7 +1201,8 @@ private fun MiniPlayer(
                 contentAlignment = Alignment.Center,
             ) {
                 IconAction(
-                    if (state.playWhenReady) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                    if (state.playWhenReady) WhispIcons.Filled.Pause
+                    else WhispIcons.Filled.PlayArrow,
                     playControlLabel(state),
                     Rose,
                     haptic = HapticKind.Confirm,

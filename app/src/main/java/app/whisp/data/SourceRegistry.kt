@@ -32,15 +32,26 @@ class SourceRegistry(
     private val scope: CoroutineScope,
     private val dao: LibraryDao,
     val secrets: SecretStore,
-    val http: OkHttpClient,
-    val onlineHttp: OkHttpClient,
-    val dlsiteDiagnostics: DlsiteDiagnostics,
+    private val httpProvider: () -> OkHttpClient,
+    private val onlineHttpProvider: () -> OkHttpClient,
+    private val dlsiteDiagnosticsProvider: () -> DlsiteDiagnostics,
 ) {
-    val dav = WebDavClient(http)
-    val smb = SmbClient { Log.i("WhispScan", it) }
+    val http: OkHttpClient
+        get() = httpProvider()
+
+    val onlineHttp: OkHttpClient
+        get() = onlineHttpProvider()
+
+    val dlsiteDiagnostics: DlsiteDiagnostics
+        get() = dlsiteDiagnosticsProvider()
+
+    val dav: WebDavClient by lazy { WebDavClient(http) }
+    val smb: SmbClient by lazy { SmbClient { Log.i("WhispScan", it) } }
     // Align NFS idle pool TTL with WhispLoadControl's 180s streaming burst window.
-    val nfs = NfsClient(poolIdleTimeoutMs = 210_000L, report = { Log.i("WhispScan", it) })
-    val dlsite = DlsiteClient(onlineHttp)
+    val nfs: NfsClient by lazy {
+        NfsClient(poolIdleTimeoutMs = 210_000L, report = { Log.i("WhispScan", it) })
+    }
+    val dlsite: DlsiteClient by lazy { DlsiteClient(onlineHttp) }
     internal val dlsiteClients = ConcurrentHashMap<String, DlsiteAccountClient>()
     internal val dlsiteCookieWrites = Mutex()
 

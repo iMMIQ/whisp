@@ -14,12 +14,13 @@ plugins {
 }
 
 val releaseSecretsFile = rootProject.file(".signing/signing.properties")
-val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+val supportedAbis = listOf("arm64-v8a", "x86_64")
+val defaultAbis = listOf("arm64-v8a")
 val buildAbis =
     providers
         .gradleProperty("abis")
         .map { it.split(',').map(String::trim).distinct() }
-        .getOrElse(supportedAbis)
+        .getOrElse(defaultAbis)
 
 require(buildAbis.isNotEmpty() && buildAbis.all { it in supportedAbis }) {
     "abis must contain supported architectures: ${supportedAbis.joinToString()}"
@@ -44,14 +45,14 @@ android {
     }
     defaultConfig {
         applicationId = "app.whisp"
-        minSdk = 26
+        minSdk = 28
         targetSdk = 36
         versionCode = 24
         versionName = "0.5.0-rc.4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake {
-                arguments += "-DANDROID_STL=c++_static"
+                arguments += "-DANDROID_STL=none"
                 if (useCcache) {
                     arguments += "-DCMAKE_C_COMPILER_LAUNCHER=ccache"
                     arguments += "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
@@ -108,7 +109,19 @@ android {
     }
     testOptions { unitTests.isIncludeAndroidResources = true }
     sourceSets.named("androidTest") { assets.srcDir("$projectDir/schemas") }
-    packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+    packaging {
+        resources.excludes +=
+            setOf(
+                "/META-INF/{AL2.0,LGPL2.1}",
+                "org/bouncycastle/pqc/**",
+                "org/bouncycastle/x509/**",
+                "kotlin/**/*.kotlin_builtins",
+            )
+    }
+}
+
+composeCompiler {
+    stabilityConfigurationFiles.add(layout.projectDirectory.file("compose-stability.conf"))
 }
 
 // Resolve Robolectric's pre-instrumented SDK jar via Gradle instead of MavenArtifactFetcher at
@@ -161,7 +174,6 @@ dependencies {
     debugImplementation(libs.compose.ui.tooling)
     // Material 3 beta provides the public MotionScheme used by the app theme.
     implementation(libs.compose.material3)
-    implementation(libs.compose.material.icons.extended)
     implementation(libs.activity.compose)
     implementation(libs.core.ktx)
     implementation(libs.lifecycle.runtime.compose)
@@ -170,7 +182,7 @@ dependencies {
     implementation(libs.navigation3.ui)
     implementation(libs.room.runtime)
     ksp(libs.room.compiler)
-    implementation(libs.datastore.preferences)
+    implementation(libs.datastore)
     implementation(libs.work.runtime)
     implementation(libs.coil.compose)
     implementation(libs.okhttp)

@@ -2,6 +2,7 @@
 package app.whisp.data
 
 import java.io.IOException
+import java.nio.ByteBuffer
 
 internal class NfsNativeEntry(
     val name: ByteArray,
@@ -38,12 +39,26 @@ internal object NfsNative {
         length: Int,
     ): Int
 
+    external fun readDirect(
+        connection: Long,
+        file: Long,
+        position: Long,
+        buffer: ByteBuffer,
+        offset: Int,
+        length: Int,
+    ): Int
+
     external fun closeFile(connection: Long, file: Long)
 
     external fun close(connection: Long)
 }
 
 internal class NativeNfsSession(address: NfsAddress) : NfsSession {
+    companion object {
+        private const val WINDOW_SIZE = 256 * 1024
+        private const val MAX_NATIVE_READ = 1024 * 1024
+    }
+
     private var connection =
         NfsNative.connect(
             address.host.removeSurrounding("[", "]").toByteArray(Charsets.UTF_8),
@@ -69,7 +84,7 @@ internal class NativeNfsSession(address: NfsAddress) : NfsSession {
     @Synchronized
     override fun open(path: String): RemoteReadHandle {
         val opened = NfsNative.open(current(), encodedPath(path))
-        return BufferedReadHandle(RawReader(opened[0], opened[1]))
+        return DirectWindowReader(opened[0], opened[1])
     }
 
     @Synchronized
@@ -79,20 +94,61 @@ internal class NativeNfsSession(address: NfsAddress) : NfsSession {
         if (handle != 0L) NfsNative.close(handle)
     }
 
-    private inner class RawReader(private var file: Long, override val length: Long) :
+    /**
+     * 256 KiB DirectByteBuffer sliding window so nfs_pread writes straight into the JVM-visible
+     * native buffer without an extra native-to-heap SetByteArrayRegion copy.
+     */
+    private inner class DirectWindowReader(private var file: Long, override val length: Long) :
         RemoteReadHandle {
+        private val window: ByteBuffer = ByteBuffer.allocateDirect(WINDOW_SIZE)
+        private var windowStart = -1L
+        private var windowAvailable = 0
+
         override fun read(buffer: ByteArray, offset: Long, bufferOffset: Int, count: Int): Int =
             synchronized(this@NativeNfsSession) {
+                require(
+                    offset >= 0 &&
+                        bufferOffset >= 0 &&
+                        count >= 0 &&
+                        bufferOffset <= buffer.size - count,
+                )
                 if (file == 0L) throw IOException("NFS 文件已关闭")
-                // Clamp each JNI pread call to the 1 MiB native limit so >1 MiB full reads succeed.
-                val boundedCount = minOf(count, 1024 * 1024)
-                val n = NfsNative.read(current(), file, offset, buffer, bufferOffset, boundedCount)
+                if (count == 0) return@synchronized 0
+                if (offset >= length) return@synchronized -1
+                val maxReadable = minOf(count.toLong(), length - offset).toInt()
+                if (
+                    windowAvailable > 0 &&
+                        offset >= windowStart &&
+                        offset - windowStart < windowAvailable
+                ) {
+                    val cachedOffset = (offset - windowStart).toInt()
+                    val copied = minOf(maxReadable, windowAvailable - cachedOffset)
+                    window.position(cachedOffset)
+                    window.get(buffer, bufferOffset, copied)
+                    return@synchronized copied
+                }
+                if (maxReadable >= WINDOW_SIZE) {
+                    val boundedCount = minOf(maxReadable, MAX_NATIVE_READ)
+                    val n =
+                        NfsNative.read(current(), file, offset, buffer, bufferOffset, boundedCount)
+                    if (n <= 0) throw IOException("NFS 文件已改变，请重新扫描")
+                    return@synchronized n
+                }
+                val fetchSize = minOf(WINDOW_SIZE.toLong(), length - offset).toInt()
+                val n = NfsNative.readDirect(current(), file, offset, window, 0, fetchSize)
                 if (n <= 0) throw IOException("NFS 文件已改变，请重新扫描")
-                n
+                windowStart = offset
+                windowAvailable = n
+                val copied = minOf(maxReadable, n)
+                window.position(0)
+                window.get(buffer, bufferOffset, copied)
+                copied
             }
 
         override fun close() =
             synchronized(this@NativeNfsSession) {
+                windowStart = -1L
+                windowAvailable = 0
                 val handle = file
                 file = 0
                 if (handle != 0L && connection != 0L) NfsNative.closeFile(connection, handle)

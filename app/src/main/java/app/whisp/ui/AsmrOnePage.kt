@@ -14,10 +14,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.ViewList
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
@@ -273,7 +269,7 @@ internal fun AsmrOnePage(
             Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconAction(Icons.AutoMirrored.Outlined.ArrowBack, "返回来源", action = back)
+            IconAction(WhispIcons.AutoMirrored.Outlined.ArrowBack, "返回来源", action = back)
             Text(
                 initialFacet?.name ?: "ASMR.ONE",
                 Modifier.weight(1f).padding(start = 4.dp),
@@ -283,7 +279,8 @@ internal fun AsmrOnePage(
                 overflow = TextOverflow.Ellipsis,
             )
             IconAction(
-                if (useListView) Icons.Outlined.GridView else Icons.AutoMirrored.Outlined.ViewList,
+                if (useListView) WhispIcons.Outlined.GridView
+                else WhispIcons.AutoMirrored.Outlined.ViewList,
                 if (useListView) "切换为网格视图" else "切换为列表视图",
                 Muted,
                 haptic = HapticKind.Tick,
@@ -291,7 +288,7 @@ internal fun AsmrOnePage(
                 listViewOverride = !useListView
             }
             IconAction(
-                Icons.Outlined.Tune,
+                WhispIcons.Outlined.Tune,
                 "筛选作品",
                 if (query.facets.isNotEmpty() || query.subtitlesOnly) Rose else Muted,
                 haptic = HapticKind.Tick,
@@ -300,7 +297,7 @@ internal fun AsmrOnePage(
                 filters = true
             }
             IconAction(
-                Icons.Outlined.Refresh,
+                WhispIcons.Outlined.Refresh,
                 "刷新在线作品",
                 Muted,
                 haptic = HapticKind.Tick,
@@ -351,7 +348,7 @@ internal fun AsmrOnePage(
                                 label = { Text(facet.name) },
                                 trailingIcon = {
                                     Icon(
-                                        Icons.Outlined.Close,
+                                        WhispIcons.Outlined.Close,
                                         "移除${facet.name}",
                                         Modifier.size(16.dp),
                                     )
@@ -371,7 +368,7 @@ internal fun AsmrOnePage(
                                     label = { Text("有字幕") },
                                     trailingIcon = {
                                         Icon(
-                                            Icons.Outlined.Close,
+                                            WhispIcons.Outlined.Close,
                                             "移除字幕筛选",
                                             Modifier.size(16.dp),
                                         )
@@ -510,7 +507,7 @@ internal fun AsmrOnePage(
                                 state.refreshing -> CircularProgressIndicator(color = Rose)
                                 state.refreshError != null ->
                                     WhispEmptyState(
-                                        icon = Icons.Outlined.CloudOff,
+                                        icon = WhispIcons.Outlined.CloudOff,
                                         title = "无法加载目录",
                                         subtitle = state.refreshError,
                                     ) {
@@ -523,8 +520,8 @@ internal fun AsmrOnePage(
                                 else ->
                                     WhispEmptyState(
                                         icon =
-                                            if (query.searching) Icons.Outlined.Search
-                                            else Icons.Outlined.Headphones,
+                                            if (query.searching) WhispIcons.Outlined.Search
+                                            else WhispIcons.Outlined.Headphones,
                                         title = if (query.searching) "没有匹配的作品" else "暂无作品",
                                     )
                             }
@@ -568,7 +565,7 @@ internal fun AsmrOnePage(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Icon(
-                                    Icons.Outlined.History,
+                                    WhispIcons.Outlined.History,
                                     null,
                                     Modifier.size(18.dp),
                                     tint = Muted,
@@ -598,7 +595,7 @@ internal fun AsmrOnePage(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Icon(
-                                    Icons.Outlined.FilterList,
+                                    WhispIcons.Outlined.FilterList,
                                     null,
                                     Modifier.size(18.dp),
                                     tint = Rose,
@@ -691,7 +688,7 @@ private fun AsmrFilters(
                 },
                 trailingIcon = {
                     IconAction(
-                        Icons.Outlined.Add,
+                        WhispIcons.Outlined.Add,
                         "添加筛选",
                         Rose,
                         enabled = name.isNotBlank() && '$' !in name,
@@ -732,7 +729,7 @@ private fun AsmrFilters(
                             modifier = Modifier.weight(1f),
                         )
                         Icon(
-                            Icons.Outlined.Add,
+                            WhispIcons.Outlined.Add,
                             null,
                             tint = Muted,
                             modifier = Modifier.size(16.dp),
@@ -748,7 +745,7 @@ private fun AsmrFilters(
                             onClick = { selected = selected - facet },
                             label = { Text(facet.name) },
                             trailingIcon = {
-                                Icon(Icons.Outlined.Close, null, Modifier.size(16.dp))
+                                Icon(WhispIcons.Outlined.Close, null, Modifier.size(16.dp))
                             },
                         )
                     }

@@ -13,7 +13,7 @@ Whisp 通过原生共享库接入 NFS 网络文件系统，本文档记录上游
 | **源码包地址** | `https://codeload.github.com/sahlberg/libnfs/tar.gz/5b1bc60260b5ddac34900c5315010b88b73e7edd` |
 | **源码包 SHA-256** | `80b67a8905f7e2051245c6fadc1c4beb7a6481da278e7664fee146e3bbe4b0f1` |
 | **Android NDK / CMake** | NDK `30.0.16248370` · CMake `3.31.6` |
-| **支持 ABI** | `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` |
+| **支持 ABI** | `arm64-v8a`、`x86_64`（64 位架构，默认构建 `arm64-v8a`） |
 
 源码下载与 SHA-256 校验由 [app/src/main/cpp/CMakeLists.txt](../app/src/main/cpp/CMakeLists.txt) 中的 CMake `FetchContent` 自动完成。
 
@@ -21,10 +21,10 @@ Whisp 通过原生共享库接入 NFS 网络文件系统，本文档记录上游
 
 ## 架构与运行约束
 
-Android 原生部分拆分为两个独立的共享库，所有 4 种 ABI 均由相同源码构建：
+Android 原生部分拆分为两个独立的共享库，所有支持的 64 位 ABI 均由相同源码构建：
 
 1. **`libnfs.so`**：由上游 `libnfs 8.0.0` 编译（构建时关闭测试、工具、示例、文档、内部多线程与 TLS，仅保留轻量客户端核心）。
-2. **`libwhisp_nfs.so`**：由 Whisp 自研的 [app/src/main/cpp/nfs_bridge.cpp](../app/src/main/cpp/nfs_bridge.cpp) 编译（C++17、`-fvisibility=hidden`、`-Wall -Wextra -Werror`），通过 JNI 向 Kotlin 层 `NativeNfsSession` 暴露只读目录遍历、文件属性查询和随机读取接口。
+2. **`libwhisp_nfs.so`**：由 Whisp 自研的 [app/src/main/cpp/nfs_bridge.cpp](../app/src/main/cpp/nfs_bridge.cpp) 编译（无 STL `-DANDROID_STL=none`、`-fno-exceptions -fno-rtti`、`-fvisibility=hidden`、`-Wall -Wextra -Werror`），通过 JNI 向 Kotlin 层 `NativeNfsSession` 暴露只读目录遍历、文件属性查询、`DirectByteBuffer` 零拷贝随机读取与常规数组读取接口。
 
 关键行为边界：
 - **协议与传输**：支持 NFS `3`、`4.0`、`4.2`，使用 TCP 与 `AUTH_SYS`（UID/GID 身份）。

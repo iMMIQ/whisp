@@ -2,16 +2,51 @@
 package app.whisp.data
 
 import android.content.Context
-import androidx.datastore.preferences.core.*
-import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.core.CorruptionException
+import androidx.datastore.core.Serializer
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+import androidx.datastore.dataStore
+import java.io.InputStream
+import java.io.OutputStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 
-private val Context.preferences by preferencesDataStore("settings")
-
 private val settingsJson = Json { ignoreUnknownKeys = true }
+
+@Serializable
+internal data class AppPreferences(
+    val settings: Settings = Settings(),
+    val asmrSearchHistory: List<String> = emptyList(),
+    val deviceAudioProfiles: Map<String, DeviceAudioProfile> = emptyMap(),
+)
+
+private object AppPreferencesSerializer : Serializer<AppPreferences> {
+    override val defaultValue: AppPreferences = AppPreferences()
+
+    override suspend fun readFrom(input: InputStream): AppPreferences {
+        val raw = input.readBytes().toString(Charsets.UTF_8)
+        if (raw.isBlank()) return defaultValue
+        return try {
+            settingsJson.decodeFromString<AppPreferences>(raw)
+        } catch (e: SerializationException) {
+            throw CorruptionException("Corrupted settings file", e)
+        }
+    }
+
+    override suspend fun writeTo(t: AppPreferences, output: OutputStream) {
+        output.write(settingsJson.encodeToString(t).toByteArray(Charsets.UTF_8))
+    }
+}
+
+private val Context.appPreferencesStore by
+    dataStore(
+        fileName = "whisp_settings.json",
+        serializer = AppPreferencesSerializer,
+        corruptionHandler = ReplaceFileCorruptionHandler { AppPreferences() },
+    )
 
 object LibrarySort {
     const val ADDED_DESC = "added_desc"
@@ -55,7 +90,6 @@ data class Settings(
     val touchFeedback: Boolean = true,
     val textEncoding: String = TextEncoding.AUTO,
     val playbackSpeed: Float = 1f,
-    val legacyImagesMigrated: Boolean = false,
     val amoledBlack: Boolean = false,
     val skipSeconds: Int = 10,
     val librarySort: String = LibrarySort.ADDED_DESC,
@@ -114,39 +148,11 @@ data class Settings(
 }
 
 class SettingsStore(private val context: Context, scope: CoroutineScope) {
-    private val settingsKey = stringPreferencesKey("settings-json")
-    private val searchHistoryKey = stringPreferencesKey("asmr-search-history")
-    private val trackSubtitleOffsetsKey = stringPreferencesKey("track-subtitle-offsets")
-    private val trackSubtitleSelectionsKey = stringPreferencesKey("track-subtitle-selections")
-    private val trackPositionsKey = stringPreferencesKey("track-positions")
-    private val deviceAudioProfilesKey = stringPreferencesKey("device-audio-profiles")
-
-    private fun decode(prefs: Preferences): Settings {
-        prefs[settingsKey]?.let { raw ->
-            runCatching { settingsJson.decodeFromString<Settings>(raw).normalized() }
-                .getOrNull()
-                ?.let {
-                    return it
-                }
-        }
-        // Seamless one-way read of legacy individual keys from pre-v0.5 installs.
-        return Settings(
-                subtitleSize = prefs[intPreferencesKey("subtitle-size")] ?: 21,
-                subtitleOffsetMs = prefs[longPreferencesKey("subtitle-offset")] ?: 0,
-                hideArtwork = prefs[booleanPreferencesKey("hide-artwork")] ?: false,
-                reduceMotion = prefs[booleanPreferencesKey("reduce-motion")] ?: false,
-                streamingCacheMiB = prefs[intPreferencesKey("streaming-cache-mib")] ?: 128,
-                hideRecents = prefs[booleanPreferencesKey("hide-recents")] ?: false,
-                touchFeedback = prefs[booleanPreferencesKey("touch-feedback")] ?: true,
-                textEncoding = prefs[stringPreferencesKey("text-encoding")] ?: TextEncoding.AUTO,
-                playbackSpeed = prefs[floatPreferencesKey("playback-speed")] ?: 1f,
-            )
-            .normalized()
-    }
+    private val preferencesFlow: Flow<AppPreferences> = context.appPreferencesStore.data
 
     // No placeholder value: background resumption and privacy hooks read persisted preferences.
     val settingsUpdates: Flow<Settings> =
-        context.preferences.data.map(::decode).distinctUntilChanged()
+        preferencesFlow.map { it.settings.normalized() }.distinctUntilChanged()
 
     val settings: StateFlow<Settings> =
         settingsUpdates.stateIn(scope, SharingStarted.Eagerly, Settings())
@@ -158,250 +164,79 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         settingsUpdates.map { it.wifiOnlyDownloads }.distinctUntilChanged()
 
     val deviceAudioProfiles: StateFlow<Map<String, DeviceAudioProfile>> =
-        context.preferences.data
-            .map { prefs ->
-                runCatching {
-                        settingsJson.decodeFromString<Map<String, DeviceAudioProfile>>(
-                            prefs[deviceAudioProfilesKey] ?: "{}",
-                        )
-                    }
-                    .getOrDefault(emptyMap())
-            }
+        preferencesFlow
+            .map { it.deviceAudioProfiles }
             .distinctUntilChanged()
-            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
-
-    val trackSubtitleOffsets: StateFlow<Map<String, Long>> =
-        context.preferences.data
-            .map { prefs ->
-                runCatching {
-                        settingsJson.decodeFromString<Map<String, Long>>(
-                            prefs[trackSubtitleOffsetsKey] ?: "{}",
-                        )
-                    }
-                    .getOrDefault(emptyMap())
-            }
-            .distinctUntilChanged()
-            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
-
-    val trackSubtitleSelections: StateFlow<Map<String, TrackSubtitleSelection>> =
-        context.preferences.data
-            .map { prefs ->
-                runCatching {
-                        settingsJson.decodeFromString<Map<String, TrackSubtitleSelection>>(
-                            prefs[trackSubtitleSelectionsKey] ?: "{}",
-                        )
-                    }
-                    .getOrDefault(emptyMap())
-            }
-            .distinctUntilChanged()
-            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
-
-    val trackPositions: StateFlow<Map<String, Long>> =
-        context.preferences.data
-            .map { prefs ->
-                runCatching {
-                        settingsJson.decodeFromString<Map<String, Long>>(
-                            prefs[trackPositionsKey] ?: "{}",
-                        )
-                    }
-                    .getOrDefault(emptyMap())
-            }
-            .distinctUntilChanged()
-            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyMap())
 
     val asmrSearchHistory: StateFlow<List<String>> =
-        context.preferences.data
-            .map { prefs ->
-                runCatching {
-                        settingsJson
-                            .decodeFromString<List<String>>(prefs[searchHistoryKey] ?: "[]")
-                            .take(20)
-                    }
-                    .getOrDefault(emptyList())
-            }
-            .stateIn(scope, SharingStarted.Eagerly, emptyList())
-
-    fun subtitleOffsetFor(trackId: String?): Long {
-        if (trackId == null) return 0L
-        return trackSubtitleOffsets.value[trackId] ?: 0L
-    }
-
-    fun subtitleSelectionFor(trackId: String?): TrackSubtitleSelection? = trackId?.let {
-        trackSubtitleSelections.value[it]
-    }
-
-    fun savedTrackPosition(trackId: String?): Long = trackId?.let { trackPositions.value[it] } ?: 0L
-
-    suspend fun setTrackSubtitleOffset(trackId: String, offsetMs: Long) {
-        val clamped = offsetMs.coerceIn(-10_000L, 10_000L)
-        context.preferences.edit { prefs ->
-            val current = runCatching {
-                settingsJson.decodeFromString<LinkedHashMap<String, Long>>(
-                    prefs[trackSubtitleOffsetsKey] ?: "{}",
-                )
-            }
-                .getOrDefault(LinkedHashMap())
-            current.remove(trackId)
-            if (clamped != 0L) current[trackId] = clamped
-            while (current.size > 200) {
-                val eldest = current.entries.iterator().next().key
-                current.remove(eldest)
-            }
-            prefs[trackSubtitleOffsetsKey] = settingsJson.encodeToString<Map<String, Long>>(current)
-        }
-    }
-
-    suspend fun setTrackSubtitleSelection(trackId: String, selection: TrackSubtitleSelection?) {
-        context.preferences.edit { prefs ->
-            val current = runCatching {
-                settingsJson.decodeFromString<LinkedHashMap<String, TrackSubtitleSelection>>(
-                    prefs[trackSubtitleSelectionsKey] ?: "{}",
-                )
-            }
-                .getOrDefault(LinkedHashMap())
-            current.remove(trackId)
-            if (
-                selection != null && (selection.primaryId != null || selection.secondaryId != null)
-            ) {
-                current[trackId] = selection
-            }
-            while (current.size > 200) {
-                val eldest = current.entries.iterator().next().key
-                current.remove(eldest)
-            }
-            prefs[trackSubtitleSelectionsKey] =
-                settingsJson.encodeToString<Map<String, TrackSubtitleSelection>>(current)
-        }
-    }
-
-    suspend fun rememberTrackPosition(trackId: String, positionMs: Long) {
-        val clamped = positionMs.coerceAtLeast(0L)
-        context.preferences.edit { prefs ->
-            val current = runCatching {
-                settingsJson.decodeFromString<LinkedHashMap<String, Long>>(
-                    prefs[trackPositionsKey] ?: "{}",
-                )
-            }
-                .getOrDefault(LinkedHashMap())
-            current.remove(trackId)
-            if (clamped > 0L) current[trackId] = clamped
-            while (current.size > 300) {
-                val eldest = current.entries.iterator().next().key
-                current.remove(eldest)
-            }
-            prefs[trackPositionsKey] = settingsJson.encodeToString<Map<String, Long>>(current)
-        }
-    }
+        preferencesFlow
+            .map { it.asmrSearchHistory.take(20) }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
 
     suspend fun update(transform: (Settings) -> Settings) {
-        context.preferences.edit { prefs ->
-            val updated = transform(decode(prefs)).normalized()
-            prefs[settingsKey] = settingsJson.encodeToString(updated)
+        context.appPreferencesStore.updateData { prefs ->
+            prefs.copy(settings = transform(prefs.settings.normalized()).normalized())
         }
     }
 
     suspend fun rememberAsmrSearch(text: String) {
         val clean = normalizedAsmrInput(text).take(300)
         if (clean.isBlank()) return
-        context.preferences.edit { prefs ->
-            val previous = runCatching {
-                settingsJson.decodeFromString<List<String>>(prefs[searchHistoryKey] ?: "[]")
-            }
-                .getOrDefault(emptyList())
-            val next = (listOf(clean) + previous).distinct().take(20)
-            prefs[searchHistoryKey] = settingsJson.encodeToString(next)
+        context.appPreferencesStore.updateData { prefs ->
+            val next = (listOf(clean) + prefs.asmrSearchHistory).distinct().take(20)
+            prefs.copy(asmrSearchHistory = next)
         }
     }
 
     suspend fun clearAsmrSearchHistory() {
-        context.preferences.edit { it.remove(searchHistoryKey) }
+        context.appPreferencesStore.updateData { prefs ->
+            if (prefs.asmrSearchHistory.isEmpty()) prefs
+            else prefs.copy(asmrSearchHistory = emptyList())
+        }
     }
 
-    fun deviceAudioProfileFor(deviceKey: String?): DeviceAudioProfile? = deviceKey?.let {
-        deviceAudioProfiles.value[it]
+    suspend fun deviceAudioProfileFor(deviceKey: String?): DeviceAudioProfile? = deviceKey?.let {
+        currentDeviceAudioProfiles()[it]
     }
+
+    suspend fun currentDeviceAudioProfiles(): Map<String, DeviceAudioProfile> =
+        preferencesFlow.first().deviceAudioProfiles
 
     suspend fun saveDeviceAudioProfile(deviceKey: String, profile: DeviceAudioProfile) {
         val cleanKey = deviceKey.trim().take(120)
         if (cleanKey.isEmpty()) return
-        context.preferences.edit { prefs ->
-            val current = runCatching {
-                settingsJson.decodeFromString<LinkedHashMap<String, DeviceAudioProfile>>(
-                    prefs[deviceAudioProfilesKey] ?: "{}",
-                )
+        context.appPreferencesStore.updateData { prefs ->
+            val next = LinkedHashMap(prefs.deviceAudioProfiles)
+            next.remove(cleanKey)
+            next[cleanKey] = profile.normalized()
+            while (next.size > 24) {
+                next.remove(next.entries.iterator().next().key)
             }
-                .getOrDefault(LinkedHashMap())
-            current.remove(cleanKey)
-            current[cleanKey] = profile.normalized()
-            while (current.size > 24) {
-                val eldest = current.entries.iterator().next().key
-                current.remove(eldest)
-            }
-            prefs[deviceAudioProfilesKey] =
-                settingsJson.encodeToString<Map<String, DeviceAudioProfile>>(current)
+            prefs.copy(deviceAudioProfiles = next)
         }
     }
 
-    suspend fun replaceBackupMaps(
+    suspend fun restoreBackup(
         settings: Settings,
-        subtitleOffsets: Map<String, Long>,
-        subtitleSelections: Map<String, TrackSubtitleSelection>,
-        trackPositions: Map<String, Long>,
         deviceProfiles: Map<String, DeviceAudioProfile>,
     ) {
-        context.preferences.edit { prefs ->
-            prefs[settingsKey] = settingsJson.encodeToString(settings.normalized())
-            if (subtitleOffsets.isNotEmpty()) {
-                val existing = runCatching {
-                    settingsJson.decodeFromString<LinkedHashMap<String, Long>>(
-                        prefs[trackSubtitleOffsetsKey] ?: "{}",
-                    )
+        context.appPreferencesStore.updateData { prefs ->
+            val mergedProfiles =
+                if (deviceProfiles.isEmpty()) prefs.deviceAudioProfiles
+                else {
+                    val next = LinkedHashMap(prefs.deviceAudioProfiles)
+                    deviceProfiles.forEach { (k, v) -> next[k] = v.normalized() }
+                    while (next.size > 24) {
+                        next.remove(next.entries.iterator().next().key)
+                    }
+                    next
                 }
-                    .getOrDefault(LinkedHashMap())
-                subtitleOffsets.forEach { (k, v) -> existing[k] = v.coerceIn(-10_000L, 10_000L) }
-                while (existing.size > 200) existing.remove(existing.entries.first().key)
-                prefs[trackSubtitleOffsetsKey] =
-                    settingsJson.encodeToString<Map<String, Long>>(existing)
-            }
-            if (subtitleSelections.isNotEmpty()) {
-                val existing = runCatching {
-                    settingsJson.decodeFromString<
-                        LinkedHashMap<String, TrackSubtitleSelection>,
-                    >(
-                        prefs[trackSubtitleSelectionsKey] ?: "{}",
-                    )
-                }
-                    .getOrDefault(LinkedHashMap())
-                existing.putAll(subtitleSelections)
-                while (existing.size > 200) existing.remove(existing.entries.first().key)
-                prefs[trackSubtitleSelectionsKey] =
-                    settingsJson.encodeToString<Map<String, TrackSubtitleSelection>>(existing)
-            }
-            if (trackPositions.isNotEmpty()) {
-                val existing = runCatching {
-                    settingsJson.decodeFromString<LinkedHashMap<String, Long>>(
-                        prefs[trackPositionsKey] ?: "{}",
-                    )
-                }
-                    .getOrDefault(LinkedHashMap())
-                trackPositions.forEach { (k, v) -> if (v > 0L) existing[k] = v }
-                while (existing.size > 300) existing.remove(existing.entries.first().key)
-                prefs[trackPositionsKey] = settingsJson.encodeToString<Map<String, Long>>(existing)
-            }
-            if (deviceProfiles.isNotEmpty()) {
-                val existing = runCatching {
-                    settingsJson.decodeFromString<
-                        LinkedHashMap<String, DeviceAudioProfile>,
-                    >(
-                        prefs[deviceAudioProfilesKey] ?: "{}",
-                    )
-                }
-                    .getOrDefault(LinkedHashMap())
-                deviceProfiles.forEach { (k, v) -> existing[k] = v.normalized() }
-                while (existing.size > 24) existing.remove(existing.entries.first().key)
-                prefs[deviceAudioProfilesKey] =
-                    settingsJson.encodeToString<Map<String, DeviceAudioProfile>>(existing)
-            }
+            prefs.copy(
+                settings = settings.normalized(),
+                deviceAudioProfiles = mergedProfiles,
+            )
         }
     }
 }

@@ -2,7 +2,7 @@
 
 面向本地文件、NAS 与在线作品的 Android 音视频播放器，专为音声、ASMR 与带字幕媒体打造。
 
-> **运行要求**：Android 8.0（API 26）及以上 · 支持 `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` · 许可证 [LGPL-3.0-or-later](LICENSE)
+> **运行要求**：Android 9.0（API 28）及以上 · 支持 64 位架构 `arm64-v8a`、`x86_64`（默认构建 `arm64-v8a`）· 许可证 [LGPL-3.0-or-later](LICENSE)
 
 ---
 
@@ -100,7 +100,7 @@ Whisp 同时支持普通作品目录和带 `RJ` 编号的作品目录。以下�
 | --- | --- | --- |
 | **JDK** | 21 | 编译目标为 Java 17，Gradle 运行需 JDK 21 |
 | **Gradle** | 9.8.1 | 已由 `./gradlew` 锁定并校验 SHA-256 |
-| **Android SDK** | Platform 37（`compileSdk = 37`, `targetSdk = 36`, `minSdk = 26`） | 通过 `ANDROID_HOME` 或本机 `local.properties` 配置 |
+| **Android SDK** | Platform 37（`compileSdk = 37`, `targetSdk = 36`, `minSdk = 28`） | 通过 `ANDROID_HOME` 或本机 `local.properties` 配置 |
 | **Build Tools** | 36.0.0 | 通过 Android SDK Manager 安装 |
 | **Android NDK** | `30.0.16248370` | 用于编译 `libnfs.so` 与 `libwhisp_nfs.so` |
 | **CMake** | `3.31.6` | 可使用 SDK 内 `cmake;3.31.6` 或在 `local.properties` 中通过 `cmake.dir` 指定同版本系统路径 |
@@ -125,7 +125,7 @@ sudo apt-get install openjdk-21-jdk-headless adb cmake ninja-build clang-format-
 # 3. 配合 ccache 加速原生重复编译
 ./gradlew -Pccache -Pabis=arm64-v8a :app:assembleDebug
 
-# 4. 构建发布版（启用 R8 与资源裁剪；-PsplitApks 生成 4 个分架构 APK + 通用 APK）
+# 4. 构建发布版（启用 R8 与资源裁剪；默认构建 arm64-v8a，-PsplitApks -Pabis=arm64-v8a,x86_64 生成分架构 + 通用 APK）
 ./gradlew -PsplitApks :app:assembleRelease :app:lintRelease
 ```
 

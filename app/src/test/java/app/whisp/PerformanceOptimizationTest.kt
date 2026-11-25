@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp
 
-import android.database.sqlite.SQLiteDatabase
 import androidx.room.Room
-import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import app.whisp.data.AttachmentEntity
 import app.whisp.data.LibraryDatabase
-import app.whisp.data.MIGRATION_5_6
 import app.whisp.data.SourceEntity
 import app.whisp.data.TrackEntity
+import app.whisp.data.TrackSummary
 import app.whisp.data.WorkEntity
+import app.whisp.data.buildFtsQueryOrNull
 import app.whisp.data.walkTreeConcurrent
 import app.whisp.ui.chunkLongText
-import java.io.File
+import app.whisp.ui.workProgressFraction
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -97,7 +97,7 @@ class PerformanceOptimizationTest {
     }
 
     @Test
-    fun searchWorkIdsUnionAndSaveProgressIfValidWorkAsExpected() = runBlocking {
+    fun ftsSearchSqlProgressSummariesAndTrackStateCascadeWorkAsExpected() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
         val db = Room.inMemoryDatabaseBuilder(context, LibraryDatabase::class.java).build()
         try {
@@ -125,7 +125,7 @@ class PerformanceOptimizationTest {
                     ),
                 ),
             )
-            dao.putTracks(
+            val tracks =
                 listOf(
                     TrackEntity(
                         id = "t1",
@@ -134,8 +134,18 @@ class PerformanceOptimizationTest {
                         fileName = "01_whisper.flac",
                         relativePath = "01.flac",
                         order = 1,
-                        durationMs = 1000L,
+                        durationMs = 60_000L,
                         uri = "content://1",
+                    ),
+                    TrackEntity(
+                        id = "t1b",
+                        workId = "w1",
+                        title = "Soft Rain",
+                        fileName = "02_rain.flac",
+                        relativePath = "02.flac",
+                        order = 2,
+                        durationMs = 60_000L,
+                        uri = "content://1b",
                     ),
                     TrackEntity(
                         id = "t2",
@@ -147,8 +157,8 @@ class PerformanceOptimizationTest {
                         durationMs = 2000L,
                         uri = "content://2",
                     ),
-                ),
-            )
+                )
+            dao.putTracks(tracks)
             dao.putAttachments(
                 listOf(
                     AttachmentEntity(
@@ -163,106 +173,65 @@ class PerformanceOptimizationTest {
                 ),
             )
 
-            // Matches w1 across work/track/attachment and w2 via track, deduplicated by UNION.
-            val matched = dao.searchWorkIds("%whisper%").sorted()
-            assertEquals(listOf("w1", "w2"), matched)
-            assertEquals(listOf("w1", "w2"), dao.searchWorkIds("%rainy%").sorted())
-            assertEquals(listOf("w2"), dao.searchWorkIds("%sunny%"))
+            // FTS4 inverted index query matches across works, tracks, and attachments.
+            assertEquals("whisper*", buildFtsQueryOrNull("whisper"))
+            assertNull(buildFtsQueryOrNull("耳かき"))
+            assertEquals(listOf("w1", "w2"), dao.searchWorkIdsFts("whisper*").sorted())
+            assertEquals(listOf("w1", "w2"), dao.searchWorkIdsFts("rainy*").sorted())
+            assertEquals(listOf("w2"), dao.searchWorkIdsFts("sunny*"))
+            assertEquals(listOf("w1", "w2"), dao.searchWorkIds("%whisper%").sorted())
 
             // saveProgressIfValid ignores unknown work or mismatched trackId.
             dao.saveProgressIfValid("missing", "t1", 500L, 100L)
             dao.saveProgressIfValid("w1", "t2", 500L, 100L)
             assertNull(dao.progress("w1"))
 
-            // Valid work+track inserts and updates in place.
-            dao.saveProgressIfValid("w1", "t1", 1234L, 200L)
+            // Valid work+track inserts and matches SQL-aggregated WorkProgressSummary.
+            dao.saveProgressIfValid("w1", "t1b", 30_000L, 200L)
             val saved = dao.progress("w1")
             assertNotNull(saved)
-            assertEquals("t1", saved!!.trackId)
-            assertEquals(1234L, saved.positionMs)
-            assertEquals(200L, saved.updatedAt)
+            assertEquals("t1b", saved!!.trackId)
+            assertEquals(30_000L, saved.positionMs)
 
-            dao.saveProgressIfValid("w1", "t1", 5678L, 300L)
-            val updated = dao.progress("w1")
-            assertEquals(5678L, updated!!.positionMs)
-            assertEquals(300L, updated.updatedAt)
+            val summaries = dao.observeWorkProgressSummaries().first()
+            assertEquals(1, summaries.size)
+            val sqlFraction = summaries.single().fraction()!!
+            val expectedFraction =
+                workProgressFraction(
+                    tracks
+                        .filter { it.workId == "w1" }
+                        .map { TrackSummary(it.id, it.workId, it.order, it.durationMs) },
+                    saved,
+                )!!
+            assertEquals(expectedFraction, sqlFraction, 0.0001f)
+
+            // Per-track state cascades automatically when work/track is deleted.
+            dao.upsertTrackPosition("t1", 12_000L, 500L)
+            dao.upsertTrackSubtitleOffset("t1", 750L, 501L)
+            dao.upsertTrackSubtitleSelection("t1", "sub-1", "sub-2", 502L)
+            val state = dao.trackState("t1")
+            assertNotNull(state)
+            assertEquals(12_000L, state!!.positionMs)
+            assertEquals(750L, state.subtitleOffsetMs)
+            assertEquals("sub-1", state.primarySubtitleId)
+            assertEquals("sub-2", state.secondarySubtitleId)
+
+            // Verify clean v1 indexes (composite tracks index present, redundant single-col gone).
+            val indexes = mutableSetOf<String>()
+            db.openHelper.readableDatabase
+                .query("SELECT name FROM sqlite_master WHERE type = 'index'")
+                .use { cursor -> while (cursor.moveToNext()) indexes += cursor.getString(0) }
+            assertTrue("index_works_coverId" in indexes)
+            assertTrue("index_works_addedAt" in indexes)
+            assertTrue("index_tracks_workId_order_id" in indexes)
+            assertFalse("index_tracks_workId" in indexes)
+            assertTrue("index_progress_updatedAt" in indexes)
+            assertTrue("index_bookmarks_positionMs" in indexes)
+
+            dao.deleteWork("w1")
+            assertNull(dao.trackState("t1"))
         } finally {
             db.close()
-        }
-    }
-
-    @Test
-    fun migration5To6CreatesPerformanceIndexesAndPreservesData() = runBlocking {
-        val context = RuntimeEnvironment.getApplication()
-        val dbFile = File(context.cacheDir, "migration-5-6-test.db")
-        dbFile.delete()
-        try {
-            // Seed exact v5 schema matching app/schemas/.../5.json.
-            val sqlite = SQLiteDatabase.openOrCreateDatabase(dbFile, null)
-            sqlite.execSQL(
-                "CREATE TABLE `sources` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `kind` TEXT NOT NULL, `root` TEXT NOT NULL, `username` TEXT NOT NULL, `secret` TEXT NOT NULL, `lastScan` INTEGER NOT NULL, `error` TEXT, PRIMARY KEY(`id`))",
-            )
-            sqlite.execSQL(
-                "CREATE TABLE `works` (`id` TEXT NOT NULL, `rj` TEXT, `title` TEXT NOT NULL, `originalTitle` TEXT NOT NULL, `artist` TEXT NOT NULL, `series` TEXT, `coverId` TEXT, `favorite` INTEGER NOT NULL, `addedAt` INTEGER NOT NULL, `offlineAttachments` INTEGER NOT NULL, `originalArtist` TEXT NOT NULL DEFAULT '', `coverUrl` TEXT DEFAULT NULL, `origin` TEXT NOT NULL DEFAULT 'local', `sourceId` TEXT DEFAULT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`sourceId`) REFERENCES `sources`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL)",
-            )
-            sqlite.execSQL("CREATE INDEX `index_works_sourceId` ON `works` (`sourceId`)")
-            sqlite.execSQL(
-                "CREATE TABLE `tracks` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `title` TEXT NOT NULL, `fileName` TEXT NOT NULL, `relativePath` TEXT NOT NULL, `order` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `subtitleId` TEXT, `scriptId` TEXT, `bonus` INTEGER NOT NULL, `uri` TEXT NOT NULL DEFAULT '', `size` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
-            )
-            sqlite.execSQL("CREATE INDEX `index_tracks_workId` ON `tracks` (`workId`)")
-            sqlite.execSQL(
-                "CREATE TABLE `attachments` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `title` TEXT NOT NULL, `fileName` TEXT NOT NULL, `relativePath` TEXT NOT NULL, `kind` TEXT NOT NULL, `uri` TEXT NOT NULL DEFAULT '', `size` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
-            )
-            sqlite.execSQL("CREATE INDEX `index_attachments_workId` ON `attachments` (`workId`)")
-            sqlite.execSQL(
-                "CREATE TABLE `dlsite_metadata` (`workId` TEXT NOT NULL, `snapshot` TEXT NOT NULL, PRIMARY KEY(`workId`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
-            )
-            sqlite.execSQL(
-                "CREATE TABLE `dlsite_purchases` (`sourceId` TEXT NOT NULL, `workno` TEXT NOT NULL, `purchasedAt` INTEGER NOT NULL, `snapshot` TEXT NOT NULL, PRIMARY KEY(`sourceId`, `workno`), FOREIGN KEY(`sourceId`) REFERENCES `sources`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
-            )
-            sqlite.execSQL(
-                "CREATE INDEX `index_dlsite_purchases_sourceId` ON `dlsite_purchases` (`sourceId`)",
-            )
-            sqlite.execSQL(
-                "CREATE TABLE `progress` (`workId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`workId`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
-            )
-            sqlite.execSQL(
-                "CREATE TABLE `bookmarks` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `title` TEXT NOT NULL, `endMs` INTEGER, PRIMARY KEY(`id`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
-            )
-            sqlite.execSQL("CREATE INDEX `index_bookmarks_workId` ON `bookmarks` (`workId`)")
-            sqlite.execSQL(
-                "INSERT INTO `works` VALUES ('w1','RJ01','T','T','A',NULL,'c1',0,100,0,'A',NULL,'local',NULL)",
-            )
-            sqlite.execSQL("INSERT INTO `progress` VALUES ('w1','t1',4200,999)")
-            sqlite.version = 5
-            sqlite.close()
-
-            val migrated =
-                Room.databaseBuilder(context, LibraryDatabase::class.java, dbFile.absolutePath)
-                    .openHelperFactory(FrameworkSQLiteOpenHelperFactory())
-                    .addMigrations(MIGRATION_5_6)
-                    .build()
-            try {
-                val work = migrated.library().work("w1")
-                assertNotNull(work)
-                assertEquals("c1", work!!.coverId)
-                assertEquals(4200L, migrated.library().progress("w1")?.positionMs)
-
-                val indexes = mutableSetOf<String>()
-                migrated.openHelper.readableDatabase
-                    .query("SELECT name FROM sqlite_master WHERE type = 'index'")
-                    .use { cursor -> while (cursor.moveToNext()) indexes += cursor.getString(0) }
-                assertTrue("index_works_coverId" in indexes)
-                assertTrue("index_works_addedAt" in indexes)
-                assertTrue("index_tracks_workId_order_id" in indexes)
-                assertTrue("index_progress_updatedAt" in indexes)
-                assertTrue("index_bookmarks_positionMs" in indexes)
-                assertFalse(indexes.isEmpty())
-            } finally {
-                migrated.close()
-            }
-        } finally {
-            dbFile.delete()
         }
     }
 }

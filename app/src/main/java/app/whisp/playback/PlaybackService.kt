@@ -918,7 +918,7 @@ class PlaybackService : MediaLibraryService() {
         else graph.library.savePlaybackProgress(entity)
         // Persist per-track position asynchronously for effortless multi-track/edition switching.
         if (clamped > 0L) {
-            graph.scope.launch { graph.settings.rememberTrackPosition(id, clamped) }
+            graph.scope.launch { graph.library.rememberTrackPosition(id, clamped) }
         }
     }
 

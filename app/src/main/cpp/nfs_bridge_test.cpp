@@ -203,6 +203,18 @@ void jni_set_object_array_element(JNIEnv *, jobjectArray array, jsize index, job
 
 void jni_delete_local_ref(JNIEnv *, jobject) {}
 
+void *jni_get_direct_buffer_address(JNIEnv *, jobject buf) {
+    check_no_pending_exception();
+    auto *ba = reinterpret_cast<FakeByteArray *>(buf);
+    return ba ? ba->data.data() : nullptr;
+}
+
+jlong jni_get_direct_buffer_capacity(JNIEnv *, jobject buf) {
+    check_no_pending_exception();
+    auto *ba = reinterpret_cast<FakeByteArray *>(buf);
+    return ba ? static_cast<jlong>(ba->data.size()) : -1;
+}
+
 jbyteArray make_bytes(const std::string &value) {
     auto *ba = new FakeByteArray{
         std::vector<jbyte>(value.begin(), value.end()),
@@ -300,6 +312,8 @@ int main() {
     table.DeleteLocalRef = jni_delete_local_ref;
     table.NewGlobalRef = jni_new_global_ref;
     table.DeleteGlobalRef = jni_delete_global_ref;
+    table.GetDirectBufferAddress = jni_get_direct_buffer_address;
+    table.GetDirectBufferCapacity = jni_get_direct_buffer_capacity;
 
     JNIEnv env{&table};
     g_vm_env = &env;
@@ -392,6 +406,20 @@ int main() {
     auto *raw_out = reinterpret_cast<FakeByteArray *>(out_buf);
     assert(static_cast<uint8_t>(raw_out->data[0]) == 10);
     assert(static_cast<uint8_t>(raw_out->data[64]) == 74);
+
+    // Zero-copy DirectByteBuffer read path & bounds validation.
+    auto *direct_buf = jni_new_byte_array(&env, 128);
+    assert(Java_app_whisp_data_NfsNative_readDirect(&env, nullptr, ptr, file_handle, 20, direct_buf,
+                                                    16, 64) == 64);
+    auto *raw_direct = reinterpret_cast<FakeByteArray *>(direct_buf);
+    assert(static_cast<uint8_t>(raw_direct->data[16]) == 20);
+    assert(static_cast<uint8_t>(raw_direct->data[79]) == 83);
+    // Out-of-bounds direct read must throw IOException without UB.
+    g_jni.reset();
+    assert(Java_app_whisp_data_NfsNative_readDirect(&env, nullptr, ptr, file_handle, 0, direct_buf,
+                                                    96, 64) == -1);
+    assert(g_jni.has_exception);
+    g_jni.reset();
 
     Java_app_whisp_data_NfsNative_closeFile(&env, nullptr, ptr, file_handle);
     Java_app_whisp_data_NfsNative_close(&env, nullptr, ptr);

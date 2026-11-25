@@ -192,10 +192,9 @@ class SystemCapabilitiesTest {
 
         val snapshot =
             WhispBackupSnapshot(
-                version = 1,
+                version = 2,
                 exportedAt = 1_700_000_000_000L,
                 settings = settings,
-                trackSubtitleOffsets = mapOf("track-1" to 500L),
                 deviceAudioProfiles = mapOf("bluetooth|sleepbuds" to profile),
                 works =
                     listOf(
@@ -209,10 +208,36 @@ class SystemCapabilitiesTest {
                             favorite = true,
                         ),
                     ),
-                progress = listOf(BackupProgress("w1", "RJ01234567", "track-1", 42_000L, 1234L)),
+                progress =
+                    listOf(
+                        BackupProgress("w1", "RJ01234567", "track-1", "01.wav", 42_000L, 1234L),
+                    ),
                 bookmarks =
                     listOf(
-                        BackupBookmark("b1", "w1", "RJ01234567", "track-1", 10_000L, "耳语", 20_000L),
+                        BackupBookmark(
+                            "b1",
+                            "w1",
+                            "RJ01234567",
+                            "track-1",
+                            "01.wav",
+                            10_000L,
+                            "耳语",
+                            20_000L,
+                        ),
+                    ),
+                trackStates =
+                    listOf(
+                        BackupTrackState(
+                            workId = "w1",
+                            rj = "RJ01234567",
+                            trackId = "track-1",
+                            trackRelativePath = "01.wav",
+                            positionMs = 42_000L,
+                            subtitleOffsetMs = 500L,
+                            primarySubtitleId = "sub-zh",
+                            primarySubtitlePath = "01.zh.vtt",
+                            updatedAt = 1234L,
+                        ),
                     ),
             )
         val json = LibraryBackup.encode(snapshot)

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp
 
-import android.database.sqlite.SQLiteDatabase
 import androidx.room.Room
-import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import app.whisp.data.*
-import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -28,40 +25,6 @@ import org.robolectric.RuntimeEnvironment
 
 @RunWith(RobolectricTestRunner::class)
 class PreReleaseRegressionTest {
-    @Test
-    fun migrateLegacyOfflineDirRenamesAndMergesWithoutDataLoss() {
-        val root = File(RuntimeEnvironment.getApplication().cacheDir, "offline-migrate-test")
-        root.deleteRecursively()
-        try {
-            // Case 1: clean rename when target does not yet exist.
-            val legacy1 = File(root, "case1/offline/attachments").apply { mkdirs() }
-            val target1 = File(root, "case1/offline/assets")
-            File(legacy1, "sub-1").writeText("vtt-content")
-            File(legacy1, "cover-1").writeBytes(byteArrayOf(1, 2, 3))
-
-            migrateLegacyOfflineDir(legacy1, target1)
-
-            assertFalse(legacy1.exists())
-            assertEquals("vtt-content", File(target1, "sub-1").readText())
-            assertArrayEquals(byteArrayOf(1, 2, 3), File(target1, "cover-1").readBytes())
-
-            // Case 2: merge into existing target without clobbering newer files.
-            val legacy2 = File(root, "case2/offline/attachments").apply { mkdirs() }
-            val target2 = File(root, "case2/offline/assets").apply { mkdirs() }
-            File(legacy2, "old-only").writeText("from-v040")
-            File(legacy2, "shared").writeText("legacy-copy")
-            File(target2, "shared").writeText("newer-copy")
-
-            migrateLegacyOfflineDir(legacy2, target2)
-
-            assertFalse(legacy2.exists())
-            assertEquals("from-v040", File(target2, "old-only").readText())
-            assertEquals("newer-copy", File(target2, "shared").readText())
-        } finally {
-            root.deleteRecursively()
-        }
-    }
-
     @Test
     fun onlineCopyToSinkStopsWritingBeforeCancellationReturns() = runBlocking {
         val server = MockWebServer()
@@ -277,99 +240,40 @@ class PreReleaseRegressionTest {
     }
 
     @Test
-    fun migration4To6PreservesAllTablesAndSkipsGhostWorksInLatestProgress() = runBlocking {
+    fun latestProgressSkipsGhostWorksWithoutTracks() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
-        val dbFile = File(context.cacheDir, "migration-4-6-test.db")
-        dbFile.delete()
+        val db = Room.inMemoryDatabaseBuilder(context, LibraryDatabase::class.java).build()
         try {
-            val sqlite = SQLiteDatabase.openOrCreateDatabase(dbFile, null)
-            sqlite.execSQL(
-                "CREATE TABLE `sources` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `kind` TEXT NOT NULL, `root` TEXT NOT NULL, `username` TEXT NOT NULL, `secret` TEXT NOT NULL, `lastScan` INTEGER NOT NULL, `error` TEXT, PRIMARY KEY(`id`))",
+            val dao = db.library()
+            dao.putSource(SourceEntity("src1", "Local", "local", "content://root"))
+            dao.putWorks(
+                listOf(
+                    WorkEntity("w1", "RJ000001", "Work 1", "Work 1", "VA", sourceId = "src1"),
+                    WorkEntity("ghost", null, "Ghost", "Ghost", "", sourceId = "src1"),
+                ),
             )
-            sqlite.execSQL(
-                "CREATE TABLE `works` (`id` TEXT NOT NULL, `rj` TEXT, `title` TEXT NOT NULL, `originalTitle` TEXT NOT NULL, `artist` TEXT NOT NULL, `series` TEXT, `coverId` TEXT, `favorite` INTEGER NOT NULL, `addedAt` INTEGER NOT NULL, `offlineAttachments` INTEGER NOT NULL, `originalArtist` TEXT NOT NULL DEFAULT '', `coverUrl` TEXT DEFAULT NULL, `origin` TEXT NOT NULL DEFAULT 'local', PRIMARY KEY(`id`))",
+            dao.putTracks(
+                listOf(
+                    TrackEntity(
+                        "t1",
+                        "w1",
+                        "Track 1",
+                        "01.mp3",
+                        "01.mp3",
+                        1,
+                        60_000L,
+                        uri = "content://root/01.mp3",
+                    ),
+                ),
             )
-            sqlite.execSQL(
-                "CREATE TABLE `tracks` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `title` TEXT NOT NULL, `fileName` TEXT NOT NULL, `relativePath` TEXT NOT NULL, `order` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `subtitleId` TEXT, `scriptId` TEXT, `bonus` INTEGER NOT NULL, PRIMARY KEY(`id`))",
-            )
-            sqlite.execSQL("CREATE INDEX `index_tracks_workId` ON `tracks` (`workId`)")
-            sqlite.execSQL(
-                "CREATE TABLE `attachments` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `title` TEXT NOT NULL, `fileName` TEXT NOT NULL, `relativePath` TEXT NOT NULL, `kind` TEXT NOT NULL, PRIMARY KEY(`id`))",
-            )
-            sqlite.execSQL("CREATE INDEX `index_attachments_workId` ON `attachments` (`workId`)")
-            sqlite.execSQL(
-                "CREATE TABLE `locations` (`id` TEXT NOT NULL, `assetId` TEXT NOT NULL, `sourceId` TEXT NOT NULL, `uri` TEXT NOT NULL, `size` INTEGER NOT NULL, `modified` INTEGER NOT NULL, `generation` INTEGER NOT NULL, PRIMARY KEY(`id`))",
-            )
-            sqlite.execSQL("CREATE INDEX `index_locations_assetId` ON `locations` (`assetId`)")
-            sqlite.execSQL("CREATE INDEX `index_locations_sourceId` ON `locations` (`sourceId`)")
-            sqlite.execSQL(
-                "CREATE TABLE `progress` (`workId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`workId`))",
-            )
-            sqlite.execSQL(
-                "CREATE TABLE `bookmarks` (`id` TEXT NOT NULL, `workId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `positionMs` INTEGER NOT NULL, `title` TEXT NOT NULL, `endMs` INTEGER, PRIMARY KEY(`id`))",
-            )
-            sqlite.execSQL("CREATE INDEX `index_bookmarks_workId` ON `bookmarks` (`workId`)")
-            sqlite.execSQL(
-                "CREATE TABLE `dlsite_metadata` (`workId` TEXT NOT NULL, `snapshot` TEXT NOT NULL, PRIMARY KEY(`workId`), FOREIGN KEY(`workId`) REFERENCES `works`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
-            )
-            sqlite.execSQL(
-                "CREATE TABLE `dlsite_purchases` (`sourceId` TEXT NOT NULL, `workno` TEXT NOT NULL, `purchasedAt` INTEGER NOT NULL, `snapshot` TEXT NOT NULL, PRIMARY KEY(`sourceId`, `workno`), FOREIGN KEY(`sourceId`) REFERENCES `sources`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
-            )
-            sqlite.execSQL(
-                "CREATE INDEX `index_dlsite_purchases_sourceId` ON `dlsite_purchases` (`sourceId`)",
-            )
-            sqlite.execSQL(
-                "INSERT INTO sources VALUES ('src1','Local','local','content://root','','',100,NULL)",
-            )
-            sqlite.execSQL(
-                "INSERT INTO works VALUES ('w1','RJ000001','Work 1','Work 1','VA',NULL,'cov1',1,100,1,'VA',NULL,'local')",
-            )
-            sqlite.execSQL(
-                "INSERT INTO works VALUES ('ghost',NULL,'Ghost','Ghost','',NULL,NULL,0,200,0,'',NULL,'local')",
-            )
-            sqlite.execSQL(
-                "INSERT INTO tracks VALUES ('t1','w1','Track 1','01.mp3','01.mp3',1,60000,NULL,NULL,0)",
-            )
-            sqlite.execSQL(
-                "INSERT INTO attachments VALUES ('cov1','w1','cover','cover.jpg','cover.jpg','image')",
-            )
-            sqlite.execSQL(
-                "INSERT INTO locations VALUES ('loc1','t1','src1','content://root/01.mp3',2048,1,1)",
-            )
-            sqlite.execSQL(
-                "INSERT INTO locations VALUES ('loc2','cov1','src1','content://root/cover.jpg',512,1,1)",
-            )
-            sqlite.execSQL("INSERT INTO progress VALUES ('w1','t1',5000,100)")
-            sqlite.execSQL("INSERT INTO progress VALUES ('ghost','missing',9000,999)")
-            sqlite.execSQL("INSERT INTO bookmarks VALUES ('b1','w1','t1',1000,'Note',2000)")
-            sqlite.execSQL("INSERT INTO dlsite_metadata VALUES ('w1','{\"rj\":\"RJ000001\"}')")
-            sqlite.version = 4
-            sqlite.close()
+            dao.saveProgress(ProgressEntity("w1", "t1", 5_000L, 100L))
+            dao.saveProgress(ProgressEntity("ghost", "missing", 9_000L, 999L))
 
-            val db =
-                Room.databaseBuilder(context, LibraryDatabase::class.java, dbFile.absolutePath)
-                    .openHelperFactory(FrameworkSQLiteOpenHelperFactory())
-                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
-                    .build()
-            try {
-                val dao = db.library()
-                val detail = dao.details("w1")
-                assertNotNull(detail)
-                assertEquals("src1", detail!!.work.sourceId)
-                assertEquals("content://root/01.mp3", detail.tracks.single().uri)
-                assertEquals(2048L, detail.tracks.single().size)
-                assertEquals("content://root/cover.jpg", detail.attachments.single().uri)
-                assertNotNull(dao.dlsiteMetadata("w1"))
-
-                // Ghost 0-track work has newer updatedAt (999) but latestProgress must return w1.
-                val latest = dao.latestProgress()
-                assertNotNull(latest)
-                assertEquals("w1", latest!!.workId)
-            } finally {
-                db.close()
-            }
+            val latest = dao.latestProgress()
+            assertNotNull(latest)
+            assertEquals("w1", latest!!.workId)
         } finally {
-            dbFile.delete()
+            db.close()
         }
     }
 
