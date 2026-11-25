@@ -46,8 +46,8 @@ android {
         applicationId = "app.whisp"
         minSdk = 26
         targetSdk = 36
-        versionCode = 23
-        versionName = "0.5.0-rc.3"
+        versionCode = 24
+        versionName = "0.5.0-rc.4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake {
