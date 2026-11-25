@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 plugins {
     alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.android.library) apply false
+    alias(libs.plugins.android.test) apply false
     alias(libs.plugins.kotlin.serialization) apply false
     alias(libs.plugins.kotlin.compose) apply false
     alias(libs.plugins.ksp) apply false
@@ -9,11 +11,11 @@ plugins {
 
 spotless {
     kotlin {
-        target("app/src/**/*.kt")
+        target("app/src/**/*.kt", "core/*/src/**/*.kt", "benchmark/src/**/*.kt")
         ktfmt(libs.versions.ktfmt.get()).kotlinlangStyle()
     }
     kotlinGradle {
-        target("*.gradle.kts", "app/*.gradle.kts")
+        target("*.gradle.kts", "app/*.gradle.kts", "core/*/*.gradle.kts", "benchmark/*.gradle.kts")
         ktfmt(libs.versions.ktfmt.get()).kotlinlangStyle()
     }
     format("text") {
@@ -25,6 +27,7 @@ spotless {
             ".editorconfig",
             "*.properties",
             "app/*.pro",
+            "core/*/*.pro",
             "gradle/*.toml",
         )
         trimTrailingWhitespace()
@@ -50,9 +53,15 @@ val clangFormatExecutable =
     providers.environmentVariable("WHISP_CLANG_FORMAT").orElse("clang-format-19")
 val cppFiles =
     listOf(
-        "app/src/main/cpp/nfs_bridge.cpp",
-        "app/src/main/cpp/nfs_bridge_test.cpp",
-        "app/src/main/cpp/test_stubs/nfsc/libnfs.h",
+        "core/native/src/main/cpp/nfs_bridge.cpp",
+        "core/native/src/main/cpp/nfs_bridge_test.cpp",
+        "core/native/src/main/cpp/smb_bridge.cpp",
+        "core/native/src/main/cpp/smb_bridge_test.cpp",
+        "core/native/src/main/cpp/dsp_bridge.cpp",
+        "core/native/src/main/cpp/dsp_bridge_test.cpp",
+        "core/native/src/main/cpp/test_stubs/nfsc/libnfs.h",
+        "core/native/src/main/cpp/test_stubs/smb2/smb2.h",
+        "core/native/src/main/cpp/test_stubs/smb2/libsmb2.h",
     )
 
 tasks.register<Exec>("cppFormat") {
@@ -69,7 +78,7 @@ tasks.register<Exec>("nativeHostTestConfigure") {
     commandLine(
         "cmake",
         "-S",
-        "app/src/main/cpp",
+        "core/native/src/main/cpp",
         "-B",
         hostNativeBuildDir.get().asFile.absolutePath,
         "-DWHISP_BUILD_HOST_TESTS=ON",
@@ -83,7 +92,7 @@ tasks.register<Exec>("nativeHostTestBuild") {
 
 tasks.register<Exec>("nativeHostTest") {
     group = "verification"
-    description = "Run host C++ JNI bridge tests with ASan and UBSan."
+    description = "Run host C++ JNI bridge tests (NFS, SMB2, NEON DSP) with ASan and UBSan."
     dependsOn("nativeHostTestBuild")
     commandLine(
         "ctest",
@@ -111,5 +120,8 @@ tasks.register("qualityCheck") {
         ":app:testDebugUnitTest",
         ":app:lintDebug",
         ":app:lintRelease",
+        ":core:model:lintRelease",
+        ":core:native:lintRelease",
+        ":benchmark:compileBenchmarkKotlin",
     )
 }

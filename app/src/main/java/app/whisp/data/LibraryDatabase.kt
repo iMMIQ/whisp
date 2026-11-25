@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.data
 
+import androidx.paging.PagingSource
 import androidx.room.*
 import kotlinx.coroutines.flow.Flow
 
@@ -26,6 +27,9 @@ val WorkEntity.originKind: SourceKind
 
 val WorkEntity.isRemovableOnline: Boolean
     get() = originKind == SourceKind.ASMRONE || originKind == SourceKind.DLSITE
+
+val TrackEntity.isVideo: Boolean
+    get() = MediaFormats.isVideo(fileName)
 
 @Entity(tableName = "sources")
 data class SourceEntity(
@@ -340,6 +344,35 @@ interface LibraryDao {
     @Query("DELETE FROM sources WHERE id = :id") suspend fun deleteSource(id: String)
 
     @Query("SELECT * FROM works ORDER BY addedAt DESC") fun observeWorks(): Flow<List<WorkEntity>>
+
+    @Query(
+        """
+        SELECT w.* FROM works w
+        LEFT JOIN progress p ON p.workId = w.id
+        WHERE (w.sourceId IS NOT NULL OR w.offlineAttachments = 1 OR (:hasOrphanOffline = 1 AND w.id IN (:orphanOfflineIds)))
+          AND (:favoriteOnly = 0 OR w.favorite = 1)
+          AND (:offlineOnly = 0 OR w.offlineAttachments = 1)
+          AND (:series IS NULL OR w.series = :series)
+          AND (:filterByIds = 0 OR w.id IN (:matchedIds))
+        ORDER BY
+          CASE WHEN :sort = 'added_asc' THEN w.addedAt END ASC,
+          CASE WHEN :sort = 'recent' THEN COALESCE(p.updatedAt, 0) END DESC,
+          CASE WHEN :sort = 'title_asc' THEN LOWER(w.title) END ASC,
+          CASE WHEN :sort = 'title_desc' THEN LOWER(w.title) END DESC,
+          CASE WHEN :sort = 'offline_first' THEN w.offlineAttachments END DESC,
+          w.addedAt DESC
+        """,
+    )
+    fun pagingWorks(
+        hasOrphanOffline: Boolean,
+        orphanOfflineIds: List<String>,
+        favoriteOnly: Boolean,
+        offlineOnly: Boolean,
+        series: String?,
+        filterByIds: Boolean,
+        matchedIds: List<String>,
+        sort: String,
+    ): PagingSource<Int, WorkEntity>
 
     @Query("SELECT id, workId FROM tracks") fun observeTrackWorkPairs(): Flow<List<TrackWorkPair>>
 

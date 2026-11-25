@@ -39,8 +39,8 @@ jobs:
         uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: native-${{ runner.os }}-ndk30.0.16248370-cmake3.31.6-v1-${{ hashFiles('app/src/main/cpp/**') }}
-          restore-keys: native-${{ runner.os }}-ndk30.0.16248370-cmake3.31.6-v1-
+          key: native-${{ runner.os }}-ndk30.0.16248370-cmake3.31.6-v2-${{ hashFiles('core/native/src/main/cpp/**') }}
+          restore-keys: native-${{ runner.os }}-ndk30.0.16248370-cmake3.31.6-v2-
       - name: Set up tools
         run: |
           python3 -m pip install black==26.10.1

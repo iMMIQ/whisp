@@ -14,7 +14,7 @@ import kotlin.math.sqrt
  * above [GRAVITY_THRESHOLD] within [DOUBLE_SHAKE_WINDOW_MS] and enforces a [COOLDOWN_MS] lockout so
  * accidental pillow adjustments never spam sleep timer extensions.
  */
-internal class ShakeStateMachine(
+class ShakeStateMachine(
     private val gravityThreshold: Float = GRAVITY_THRESHOLD,
     private val doubleShakeWindowMs: Long = DOUBLE_SHAKE_WINDOW_MS,
     private val cooldownMs: Long = COOLDOWN_MS,

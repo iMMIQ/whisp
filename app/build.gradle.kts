@@ -27,7 +27,6 @@ require(buildAbis.isNotEmpty() && buildAbis.all { it in supportedAbis }) {
 }
 
 val splitApks = providers.gradleProperty("splitApks").isPresent
-val useCcache = providers.gradleProperty("ccache").isPresent
 val releaseSecrets =
     Properties().apply {
         if (releaseSecretsFile.isFile) releaseSecretsFile.inputStream().use { load(it) }
@@ -37,12 +36,6 @@ android {
     namespace = "app.whisp"
     compileSdk = 37
     ndkVersion = "30.0.16248370"
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.31.6"
-        }
-    }
     defaultConfig {
         applicationId = "app.whisp"
         minSdk = 28
@@ -50,15 +43,6 @@ android {
         versionCode = 25
         versionName = "0.5.0-rc.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        externalNativeBuild {
-            cmake {
-                arguments += "-DANDROID_STL=none"
-                if (useCcache) {
-                    arguments += "-DCMAKE_C_COMPILER_LAUNCHER=ccache"
-                    arguments += "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
-                }
-            }
-        }
         if (!splitApks) ndk { abiFilters += buildAbis }
     }
     splits {
@@ -88,6 +72,12 @@ android {
             )
             if (releaseSecretsFile.isFile) signingConfig = signingConfigs.getByName("localRelease")
         }
+        create("benchmark") {
+            initWith(buildTypes.getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+            isDebuggable = false
+        }
     }
     // Isolated on-device tests preserve the installed user's release and its library.
     if (providers.gradleProperty("smokeTest").isPresent) {
@@ -114,8 +104,6 @@ android {
         resources.excludes +=
             setOf(
                 "/META-INF/{AL2.0,LGPL2.1}",
-                "org/bouncycastle/pqc/**",
-                "org/bouncycastle/x509/**",
                 "kotlin/**/*.kotlin_builtins",
             )
     }
@@ -163,6 +151,8 @@ kotlin { compilerOptions { allWarningsAsErrors.set(true) } }
 ksp { arg("room.schemaLocation", "$projectDir/schemas") }
 
 dependencies {
+    implementation(project(":core:model"))
+    implementation(project(":core:native"))
     constraints {
         implementation(libs.serialization.core) {
             because("Align the Navigation 3 serialization runtime with test serialization")
@@ -182,7 +172,10 @@ dependencies {
     implementation(libs.navigation3.runtime)
     implementation(libs.navigation3.ui)
     implementation(libs.room.runtime)
+    implementation(libs.room.paging)
     ksp(libs.room.compiler)
+    implementation(libs.paging.runtime)
+    implementation(libs.paging.compose)
     implementation(libs.datastore)
     implementation(libs.work.runtime)
     implementation(libs.coil.compose)
@@ -191,12 +184,12 @@ dependencies {
     implementation(libs.coroutines.android)
     implementation(libs.serialization.json)
     implementation(libs.jsoup)
-    implementation(libs.smbj)
     implementation(libs.media3.exoplayer)
     implementation(libs.media3.session)
     implementation(libs.media3.datasource.okhttp)
     implementation(libs.media3.extractor)
     implementation(libs.media3.ui.compose)
+    implementation(libs.profileinstaller)
     testImplementation(libs.junit)
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.robolectric)

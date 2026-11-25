@@ -25,4 +25,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Whisp"
 
-include(":app")
+include(":app", ":core:model", ":core:native", ":benchmark")

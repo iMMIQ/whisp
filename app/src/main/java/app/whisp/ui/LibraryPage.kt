@@ -31,6 +31,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.paging.LoadState
+import androidx.paging.compose.collectAsLazyPagingItems
 import app.whisp.AppGraph
 import app.whisp.R
 import app.whisp.data.LibrarySort
@@ -103,36 +105,17 @@ internal fun LibraryPage(
         }
     }
 
-    val progressByWork = remember(progressList) { progressList.associateBy { it.workId } }
-    val sortProgress = if (settings.librarySort == LibrarySort.RECENT) progressByWork else null
-
-    val filtered =
-        remember(works, tab, series, matchedIds, settings.librarySort, sortProgress) {
-            val base = works.filter { work ->
-                (tab != "收藏" || work.favorite) &&
-                    (tab != "离线" || work.offlineAttachments) &&
-                    (series == null || work.series == series) &&
-                    (matchedIds == null || work.id in matchedIds!!)
-            }
-            when (settings.librarySort) {
-                LibrarySort.ADDED_ASC -> base.sortedBy { it.addedAt }
-                LibrarySort.RECENT ->
-                    base.sortedWith(
-                        compareByDescending<WorkEntity> {
-                                sortProgress?.get(it.id)?.updatedAt ?: 0L
-                            }
-                            .thenByDescending { it.addedAt },
-                    )
-                LibrarySort.TITLE_ASC -> base.sortedBy { it.title.lowercase() }
-                LibrarySort.TITLE_DESC -> base.sortedByDescending { it.title.lowercase() }
-                LibrarySort.OFFLINE_FIRST ->
-                    base.sortedWith(
-                        compareByDescending<WorkEntity> { it.offlineAttachments }
-                            .thenByDescending { it.addedAt },
-                    )
-                else -> base
-            }
+    val pagedWorksFlow =
+        remember(tab, series, matchedIds, settings.librarySort) {
+            graph.library.pagedWorks(
+                favoriteOnly = tab == "收藏",
+                offlineOnly = tab == "离线",
+                series = series,
+                matchedIds = matchedIds,
+                sort = settings.librarySort,
+            )
         }
+    val pagedWorks = pagedWorksFlow.collectAsLazyPagingItems()
     val seriesGroups =
         remember(works, query, matchedIds) {
             val trimmed = query.trim().lowercase()
@@ -269,7 +252,7 @@ internal fun LibraryPage(
                         }
                     }
                 }
-            filtered.isEmpty() ->
+            pagedWorks.itemCount == 0 && pagedWorks.loadState.refresh is LoadState.NotLoading ->
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     when {
                         query.isNotBlank() ->
@@ -298,10 +281,8 @@ internal fun LibraryPage(
                     }
                 }
             else ->
-                WorkGrid(
-                    items = filtered,
-                    key = { it.id },
-                    workOf = { it },
+                PagedWorkGrid(
+                    items = pagedWorks,
                     imageOf = { it.coverId?.let { id -> WhispImage.Asset(id) } },
                     onClick = { open(it.id) },
                     state = grid,

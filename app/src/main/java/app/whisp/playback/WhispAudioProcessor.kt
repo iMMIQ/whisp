@@ -93,53 +93,73 @@ class WhispAudioProcessor : BaseAudioProcessor() {
     ) {
         if (channels == 2) {
             val frames = input.remaining() / 4
-            val sampleCount = frames * 2
-            if (sampleCount > 0) {
-                if (pcm16Scratch.size < sampleCount) pcm16Scratch = ShortArray(sampleCount)
-                val samples = pcm16Scratch
-                val inShorts = input.asShortBuffer()
-                inShorts.get(samples, 0, sampleCount)
-                input.position(input.position() + sampleCount * 2)
-                if (!night) {
-                    // Bit-exact integer fast path on contiguous array without float roundtrip.
-                    var i = 0
-                    if (mono) {
-                        while (i < sampleCount) {
-                            val m = ((samples[i].toInt() + samples[i + 1].toInt()) / 2).toShort()
-                            samples[i] = m
-                            samples[i + 1] = m
-                            i += 2
-                        }
-                    } else if (swap) {
-                        while (i < sampleCount) {
-                            val tmp = samples[i]
-                            samples[i] = samples[i + 1]
-                            samples[i + 1] = tmp
-                            i += 2
-                        }
-                    }
+            if (frames > 0) {
+                if (DspNative.available && input.isDirect && output.isDirect) {
+                    envelope =
+                        DspNative.processPcm16Stereo(
+                            input = input,
+                            inPos = input.position(),
+                            output = output,
+                            outPos = output.position(),
+                            frames = frames,
+                            swap = swap,
+                            mono = mono,
+                            night = night,
+                            attackCoeff = attackCoeff,
+                            releaseCoeff = releaseCoeff,
+                            initialEnvelope = envelope,
+                        )
+                    val byteLen = frames * 4
+                    input.position(input.position() + byteLen)
+                    output.position(output.position() + byteLen)
                 } else {
-                    var i = 0
-                    while (i < sampleCount) {
-                        var l = samples[i] * INV_PCM16
-                        var r = samples[i + 1] * INV_PCM16
+                    val sampleCount = frames * 2
+                    if (pcm16Scratch.size < sampleCount) pcm16Scratch = ShortArray(sampleCount)
+                    val samples = pcm16Scratch
+                    input.asShortBuffer().get(samples, 0, sampleCount)
+                    input.position(input.position() + sampleCount * 2)
+                    if (!night) {
+                        // Bit-exact integer fast path on contiguous array without float roundtrip.
+                        var i = 0
                         if (mono) {
-                            val m = (l + r) * 0.5f
-                            l = m
-                            r = m
+                            while (i < sampleCount) {
+                                val m =
+                                    ((samples[i].toInt() + samples[i + 1].toInt()) / 2).toShort()
+                                samples[i] = m
+                                samples[i + 1] = m
+                                i += 2
+                            }
                         } else if (swap) {
-                            val tmp = l
-                            l = r
-                            r = tmp
+                            while (i < sampleCount) {
+                                val tmp = samples[i]
+                                samples[i] = samples[i + 1]
+                                samples[i + 1] = tmp
+                                i += 2
+                            }
                         }
-                        val gain = computeNightGain(max(abs(l), abs(r)))
-                        samples[i] = floatToPcm16(softClip(l * gain))
-                        samples[i + 1] = floatToPcm16(softClip(r * gain))
-                        i += 2
+                    } else {
+                        var i = 0
+                        while (i < sampleCount) {
+                            var l = samples[i] * INV_PCM16
+                            var r = samples[i + 1] * INV_PCM16
+                            if (mono) {
+                                val m = (l + r) * 0.5f
+                                l = m
+                                r = m
+                            } else if (swap) {
+                                val tmp = l
+                                l = r
+                                r = tmp
+                            }
+                            val gain = computeNightGain(max(abs(l), abs(r)))
+                            samples[i] = floatToPcm16(softClip(l * gain))
+                            samples[i + 1] = floatToPcm16(softClip(r * gain))
+                            i += 2
+                        }
                     }
+                    output.asShortBuffer().put(samples, 0, sampleCount)
+                    output.position(output.position() + sampleCount * 2)
                 }
-                output.asShortBuffer().put(samples, 0, sampleCount)
-                output.position(output.position() + sampleCount * 2)
             }
             while (input.hasRemaining()) output.put(input.get())
             return
@@ -178,36 +198,58 @@ class WhispAudioProcessor : BaseAudioProcessor() {
     ) {
         if (channels == 2) {
             val frames = input.remaining() / 8
-            val sampleCount = frames * 2
-            if (sampleCount > 0) {
-                if (pcmFloatScratch.size < sampleCount) pcmFloatScratch = FloatArray(sampleCount)
-                val samples = pcmFloatScratch
-                input.asFloatBuffer().get(samples, 0, sampleCount)
-                input.position(input.position() + sampleCount * 4)
-                var i = 0
-                while (i < sampleCount) {
-                    var l = samples[i]
-                    var r = samples[i + 1]
-                    if (mono) {
-                        val m = (l + r) * 0.5f
-                        l = m
-                        r = m
-                    } else if (swap) {
-                        val tmp = l
-                        l = r
-                        r = tmp
+            if (frames > 0) {
+                if (DspNative.available && input.isDirect && output.isDirect) {
+                    envelope =
+                        DspNative.processPcmFloatStereo(
+                            input = input,
+                            inPos = input.position(),
+                            output = output,
+                            outPos = output.position(),
+                            frames = frames,
+                            swap = swap,
+                            mono = mono,
+                            night = night,
+                            attackCoeff = attackCoeff,
+                            releaseCoeff = releaseCoeff,
+                            initialEnvelope = envelope,
+                        )
+                    val byteLen = frames * 8
+                    input.position(input.position() + byteLen)
+                    output.position(output.position() + byteLen)
+                } else {
+                    val sampleCount = frames * 2
+                    if (pcmFloatScratch.size < sampleCount) {
+                        pcmFloatScratch = FloatArray(sampleCount)
                     }
-                    if (night) {
-                        val gain = computeNightGain(max(abs(l), abs(r)))
-                        l = softClip(l * gain)
-                        r = softClip(r * gain)
+                    val samples = pcmFloatScratch
+                    input.asFloatBuffer().get(samples, 0, sampleCount)
+                    input.position(input.position() + sampleCount * 4)
+                    var i = 0
+                    while (i < sampleCount) {
+                        var l = samples[i]
+                        var r = samples[i + 1]
+                        if (mono) {
+                            val m = (l + r) * 0.5f
+                            l = m
+                            r = m
+                        } else if (swap) {
+                            val tmp = l
+                            l = r
+                            r = tmp
+                        }
+                        if (night) {
+                            val gain = computeNightGain(max(abs(l), abs(r)))
+                            l = softClip(l * gain)
+                            r = softClip(r * gain)
+                        }
+                        samples[i] = l
+                        samples[i + 1] = r
+                        i += 2
                     }
-                    samples[i] = l
-                    samples[i + 1] = r
-                    i += 2
+                    output.asFloatBuffer().put(samples, 0, sampleCount)
+                    output.position(output.position() + sampleCount * 4)
                 }
-                output.asFloatBuffer().put(samples, 0, sampleCount)
-                output.position(output.position() + sampleCount * 4)
             }
             while (input.hasRemaining()) output.put(input.get())
             return

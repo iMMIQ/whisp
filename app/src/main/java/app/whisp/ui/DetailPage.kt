@@ -2,8 +2,6 @@
 package app.whisp.ui
 
 import android.content.Intent
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -12,15 +10,11 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -29,13 +23,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
@@ -43,143 +35,9 @@ import androidx.media3.exoplayer.offline.Download
 import app.whisp.AppGraph
 import app.whisp.R
 import app.whisp.data.*
-import java.util.LinkedHashMap
 import java.util.Locale
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-
-/** Bounded LRU cache and per-work-part request deduplication for DLsite detail tabs. */
-class DlsiteDetailsLoader(
-    private val scope: CoroutineScope,
-    private val library: LibraryStore,
-    private val defaultClient: DlsiteClient,
-) {
-    companion object {
-        private const val MAX_ENTRIES = 6
-        private const val PRODUCT_TTL_MS = 7L * 24 * 60 * 60 * 1000
-        private const val STATS_TTL_MS = 24L * 60 * 60 * 1000
-
-        fun isFresh(
-            cached: DlsiteDetails?,
-            part: String,
-            now: Long = System.currentTimeMillis(),
-        ): Boolean {
-            if (cached == null) return false
-            return when (part) {
-                "product" ->
-                    cached.completeProduct && now - cached.productFetchedAt < PRODUCT_TTL_MS
-                "description" -> cached.descriptionFetchedAt > 0
-                "statistics" ->
-                    cached.statistics != null && now - cached.statistics.fetchedAt < STATS_TTL_MS
-                else -> false
-            }
-        }
-    }
-
-    val states = MutableStateFlow<Map<String, DlsiteUiState>>(emptyMap())
-    private val cache = LinkedHashMap<String, DlsiteUiState>(MAX_ENTRIES + 1, 0.75f, true)
-    private val activeJobs = mutableMapOf<Pair<String, String>, Job>()
-
-    fun accept(workId: String, details: DlsiteDetails) {
-        val current = cache[workId]
-        val merged = details.preserving(current?.details)
-        put(workId, (current ?: DlsiteUiState()).copy(details = merged))
-    }
-
-    fun load(
-        workId: String,
-        rj: String,
-        part: String = "product",
-        seed: DlsiteDetails? = null,
-        force: Boolean = false,
-        client: DlsiteClient = defaultClient,
-    ) {
-        val key = workId to part
-        if (activeJobs[key]?.isActive == true) return
-        val existing = cache[workId]
-        val baseline = existing?.details ?: seed
-        if (seed != null && existing?.details == null) {
-            put(workId, (existing ?: DlsiteUiState()).copy(details = seed))
-        }
-        if (!force && isFresh(baseline, part)) return
-        put(
-            workId,
-            (cache[workId] ?: DlsiteUiState(baseline)).let {
-                it.copy(loading = it.loading + part, errors = it.errors - part)
-            },
-        )
-        val job =
-            scope.launch(start = CoroutineStart.LAZY) {
-                try {
-                    val stored = library.readDlsiteDetails(workId)
-                    val mergedSeed =
-                        (cache[workId]?.details ?: seed).let { current ->
-                            stored?.preserving(current) ?: current
-                        }
-                    if (!force && isFresh(mergedSeed, part)) {
-                        if (mergedSeed != null && cache.containsKey(workId)) {
-                            put(workId, cache[workId]!!.copy(details = mergedSeed))
-                        }
-                        return@launch
-                    }
-                    val fetched: DlsiteDetails =
-                        withContext(Dispatchers.IO) {
-                            when (part) {
-                                "description" ->
-                                    DlsiteDetails(
-                                        rj = rj,
-                                        description = client.description(rj),
-                                        descriptionFetchedAt = System.currentTimeMillis(),
-                                    )
-                                "statistics" ->
-                                    DlsiteDetails(rj = rj, statistics = client.statistics(rj))
-                                else -> client.work(rj).details
-                            }
-                        }
-                    val combined = fetched.preserving(cache[workId]?.details ?: mergedSeed)
-                    library.saveDlsiteDetails(workId, combined)
-                    val me = currentCoroutineContext()[Job]
-                    if (activeJobs[key] === me && cache.containsKey(workId)) {
-                        put(workId, cache[workId]!!.copy(details = combined))
-                    }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    val me = currentCoroutineContext()[Job]
-                    if (activeJobs[key] === me && cache.containsKey(workId)) {
-                        put(
-                            workId,
-                            cache[workId]!!.let {
-                                it.copy(errors = it.errors + (part to (e.message ?: "读取失败")))
-                            },
-                        )
-                    }
-                } finally {
-                    val me = currentCoroutineContext()[Job]
-                    if (activeJobs[key] === me) {
-                        activeJobs.remove(key)
-                        cache[workId]?.let { put(workId, it.copy(loading = it.loading - part)) }
-                    }
-                }
-            }
-        activeJobs[key] = job
-        job.start()
-    }
-
-    private fun put(workId: String, state: DlsiteUiState) {
-        cache[workId] = state
-        while (cache.size > MAX_ENTRIES) {
-            val evicted = cache.entries.iterator().next().key
-            cache.remove(evicted)
-            activeJobs.keys
-                .filter { it.first == evicted }
-                .forEach { key ->
-                    activeJobs.remove(key)?.cancel()
-                }
-        }
-        states.value = cache.toMap()
-    }
-}
 
 sealed interface WorkDetailTarget {
     data class Library(val workId: String) : WorkDetailTarget
@@ -1048,273 +906,6 @@ internal fun WorkDetailScreen(
             item.kind == "document" || item.fileName.endsWith(".pdf", ignoreCase = true) ->
                 PdfViewerDialog(item, graph) { attachment = null }
             else -> AttachmentDialog(item, graph) { attachment = null }
-        }
-    }
-}
-
-@Composable
-private fun ResourceRow(title: String, icon: ImageVector, click: () -> Unit) {
-    Row(
-        Modifier.fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 3.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(14.dp))
-            .clickable(onClick = click)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(icon, null, tint = Rose.copy(alpha = 0.85f), modifier = Modifier.size(20.dp))
-        Text(
-            title,
-            style = MaterialTheme.typography.bodyMedium,
-            color = Cream,
-            fontSize = 15.sp,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f).padding(horizontal = 14.dp),
-        )
-        Icon(WhispIcons.Outlined.ChevronRight, null, tint = Muted, modifier = Modifier.size(18.dp))
-    }
-}
-
-@Composable
-private fun AttachmentDialog(
-    attachment: AttachmentEntity,
-    graph: AppGraph,
-    dismiss: () -> Unit,
-) {
-    val settings by graph.settings.settings.collectAsStateWithLifecycle()
-    var encoding by remember(attachment.id) { mutableStateOf(settings.textEncoding) }
-    var rawBytes by remember(attachment.id) { mutableStateOf<ByteArray?>(null) }
-    var chunks by remember(attachment.id) { mutableStateOf<List<String>?>(null) }
-    var loading by remember(attachment.id) { mutableStateOf(true) }
-    LaunchedEffect(attachment.id) {
-        try {
-            rawBytes = graph.library.readAsset(attachment.id, 64 * 1024 * 1024)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            graph.messages.tryEmit(e.message ?: "附件不可读")
-            dismiss()
-        } finally {
-            loading = false
-        }
-    }
-    LaunchedEffect(rawBytes, encoding) {
-        val bytes = rawBytes ?: return@LaunchedEffect
-        chunks =
-            withContext(Dispatchers.Default) {
-                chunkLongText(TextEncoding.decode(bytes, encoding))
-            }
-    }
-    WhispSheet(onDismissRequest = dismiss) { _ ->
-        Text(
-            attachment.title,
-            style = MaterialTheme.typography.titleLarge,
-            color = Cream,
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
-        )
-        if (rawBytes != null) {
-            EncodingChips(
-                selected = encoding,
-                onSelect = { encoding = it },
-                horizontalPadding = 24.dp,
-            )
-        }
-        if (loading) {
-            Box(Modifier.fillMaxWidth().padding(36.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = Rose)
-            }
-        }
-        chunks?.let { parts ->
-            LazyColumn(
-                modifier = Modifier.fillMaxWidth().heightIn(max = 550.dp),
-                contentPadding = PaddingValues(24.dp),
-            ) {
-                itemsIndexed(parts, key = { idx, _ -> idx }) { _, chunk ->
-                    Text(
-                        chunk,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = Cream,
-                        lineHeight = 28.sp,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            }
-        }
-        Spacer(Modifier.navigationBarsPadding())
-    }
-}
-
-@Composable
-private fun InfoDialog(
-    detail: WorkDetails,
-    graph: AppGraph,
-    onRemoved: () -> Unit,
-    dismiss: () -> Unit,
-) {
-    var title by rememberSaveable(detail.work.id) { mutableStateOf(detail.work.title) }
-    var artist by rememberSaveable(detail.work.id) { mutableStateOf(detail.work.artist) }
-    var confirmingRemoval by rememberSaveable(detail.work.id) { mutableStateOf(false) }
-    var loading by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-    val cover =
-        rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-            uri?.let {
-                scope.launch {
-                    runCatching { graph.offline.setCover(detail.work, it) }
-                        .onFailure { err -> graph.messages.tryEmit(err.message ?: "更换封面失败") }
-                }
-            }
-        }
-    if (confirmingRemoval) {
-        WhispConfirmDialog(
-            title = "删除作品",
-            message = "删除该作品及其下载、书签和播放进度。",
-            confirmLabel = if (loading) "删除中" else "删除",
-            busy = loading,
-            onConfirm = {
-                loading = true
-                scope.launch {
-                    try {
-                        graph.sync.removeOnlineWork(detail.work.id)
-                        dismiss()
-                        onRemoved()
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        graph.messages.tryEmit(e.message ?: "删除失败")
-                    } finally {
-                        loading = false
-                    }
-                }
-            },
-            onDismiss = { confirmingRemoval = false },
-        )
-        return
-    }
-    WhispSheet(onDismissRequest = dismiss) { close ->
-        Column(
-            Modifier.fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 24.dp)
-                .navigationBarsPadding()
-                .imePadding(),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    stringResource(R.string.action_work_info),
-                    style = MaterialTheme.typography.headlineSmall,
-                    color = Cream,
-                    modifier = Modifier.weight(1f),
-                )
-                detail.work.rj?.let {
-                    Text(
-                        it,
-                        color = Muted,
-                        style = MaterialTheme.typography.labelLarge.merge(TabularNumeralStyle),
-                    )
-                }
-            }
-            OutlinedTextField(
-                value = title,
-                onValueChange = { title = it },
-                label = { Text("作品名") },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(14.dp),
-            )
-            OutlinedTextField(
-                value = artist,
-                onValueChange = { artist = it },
-                label = { Text("声优") },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(14.dp),
-            )
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                OutlinedButton(
-                    onClick = {
-                        cover.launch(
-                            androidx.activity.result.PickVisualMediaRequest(
-                                ActivityResultContracts.PickVisualMedia.ImageOnly,
-                            ),
-                        )
-                    },
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(12.dp),
-                ) {
-                    Text("更换封面")
-                }
-                if (detail.work.rj != null) {
-                    OutlinedButton(
-                        enabled = !loading,
-                        onClick = {
-                            loading = true
-                            scope.launch {
-                                try {
-                                    graph.sync.updateDlsiteMetadata(detail.work.id)
-                                } catch (e: CancellationException) {
-                                    throw e
-                                } catch (e: Exception) {
-                                    graph.messages.tryEmit(e.message ?: "元数据更新失败")
-                                } finally {
-                                    loading = false
-                                }
-                            }
-                        },
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(12.dp),
-                    ) {
-                        Text(if (loading) "读取中" else "更新 DLsite 元数据", maxLines = 1)
-                    }
-                }
-            }
-            if (detail.work.isRemovableOnline) {
-                OutlinedButton(
-                    enabled = !loading,
-                    onClick = { confirmingRemoval = true },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                ) {
-                    Text("删除作品", color = MaterialTheme.colorScheme.error)
-                }
-            }
-            Row(
-                Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                OutlinedButton(
-                    onClick = close,
-                    modifier = Modifier.weight(1f).height(48.dp),
-                    shape = RoundedCornerShape(14.dp),
-                ) {
-                    Text("取消")
-                }
-                Button(
-                    onClick = {
-                        val nextTitle = title.ifBlank { detail.work.title }
-                        val nextArtist = artist
-                        graph.scope.launch {
-                            runCatching {
-                                graph.library.editWorkIdentity(
-                                    detail.work.id,
-                                    nextTitle,
-                                    nextArtist,
-                                )
-                            }
-                        }
-                        close()
-                    },
-                    modifier = Modifier.weight(1f).height(48.dp),
-                    shape = RoundedCornerShape(14.dp),
-                ) {
-                    Text("保存", fontWeight = FontWeight.SemiBold)
-                }
-            }
         }
     }
 }

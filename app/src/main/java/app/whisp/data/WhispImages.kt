@@ -3,7 +3,7 @@ package app.whisp.data
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.os.Build
 import android.util.LruCache
 import coil3.ImageLoader
@@ -232,18 +232,26 @@ class WhispImages(
     }
 
     private fun decodeThumbnail(path: String): ByteArray? {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(path, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        val options =
-            BitmapFactory.Options().apply {
-                inSampleSize = 1
-                inPreferredConfig = Bitmap.Config.RGB_565
+        val file = File(path)
+        if (!file.isFile) return null
+        val bitmap =
+            runCatching {
+                ImageDecoder.decodeBitmap(ImageDecoder.createSource(file)) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    decoder.memorySizePolicy = ImageDecoder.MEMORY_POLICY_LOW_RAM
+                    val w = info.size.width
+                    val h = info.size.height
+                    val longest = maxOf(w, h)
+                    if (longest > 320 && w > 0 && h > 0) {
+                        val scale = 320f / longest.toFloat()
+                        decoder.setTargetSize(
+                            (w * scale).toInt().coerceAtLeast(1),
+                            (h * scale).toInt().coerceAtLeast(1),
+                        )
+                    }
+                }
             }
-        while (maxOf(bounds.outWidth, bounds.outHeight) / options.inSampleSize > 320) {
-            options.inSampleSize *= 2
-        }
-        val bitmap = BitmapFactory.decodeFile(path, options) ?: return null
+                .getOrNull() ?: return null
         return try {
             val output = ByteArrayOutputStream()
             @Suppress("DEPRECATION")

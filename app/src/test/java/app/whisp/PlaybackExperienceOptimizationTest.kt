@@ -249,6 +249,67 @@ class PlaybackExperienceOptimizationTest {
     }
 
     @Test
+    fun smbClientRetriesReadOnBrokenConnectionAndDetectsFileLengthChange() {
+        val source = SourceEntity("smb-retry", "NAS", "smb", "smb://nas.example/media/", "user")
+        val uri = SmbAddress.assetUri(source.id, "01.wav")
+        var sessionCount = 0
+        var failFirstRead = true
+        var secondLength = 4L
+        val client =
+            SmbClient(
+                connect = { _, _, _ ->
+                    val id = ++sessionCount
+                    object : SmbSession {
+                        override fun list(path: String) = emptyList<SmbEntry>()
+
+                        override fun open(path: String) =
+                            object : RemoteReadHandle {
+                                override val length: Long = if (id == 1) 4L else secondLength
+
+                                override fun read(
+                                    buffer: ByteArray,
+                                    offset: Long,
+                                    bufferOffset: Int,
+                                    count: Int,
+                                ): Int {
+                                    if (id == 1 && failFirstRead) {
+                                        failFirstRead = false
+                                        throw IOException("SMB reset")
+                                    }
+                                    val data = byteArrayOf(11, 12, 13, 14)
+                                    val n = minOf(count, (4L - offset).toInt())
+                                    System.arraycopy(data, offset.toInt(), buffer, bufferOffset, n)
+                                    return n
+                                }
+
+                                override fun close() {}
+                            }
+
+                        override fun close() {}
+                    }
+                },
+                idleTimeoutMs = 30_000L,
+            )
+
+        assertArrayEquals(byteArrayOf(11, 12, 13, 14), client.bytes(uri, source, "pass", 1024))
+        assertEquals(2, sessionCount)
+        client.closeIdle()
+
+        sessionCount = 0
+        failFirstRead = true
+        secondLength = 8L
+        val handle = client.open(source, "pass", uri)
+        try {
+            handle.read(ByteArray(4), 0L, 0, 4)
+            fail("Expected length mismatch IOException")
+        } catch (e: IOException) {
+            assertTrue(e.message?.contains("文件已改变") == true)
+        } finally {
+            handle.close()
+        }
+    }
+
+    @Test
     fun typedSettingsStorePersistsGlobalSettingsProfilesAndSearchHistory() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         try {

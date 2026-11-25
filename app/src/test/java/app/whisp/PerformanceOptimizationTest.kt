@@ -228,6 +228,28 @@ class PerformanceOptimizationTest {
             assertTrue("index_progress_updatedAt" in indexes)
             assertTrue("index_bookmarks_positionMs" in indexes)
 
+            // SQL-side Paging 3 query honors filter and sort modes directly inside SQLite.
+            val pagingSource =
+                dao.pagingWorks(
+                    hasOrphanOffline = false,
+                    orphanOfflineIds = listOf(""),
+                    favoriteOnly = false,
+                    offlineOnly = false,
+                    series = null,
+                    filterByIds = false,
+                    matchedIds = listOf(""),
+                    sort = app.whisp.data.LibrarySort.TITLE_DESC,
+                )
+            val loaded =
+                pagingSource.load(
+                    androidx.paging.PagingSource.LoadParams.Refresh(
+                        key = null,
+                        loadSize = 20,
+                        placeholdersEnabled = false,
+                    ),
+                ) as androidx.paging.PagingSource.LoadResult.Page
+            assertEquals(listOf("w2", "w1"), loaded.data.map { it.id })
+
             dao.deleteWork("w1")
             assertNull(dao.trackState("t1"))
         } finally {

@@ -5,6 +5,9 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import androidx.media3.common.util.UnstableApi
+import androidx.paging.Pager
+import androidx.paging.PagingConfig
+import androidx.paging.PagingData
 import androidx.room.withTransaction
 import java.io.File
 import java.io.IOException
@@ -64,18 +67,59 @@ class LibraryStore(
     val works: StateFlow<List<WorkEntity>> by lazy {
         combine(
                 dao.observeWorks(),
-                dao.observeOrphanTrackWorkPairs(),
-                media.completedDownloads,
-            ) { allWorks, orphanTrackPairs, completed ->
-                val offlineWorkIds =
-                    if (orphanTrackPairs.isEmpty() || completed.isEmpty()) emptySet()
-                    else orphanTrackPairs.filter { it.id in completed }.map { it.workId }.toSet()
+                orphanOfflineWorkIds,
+            ) { allWorks, offlineWorkIds ->
                 allWorks.filter { work ->
                     work.sourceId != null || work.offlineAttachments || work.id in offlineWorkIds
                 }
             }
             .distinctUntilChanged()
-            .stateIn(scope, SharingStarted.Eagerly, emptyList())
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+    }
+
+    val orphanOfflineWorkIds: StateFlow<Set<String>> by lazy {
+        combine(dao.observeOrphanTrackWorkPairs(), media.completedDownloads) {
+                orphanTrackPairs,
+                completed ->
+                if (orphanTrackPairs.isEmpty() || completed.isEmpty()) emptySet()
+                else orphanTrackPairs.filter { it.id in completed }.map { it.workId }.toSet()
+            }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptySet())
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun pagedWorks(
+        favoriteOnly: Boolean,
+        offlineOnly: Boolean,
+        series: String?,
+        matchedIds: Set<String>?,
+        sort: String,
+    ): Flow<PagingData<WorkEntity>> = orphanOfflineWorkIds.flatMapLatest { orphanIds ->
+        val orphanList = orphanIds.toList()
+        val idList = matchedIds?.toList().orEmpty()
+        Pager(
+                config =
+                    PagingConfig(
+                        pageSize = 40,
+                        initialLoadSize = 60,
+                        prefetchDistance = 20,
+                        enablePlaceholders = false,
+                    ),
+                pagingSourceFactory = {
+                    dao.pagingWorks(
+                        hasOrphanOffline = orphanList.isNotEmpty(),
+                        orphanOfflineIds = orphanList.ifEmpty { listOf("") },
+                        favoriteOnly = favoriteOnly,
+                        offlineOnly = offlineOnly,
+                        series = series,
+                        filterByIds = matchedIds != null,
+                        matchedIds = idList.ifEmpty { listOf("") },
+                        sort = sort,
+                    )
+                },
+            )
+            .flow
     }
 
     val progress: StateFlow<List<ProgressEntity>> by lazy {

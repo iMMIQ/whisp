@@ -26,6 +26,3 @@ object MediaFormats {
             else -> null
         }
 }
-
-val TrackEntity.isVideo: Boolean
-    get() = MediaFormats.isVideo(fileName)

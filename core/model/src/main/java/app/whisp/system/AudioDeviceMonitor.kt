@@ -30,7 +30,7 @@ data class AudioOutputSnapshot(
         get() = !hasExternalOutput
 }
 
-internal data class AudioDeviceDescriptor(val type: Int, val productName: String)
+data class AudioDeviceDescriptor(val type: Int, val productName: String)
 
 /**
  * Observes Android audio output routes via [AudioManager.registerAudioDeviceCallback] without
@@ -89,7 +89,7 @@ class AudioDeviceMonitor(private val context: Context) {
     }
 
     companion object {
-        internal fun classifyExternalKind(type: Int): AudioOutputKind? =
+        fun classifyExternalKind(type: Int): AudioOutputKind? =
             when (type) {
                 AudioDeviceInfo.TYPE_WIRED_HEADSET,
                 AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> AudioOutputKind.WIRED_HEADSET
@@ -136,7 +136,7 @@ class AudioDeviceMonitor(private val context: Context) {
                 AudioOutputKind.SPEAKER -> "手机扬声器"
             }
 
-        internal fun resolveSnapshot(devices: List<AudioDeviceDescriptor>): AudioOutputSnapshot {
+        fun resolveSnapshot(devices: List<AudioDeviceDescriptor>): AudioOutputSnapshot {
             val external =
                 devices
                     .mapNotNull { descriptor ->

@@ -51,15 +51,15 @@ flowchart TD
 
 ### 核心包与职责
 
-| 包 / 模块 | 代表文件 | 主要职责 |
+| 模块 / 包 | 代表文件 | 主要职责 |
 | --- | --- | --- |
-| `app.whisp` | `WhispApp.kt`, `MainActivity.kt`, `DlsiteLoginActivity.kt` | `AppGraph` 依赖装配、画中画（PiP）、Android 13+ 后台多任务隐私保护、DLsite 官方登录容器 |
-| `app.whisp.data` | `LibraryDatabase.kt`, `LibraryStore.kt`, `LibraryIndexer.kt`, `LibrarySync.kt`, `OfflineStore.kt` | Room 持久化、目录与作品识别、跨来源稳定 ID、后台扫描（WorkManager）与离线资源管理 |
-| `app.whisp.data`（传输与来源） | `SourceRegistry.kt`, `Sources.kt`, `SmbClient.kt`, `NfsClient.kt`, `RemoteTransport.kt`, `MediaSourceRouting.kt` | 本地 SAF、SMB、NFS、WebDAV、ASMR.ONE、DLsite 的统一路由、认证与流式缓存 |
-| `app.whisp.data`（字幕与文本） | `SubtitleTimeline.kt`, `TextEncoding.kt`, `TrackSections.kt`, `MediaFormats.kt` | VTT / LRC / SRT 解析、多编码自动检测、多语字幕候选匹配与录音版本/正篇附赠分组 |
-| `app.whisp.playback` | `PlaybackService.kt`, `PlaybackCoordinator.kt`, `PlaybackControllers.kt`, `WhispAudioProcessor.kt`, `OfflineService.kt` | `MediaLibraryService`、ExoPlayer 生命周期、音频 DSP、硬件卸载、A–B 循环、睡眠定时与系统续播 |
-| `app.whisp.ui` | `WhispRoot.kt`, `WhispRoute.kt`, `LibraryPage.kt`, `DetailPage.kt`, `PlayerPage.kt`, `VideoPlayer.kt`, `PrecisionSeekBar.kt` | Jetpack Compose 界面、Navigation 3 顶层标签独立返回栈、精细拖动进度条、视频全屏手势与共享元素转场 |
-| `app/src/main/cpp` | `CMakeLists.txt`, `nfs_bridge.cpp`, `nfs_bridge_test.cpp` | `libnfs 8.0.0` 原生构建、JNI 只读桥接层与主机端 ASan/UBSan 单元测试 |
+| `:core:model` | `MediaFormats.kt`, `TextEncoding.kt`, `DlsiteDetails.kt`, `SmbAddress.kt`, `NfsAddress.kt`, `AudioDeviceMonitor.kt`, `ShakeDetector.kt` | 纯领域模型、格式与编码解码、网络路径编解码与音频路由/传感器状态机 |
+| `:core:native` | `CMakeLists.txt`, `nfs_bridge.cpp`, `smb_bridge.cpp`, `dsp_bridge.cpp`, `NfsNative.kt`, `SmbNative.kt`, `DspNative.kt` | `libnfs 8.0.0`、`libsmb2 7.0.0` 与 ARM64 NEON 音频 DSP 原生库、无 STL JNI 桥接与 ASan/UBSan 主机测试 |
+| `:app`（入口） | `WhispApp.kt`, `MainActivity.kt`, `DlsiteLoginActivity.kt` | 懒加载 `AppGraph` 依赖装配、画中画（PiP）、后台多任务隐私保护、DLsite 官方登录容器 |
+| `:app`（数据与传输） | `LibraryDatabase.kt`, `LibraryStore.kt`, `LibrarySync.kt`, `SmbClient.kt`, `NfsClient.kt`, `MediaSourceRouting.kt` | Room v1（FTS4 + Paging 3 + `track_state`）、类型化 DataStore、原生 SMB/NFS 连接池与离线存储 |
+| `:app`（播放） | `PlaybackService.kt`, `PlaybackCoordinator.kt`, `PlaybackControllers.kt`, `WhispAudioProcessor.kt`, `OfflineService.kt` | `MediaLibraryService`、ExoPlayer 生命周期、原生 NEON DSP、硬件卸载、A–B 循环、睡眠定时与系统续播 |
+| `:app`（界面） | `WhispRoot.kt`, `LibraryPage.kt`, `DetailPage.kt`, `PlayerPage.kt`, `PlayerControls.kt`, `PlayerSubtitlePane.kt`, `WhispIcons.kt` | Jetpack Compose 界面、Paging 3 分页网格、Navigation 3、本地精简矢量图标与共享元素转场 |
+| `:benchmark` | `BaselineProfileGenerator.kt`, `StartupBenchmark.kt` | AndroidX Macrobenchmark 冷启动基准测试与 Baseline Profile 自动采集模块 |
 
 ---
 
@@ -138,6 +138,6 @@ flowchart TD
 所有直接依赖版本统一维护在 [gradle/libs.versions.toml](../gradle/libs.versions.toml)，此处仅记录关键框架选型与约束：
 
 - **UI 与导航**：Jetpack Compose + Material 3（使用 `1.5.0-beta01` 公开的 `MotionScheme` 动效接口）+ Navigation 3（每个顶层标签页独立维护返回栈与滚动状态）+ Coil 3。
-- **媒体与后台**：AndroidX Media3（ExoPlayer、Session、OkHttp DataSource、UI Compose）+ WorkManager + Room + DataStore。
-- **网络与协议**：OkHttp 5 + Okio + kotlinx.serialization + Jsoup + SMBJ + `libnfs 8.0.0`。
+- **媒体与后台**：AndroidX Media3（ExoPlayer、Session、OkHttp DataSource、UI Compose）+ Paging 3 + WorkManager + Room + 类型化 DataStore + ProfileInstaller / Macrobenchmark。
+- **网络与协议**：OkHttp 5 + Okio + kotlinx.serialization + Jsoup + `libsmb2 7.0.0` + `libnfs 8.0.0`（无 SMBJ / BouncyCastle 依赖）。
 - **SDK 策略**：`compileSdk = 37`，`targetSdk = 36`，`minSdk = 28`，仅支持 64 位 ABI（`arm64-v8a` / `x86_64`），构建期开启 Kotlin `allWarningsAsErrors = true`。

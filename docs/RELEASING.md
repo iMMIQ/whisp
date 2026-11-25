@@ -60,7 +60,7 @@ python3 tools/check-public-content.py
 
 为满足 LGPL 分发义务（详见 [docs/NATIVE.md](NATIVE.md)）：
 
-1. 打包对应提交的完整项目源码归档，并在归档内 `third_party/libnfs/` 放入固定提交与校验值一致的完整 `libnfs 8.0.0` 源码。
+1. 打包对应提交的完整项目源码归档，并在归档内 `third_party/libnfs/` 与 `third_party/libsmb2/` 分别放入固定提交与校验值一致的完整 `libnfs 8.0.0` 与 `libsmb2 7.0.0` 源码。
 2. 为所有 APK 与源码归档生成 `SHA256SUMS` 校验文件：
 
 ```sh
@@ -93,5 +93,5 @@ sha256sum app/build/outputs/apk/release/*.apk <source-archive>.zip > SHA256SUMS
 | --- | --- |
 | 2 个 64 位分架构 Release APK（`arm64-v8a` / `x86_64`） | 供已知设备架构用户下载，体积更小 |
 | `app-universal-release.apk` | 覆盖全部 64 位 ABI 的通用安装包 |
-| 配套源码归档（含 `third_party/libnfs/`） | 满足 LGPL 源码分发与原生共享库独立重建要求 |
+| 配套源码归档（含 `third_party/libnfs/` 与 `third_party/libsmb2/`） | 满足 LGPL 源码分发与原生共享库独立重建要求 |
 | `SHA256SUMS` | 供用户校验所有安装包与源码归档完整性 |
