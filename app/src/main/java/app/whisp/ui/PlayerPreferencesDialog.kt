@@ -26,6 +26,8 @@ internal fun PlaybackPreferencesDialog(
     settings: Settings,
     currentSpeed: Float,
     trackOffsetMs: Long = 0L,
+    workVolumeDb: Float = 0f,
+    onWorkVolumeDbChange: ((Float) -> Unit)? = null,
     onTrackOffsetChange: ((Long) -> Unit)? = null,
     onSpeedChange: (Float) -> Unit,
     onUpdateSettings: ((Settings) -> Settings) -> Unit,
@@ -74,6 +76,30 @@ internal fun PlaybackPreferencesDialog(
                 tag = "audio-night-dynamics",
                 onCheckedChange = { onUpdateSettings { cur -> cur.copy(nightDynamics = it) } },
             )
+            if (settings.nightDynamics) {
+                val strengthOptions = listOf(1 to "轻柔", 2 to "标准", 3 to "强力")
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    strengthOptions.forEachIndexed { index, (level, label) ->
+                        SegmentedButton(
+                            selected = settings.nightDynamicsStrength == level,
+                            onClick = {
+                                haptics.tick()
+                                onUpdateSettings { it.copy(nightDynamicsStrength = level) }
+                            },
+                            shape = SegmentedButtonDefaults.itemShape(index, strengthOptions.size),
+                        ) {
+                            Text(label, style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
+            }
+            WhispToggleRow(
+                label = "低切降噪（80 Hz）",
+                subtitle = "过滤麦克风喷麦与低频底噪，保留人声自然质感",
+                checked = settings.highPassFilter,
+                tag = "audio-high-pass",
+                onCheckedChange = { onUpdateSettings { cur -> cur.copy(highPassFilter = it) } },
+            )
             WhispToggleRow(
                 label = "单声道合并",
                 subtitle = "侧睡单耳佩戴时听全双耳声音",
@@ -81,6 +107,76 @@ internal fun PlaybackPreferencesDialog(
                 tag = "audio-mono",
                 onCheckedChange = { onUpdateSettings { cur -> cur.copy(monoAudio = it) } },
             )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "左右声道平衡",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Muted,
+                    modifier = Modifier.weight(1f),
+                )
+                val balPct = (settings.stereoBalance * 100f).roundToInt()
+                Text(
+                    when {
+                        balPct < -1 -> "左 +${-balPct}%"
+                        balPct > 1 -> "右 +${balPct}%"
+                        else -> "居中"
+                    },
+                    style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                    color = if (abs(balPct) > 1) Rose else Muted,
+                )
+                if (abs(settings.stereoBalance) > 0.02f) {
+                    TextButton(
+                        onClick = {
+                            haptics.tick()
+                            onUpdateSettings { it.copy(stereoBalance = 0f) }
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) {
+                        Text("居中")
+                    }
+                }
+            }
+            SyncedSlider(
+                settings.stereoBalance,
+                -1f..1f,
+                onValueChange = { value ->
+                    val snapped = if (abs(value) < 0.04f) 0f else value
+                    onUpdateSettings { it.copy(stereoBalance = snapped) }
+                },
+            )
+            if (onWorkVolumeDbChange != null) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "本作品音量补偿",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Muted,
+                        modifier = Modifier.weight(1f),
+                    )
+                    val dbInt = workVolumeDb.roundToInt()
+                    Text(
+                        if (dbInt > 0) "+${dbInt} dB" else "${dbInt} dB",
+                        style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                        color = if (dbInt != 0) Rose else Muted,
+                    )
+                    if (abs(workVolumeDb) > 0.25f) {
+                        TextButton(
+                            onClick = {
+                                haptics.tick()
+                                onWorkVolumeDbChange(0f)
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        ) {
+                            Text("归零")
+                        }
+                    }
+                }
+                SyncedSlider(
+                    workVolumeDb,
+                    -12f..12f,
+                    steps = 23,
+                    onValueChange = { value -> onWorkVolumeDbChange(value.roundToInt().toFloat()) },
+                )
+            }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     "夜间精细音量",

@@ -1,20 +1,64 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.data
 
+object EditionPreference {
+    const val COMPACT_MP3 = "mp3"
+    const val LOSSLESS_FIRST = "lossless"
+    const val DEFAULT = "default"
+
+    val supported = listOf(COMPACT_MP3, LOSSLESS_FIRST, DEFAULT)
+}
+
 data class TrackSection(
     val key: String,
     val title: String,
     val bonus: Boolean,
     val tracks: List<TrackEntity>,
-)
+) {
+    val totalBytes: Long
+        get() = tracks.sumOf { it.size.coerceAtLeast(0L) }
+}
 
 data class QueuePosition(val index: Int, val positionMs: Long)
 
 /** Keep directory editions separate: equal names do not prove equal recordings. */
 object TrackSections {
     private val bonusFolder = Regex("附赠|特典|おまけ|omake|bonus|extra", RegexOption.IGNORE_CASE)
+    private val losslessHint = Regex("(?i)\\b(wav|flac|lossless|hi-?res)\\b|无损")
+    private val compactHint = Regex("(?i)\\b(mp3|aac|opus|m4a|ogg)\\b")
 
-    fun groups(tracks: List<TrackEntity>): List<TrackSection> {
+    private fun sectionFormatRank(section: TrackSection, preference: String): Int {
+        val title = section.title
+        val exts = section.tracks.mapTo(HashSet()) { MediaFormats.extension(it.fileName) }
+        val isLossless =
+            losslessHint.containsMatchIn(title) ||
+                (exts.isNotEmpty() && exts.all { it == "wav" || it == "flac" })
+        val isCompact =
+            title.equals("mp3", ignoreCase = true) ||
+                compactHint.containsMatchIn(title) ||
+                (exts.isNotEmpty() && exts.all { it in setOf("mp3", "m4a", "aac", "opus", "ogg") })
+        return when (preference) {
+            EditionPreference.LOSSLESS_FIRST ->
+                when {
+                    isLossless -> 0
+                    !isCompact -> 1
+                    else -> 2
+                }
+            EditionPreference.DEFAULT -> 0
+            else ->
+                when {
+                    title.equals("mp3", ignoreCase = true) -> 0
+                    isCompact -> 1
+                    !isLossless -> 2
+                    else -> 3
+                }
+        }
+    }
+
+    fun groups(
+        tracks: List<TrackEntity>,
+        preference: String = EditionPreference.COMPACT_MP3,
+    ): List<TrackSection> {
         val parents = tracks.map { it.relativePath.substringBeforeLast('/', "") }
         val components = parents.map { it.split('/').filter(String::isNotBlank) }
         val common =
@@ -46,11 +90,21 @@ object TrackSections {
                     rows.sortedWith(compareBy({ it.order }, { it.relativePath })),
                 )
             }
-            .sortedWith(compareBy({ it.bonus }, { it.title.lowercase() != "mp3" }, { it.key }))
+            .sortedWith(
+                compareBy<TrackSection>(
+                    { it.bonus },
+                    { sectionFormatRank(it, preference) },
+                    { it.key },
+                ),
+            )
     }
 
-    fun queue(tracks: List<TrackEntity>, selectedId: String? = null): List<TrackEntity> {
-        val sections = groups(tracks)
+    fun queue(
+        tracks: List<TrackEntity>,
+        selectedId: String? = null,
+        preference: String = EditionPreference.COMPACT_MP3,
+    ): List<TrackEntity> {
+        val sections = groups(tracks, preference)
         return (sections.firstOrNull { it.tracks.any { t -> t.id == selectedId } }
                 ?: sections.firstOrNull())
             ?.tracks

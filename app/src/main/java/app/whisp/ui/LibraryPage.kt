@@ -12,11 +12,14 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -35,12 +38,11 @@ import androidx.paging.LoadState
 import androidx.paging.compose.collectAsLazyPagingItems
 import app.whisp.AppGraph
 import app.whisp.R
-import app.whisp.data.LibrarySort
-import app.whisp.data.ProgressEntity
-import app.whisp.data.WhispImage
-import app.whisp.data.WorkEntity
+import app.whisp.data.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val librarySortOptions =
     listOf(
@@ -52,6 +54,14 @@ private val librarySortOptions =
         LibrarySort.OFFLINE_FIRST to "离线优先",
     )
 
+private val listenFilterOptions =
+    listOf(
+        ListenFilter.ALL to "全部状态",
+        ListenFilter.UNPLAYED to "未听",
+        ListenFilter.IN_PROGRESS to "在听",
+        ListenFilter.FINISHED to "已听完",
+    )
+
 @Composable
 internal fun LibraryPage(
     graph: AppGraph,
@@ -60,8 +70,12 @@ internal fun LibraryPage(
     open: (String) -> Unit,
     resumePlay: (String) -> Unit = open,
     sources: () -> Unit,
+    openPlayer: () -> Unit = {},
 ) {
-    val works by graph.library.works.collectAsStateWithLifecycle()
+    val visibleCount by graph.library.visibleWorkCount.collectAsStateWithLifecycle()
+    val seriesSummaries by graph.library.seriesSummaries.collectAsStateWithLifecycle()
+    val playlists by graph.library.playlists.collectAsStateWithLifecycle()
+    val sourceList by graph.library.sourceList.collectAsStateWithLifecycle()
     val progressList by graph.library.progress.collectAsStateWithLifecycle()
     val progressSummaries by graph.library.workProgressSummaries.collectAsStateWithLifecycle()
     val settings by graph.settings.settings.collectAsStateWithLifecycle()
@@ -69,12 +83,28 @@ internal fun LibraryPage(
     var series by rememberSaveable { mutableStateOf<String?>(null) }
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
+    var debouncedQuery by remember { mutableStateOf("") }
     var sortSheet by rememberSaveable { mutableStateOf(false) }
-    var matchedIds by remember { mutableStateOf<Set<String>?>(null) }
+    var filterSheet by rememberSaveable { mutableStateOf(false) }
+    var filterSourceId by rememberSaveable { mutableStateOf<String?>(null) }
+    var filterListen by rememberSaveable { mutableStateOf(ListenFilter.ALL) }
+    var filterSubtitlesOnly by rememberSaveable { mutableStateOf(false) }
+    var filterArtist by rememberSaveable { mutableStateOf("") }
+    var filterTag by rememberSaveable { mutableStateOf("") }
+    var activePlaylistId by rememberSaveable { mutableStateOf<String?>(null) }
+    var creatingPlaylist by rememberSaveable { mutableStateOf(false) }
+    var newPlaylistName by rememberSaveable { mutableStateOf("") }
     val grid = rememberLazyGridState()
     val searchFocus = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
     val haptics = rememberWhispHaptics()
+
+    val hasAdvancedFilter =
+        filterSourceId != null ||
+            filterListen != ListenFilter.ALL ||
+            filterSubtitlesOnly ||
+            filterArtist.isNotBlank() ||
+            filterTag.isNotBlank()
 
     // Intercept system back for in-page series drilldown and search bar expansion.
     BackHandler(enabled = series != null) { series = null }
@@ -96,56 +126,72 @@ internal fun LibraryPage(
         }
     }
 
-    LaunchedEffect(query, works) {
+    LaunchedEffect(query) {
         if (query.isBlank()) {
-            matchedIds = null
+            debouncedQuery = ""
         } else {
-            delay(250L)
-            matchedIds = graph.library.searchWorkIds(query)
+            delay(200L)
+            debouncedQuery = query
         }
     }
 
-    val pagedWorksFlow =
-        remember(tab, series, matchedIds, settings.librarySort) {
-            graph.library.pagedWorks(
+    val activeFilter =
+        remember(
+            tab,
+            series,
+            filterSourceId,
+            filterListen,
+            filterSubtitlesOnly,
+            filterArtist,
+            filterTag,
+            debouncedQuery,
+        ) {
+            LibraryQueryFilter(
                 favoriteOnly = tab == "收藏",
                 offlineOnly = tab == "离线",
                 series = series,
-                matchedIds = matchedIds,
-                sort = settings.librarySort,
+                sourceId = filterSourceId,
+                artist = filterArtist.takeIf(String::isNotBlank),
+                tag = filterTag.takeIf(String::isNotBlank),
+                hasSubtitlesOnly = filterSubtitlesOnly,
+                listenFilter = filterListen,
+                query = debouncedQuery,
             )
         }
-    val pagedWorks = pagedWorksFlow.collectAsLazyPagingItems()
-    val seriesGroups =
-        remember(works, query, matchedIds) {
-            val trimmed = query.trim().lowercase()
-            val matched = matchedIds
-            works
-                .filter { !it.series.isNullOrBlank() }
-                .groupBy { it.series!! }
-                .entries
-                .filter { (seriesName, members) ->
-                    trimmed.isEmpty() ||
-                        matched == null ||
-                        seriesName.lowercase().contains(trimmed) ||
-                        members.any { it.id in matched }
-                }
-                .sortedBy { it.key }
-                .map { it.key to it.value }
+    val pagedWorksFlow =
+        remember(activeFilter, settings.librarySort) {
+            graph.library.pagedWorks(activeFilter, settings.librarySort)
         }
-    // Avoid duplicating the exact same item already pinned in MiniPlayer when only 1 recent item
-    // exists.
-    val latestResume =
-        remember(works, progressList, tab, series, query, activeMiniWorkId) {
-            if (tab != "全部" || series != null || query.isNotBlank()) null
-            else {
-                val candidate =
-                    progressList.firstOrNull { it.workId != activeMiniWorkId }
-                        ?: progressList.firstOrNull()?.takeIf { activeMiniWorkId == null }
-                        ?: return@remember null
-                val work = works.firstOrNull { it.id == candidate.workId } ?: return@remember null
-                work to candidate
-            }
+    val pagedWorks = pagedWorksFlow.collectAsLazyPagingItems()
+
+    val filteredSeries =
+        remember(seriesSummaries, debouncedQuery) {
+            val trimmed = debouncedQuery.trim().lowercase()
+            if (trimmed.isEmpty()) seriesSummaries
+            else seriesSummaries.filter { it.series.lowercase().contains(trimmed) }
+        }
+
+    // Resolve only the single continue-listening banner work instead of loading all works in RAM.
+    val latestResumeCandidate =
+        remember(progressList, tab, series, debouncedQuery, hasAdvancedFilter, activeMiniWorkId) {
+            if (tab != "全部" || series != null || debouncedQuery.isNotBlank() || hasAdvancedFilter)
+                null
+            else
+                progressList.firstOrNull { it.workId != activeMiniWorkId }
+                    ?: progressList.firstOrNull()?.takeIf { activeMiniWorkId == null }
+        }
+    val latestResume by
+        produceState<Pair<WorkEntity, ProgressEntity>?>(null, latestResumeCandidate) {
+            val candidate = latestResumeCandidate
+            value =
+                if (candidate == null) null
+                else
+                    withContext(Dispatchers.IO) {
+                        val w = graph.library.dao.work(candidate.workId)
+                        if (w != null && (w.sourceId != null || w.offlineAttachments))
+                            w to candidate
+                        else null
+                    }
         }
 
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
@@ -172,6 +218,14 @@ internal fun LibraryPage(
                 if (!searching) query = ""
             }
             IconAction(
+                WhispIcons.Outlined.Tune,
+                "筛选作品",
+                tint = if (hasAdvancedFilter) Rose else Cream,
+                haptic = HapticKind.Tick,
+            ) {
+                filterSheet = true
+            }
+            IconAction(
                 WhispIcons.Outlined.SwapVert,
                 stringResource(R.string.action_toggle_order),
                 tint = if (settings.librarySort != LibrarySort.ADDED_DESC) Rose else Cream,
@@ -188,14 +242,21 @@ internal fun LibraryPage(
             WhispSearchBar(
                 value = query,
                 onValueChange = { query = it },
-                placeholder = "作品、声优、RJ",
+                placeholder = "作品、声优、社团、标签、RJ/VJ",
                 modifier =
                     Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
                         .focusRequester(searchFocus),
             )
         }
         WhispTabBar(
-            options = listOf("全部" to "全部", "收藏" to "收藏", "系列" to "系列", "离线" to "离线"),
+            options =
+                listOf(
+                    "全部" to "全部",
+                    "收藏" to "收藏",
+                    "系列" to "系列",
+                    "歌单" to "歌单",
+                    "离线" to "离线",
+                ),
             selected = tab,
             onSelect = { item ->
                 haptics.tick()
@@ -217,8 +278,95 @@ internal fun LibraryPage(
                     }
                 } else null,
         )
+        AnimatedVisibility(visible = hasAdvancedFilter && tab != "歌单") {
+            LazyRow(
+                Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                contentPadding = PaddingValues(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                filterSourceId?.let { srcId ->
+                    val label = sourceList.firstOrNull { it.id == srcId }?.name ?: "指定来源"
+                    item(key = "chip-src") {
+                        InputChip(
+                            selected = true,
+                            onClick = { filterSourceId = null },
+                            label = { Text(label) },
+                            trailingIcon = {
+                                Icon(WhispIcons.Outlined.Close, null, Modifier.size(15.dp))
+                            },
+                        )
+                    }
+                }
+                if (filterListen != ListenFilter.ALL) {
+                    val label =
+                        listenFilterOptions.firstOrNull { it.first == filterListen }?.second
+                            ?: filterListen
+                    item(key = "chip-listen") {
+                        InputChip(
+                            selected = true,
+                            onClick = { filterListen = ListenFilter.ALL },
+                            label = { Text(label) },
+                            trailingIcon = {
+                                Icon(WhispIcons.Outlined.Close, null, Modifier.size(15.dp))
+                            },
+                        )
+                    }
+                }
+                if (filterSubtitlesOnly) {
+                    item(key = "chip-sub") {
+                        InputChip(
+                            selected = true,
+                            onClick = { filterSubtitlesOnly = false },
+                            label = { Text("有字幕") },
+                            trailingIcon = {
+                                Icon(WhispIcons.Outlined.Close, null, Modifier.size(15.dp))
+                            },
+                        )
+                    }
+                }
+                if (filterArtist.isNotBlank()) {
+                    item(key = "chip-artist") {
+                        InputChip(
+                            selected = true,
+                            onClick = { filterArtist = "" },
+                            label = { Text("声优：$filterArtist") },
+                            trailingIcon = {
+                                Icon(WhispIcons.Outlined.Close, null, Modifier.size(15.dp))
+                            },
+                        )
+                    }
+                }
+                if (filterTag.isNotBlank()) {
+                    item(key = "chip-tag") {
+                        InputChip(
+                            selected = true,
+                            onClick = { filterTag = "" },
+                            label = { Text("标签：$filterTag") },
+                            trailingIcon = {
+                                Icon(WhispIcons.Outlined.Close, null, Modifier.size(15.dp))
+                            },
+                        )
+                    }
+                }
+            }
+        }
         when {
-            works.isEmpty() ->
+            tab == "歌单" ->
+                PlaylistTabContent(
+                    playlists = playlists,
+                    onCreate = {
+                        newPlaylistName = ""
+                        creatingPlaylist = true
+                    },
+                    onOpen = { activePlaylistId = it.id },
+                    onPlay = { pl ->
+                        graph.playback.playPlaylist(pl.id)
+                        openPlayer()
+                    },
+                )
+            visibleCount == 0 &&
+                pagedWorks.itemCount == 0 &&
+                pagedWorks.loadState.refresh is LoadState.NotLoading ->
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     WhispEmptyState(
                         icon = WhispIcons.Outlined.LibraryMusic,
@@ -233,7 +381,7 @@ internal fun LibraryPage(
                     }
                 }
             tab == "系列" && series == null ->
-                if (seriesGroups.isEmpty()) {
+                if (filteredSeries.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         WhispEmptyState(
                             icon = WhispIcons.Outlined.FolderOpen,
@@ -247,20 +395,34 @@ internal fun LibraryPage(
                         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        items(seriesGroups, key = { it.first }) { (name, members) ->
-                            SeriesCard(name = name, works = members, onClick = { series = name })
+                        items(filteredSeries, key = { it.series }) { item ->
+                            SeriesSummaryCard(summary = item, onClick = { series = item.series })
                         }
                     }
                 }
             pagedWorks.itemCount == 0 && pagedWorks.loadState.refresh is LoadState.NotLoading ->
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     when {
-                        query.isNotBlank() ->
+                        query.isNotBlank() || hasAdvancedFilter ->
                             WhispEmptyState(
                                 icon = WhispIcons.Outlined.Search,
                                 title = "没有找到匹配的作品",
-                                subtitle = "尝试更换关键词、声优名或 RJ 编号",
-                            )
+                                subtitle = "尝试调整筛选条件或更换关键词、声优、标签与编号",
+                            ) {
+                                if (hasAdvancedFilter) {
+                                    FilledTonalButton(
+                                        onClick = {
+                                            filterSourceId = null
+                                            filterListen = ListenFilter.ALL
+                                            filterSubtitlesOnly = false
+                                            filterArtist = ""
+                                            filterTag = ""
+                                        },
+                                    ) {
+                                        Text("清除筛选")
+                                    }
+                                }
+                            }
                         tab == "收藏" ->
                             WhispEmptyState(
                                 icon = WhispIcons.Outlined.FavoriteBorder,
@@ -308,6 +470,150 @@ internal fun LibraryPage(
                 )
         }
     }
+
+    if (creatingPlaylist) {
+        AlertDialog(
+            onDismissRequest = { creatingPlaylist = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = { Text("新建歌单", color = Cream) },
+            text = {
+                OutlinedTextField(
+                    value = newPlaylistName,
+                    onValueChange = { newPlaylistName = it.take(80) },
+                    label = { Text("歌单名称（如：睡前助眠）") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = newPlaylistName.isNotBlank(),
+                    onClick = {
+                        val name = newPlaylistName.trim()
+                        creatingPlaylist = false
+                        scope.launch {
+                            runCatching { graph.library.createPlaylist(name) }
+                                .onFailure { graph.messages.tryEmit(it.message ?: "创建失败") }
+                        }
+                    },
+                ) {
+                    Text("创建", color = Rose)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { creatingPlaylist = false }) { Text("取消") }
+            },
+        )
+    }
+
+    playlists
+        .firstOrNull { it.id == activePlaylistId }
+        ?.let { pl ->
+            PlaylistDetailSheet(
+                graph = graph,
+                playlist = pl,
+                onPlay = openPlayer,
+                onDismiss = { activePlaylistId = null },
+            )
+        }
+
+    if (filterSheet) {
+        WhispSheet(onDismissRequest = { filterSheet = false }) { dismiss ->
+            Column(
+                Modifier.fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp)
+                    .navigationBarsPadding()
+                    .imePadding(),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "筛选作品",
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = Cream,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (hasAdvancedFilter) {
+                        TextButton(
+                            onClick = {
+                                filterSourceId = null
+                                filterListen = ListenFilter.ALL
+                                filterSubtitlesOnly = false
+                                filterArtist = ""
+                                filterTag = ""
+                            },
+                        ) {
+                            Text("重置")
+                        }
+                    }
+                    TextButton(onClick = dismiss) { Text("完成", fontWeight = FontWeight.SemiBold) }
+                }
+                Text("收听状态", style = MaterialTheme.typography.labelLarge, color = Muted)
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(listenFilterOptions, key = { it.first }) { (key, label) ->
+                        FilterChip(
+                            selected = filterListen == key,
+                            onClick = {
+                                haptics.tick()
+                                filterListen = key
+                            },
+                            label = { Text(label) },
+                        )
+                    }
+                }
+                if (sourceList.isNotEmpty()) {
+                    Text("按来源筛选", style = MaterialTheme.typography.labelLarge, color = Muted)
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        item(key = "src-all") {
+                            FilterChip(
+                                selected = filterSourceId == null,
+                                onClick = {
+                                    haptics.tick()
+                                    filterSourceId = null
+                                },
+                                label = { Text("全部来源") },
+                            )
+                        }
+                        items(sourceList, key = { it.id }) { src ->
+                            FilterChip(
+                                selected = filterSourceId == src.id,
+                                onClick = {
+                                    haptics.tick()
+                                    filterSourceId = if (filterSourceId == src.id) null else src.id
+                                },
+                                label = { Text(src.name, maxLines = 1) },
+                            )
+                        }
+                    }
+                }
+                WhispToggleRow(
+                    label = "仅看含字幕作品",
+                    subtitle = "筛选包含 VTT / LRC / SRT / ASS 字幕的作品",
+                    checked = filterSubtitlesOnly,
+                    onCheckedChange = { filterSubtitlesOnly = it },
+                )
+                OutlinedTextField(
+                    value = filterArtist,
+                    onValueChange = { filterArtist = it.take(80) },
+                    label = { Text("声优 / 社团关键词") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                )
+                OutlinedTextField(
+                    value = filterTag,
+                    onValueChange = { filterTag = it.take(80) },
+                    label = { Text("标签关键词（官方标签或个人标签）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                )
+                Spacer(Modifier.height(8.dp))
+            }
+        }
+    }
+
     if (sortSheet) {
         WhispSheet(onDismissRequest = { sortSheet = false }) { dismiss ->
             Text(
@@ -348,6 +654,91 @@ internal fun LibraryPage(
                     }
                 }
                 Spacer(Modifier.height(8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaylistTabContent(
+    playlists: List<PlaylistSummary>,
+    onCreate: () -> Unit,
+    onOpen: (PlaylistSummary) -> Unit,
+    onPlay: (PlaylistSummary) -> Unit,
+) {
+    if (playlists.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            WhispEmptyState(
+                icon = WhispIcons.AutoMirrored.Outlined.QueueMusic,
+                title = "暂无自定义歌单",
+                subtitle = "将不同作品的助眠音轨或循环片段编排在一起连续播放",
+            ) {
+                FilledTonalButton(onClick = onCreate) {
+                    Icon(WhispIcons.Outlined.Add, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("新建歌单")
+                }
+            }
+        }
+        return
+    }
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item(key = "create-playlist-btn") {
+            OutlinedButton(
+                onClick = onCreate,
+                modifier = Modifier.fillMaxWidth().height(46.dp),
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Icon(WhispIcons.Outlined.Add, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("新建跨作品歌单")
+            }
+        }
+        items(playlists, key = { it.id }) { pl ->
+            val shape = RoundedCornerShape(18.dp)
+            Row(
+                Modifier.fillMaxWidth()
+                    .clip(shape)
+                    .background(MaterialTheme.colorScheme.surface)
+                    .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+                    .clickable { onOpen(pl) }
+                    .padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Artwork(
+                    image = pl.coverId?.let { WhispImage.Asset(it) },
+                    description = null,
+                    modifier = Modifier.size(54.dp).clip(RoundedCornerShape(12.dp)),
+                )
+                Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
+                    Text(
+                        pl.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Cream,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${pl.itemCount} 条曲目/片段",
+                        style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
+                        color = Muted,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+                if (pl.itemCount > 0) {
+                    IconAction(
+                        WhispIcons.Filled.PlayArrow,
+                        "播放歌单",
+                        Rose,
+                        haptic = HapticKind.Confirm,
+                    ) {
+                        onPlay(pl)
+                    }
+                }
             }
         }
     }
@@ -430,9 +821,8 @@ private fun ContinueListeningBanner(
 }
 
 @Composable
-private fun SeriesCard(name: String, works: List<WorkEntity>, onClick: () -> Unit) {
+private fun SeriesSummaryCard(summary: SeriesSummary, onClick: () -> Unit) {
     val shape = RoundedCornerShape(18.dp)
-    val covers = remember(works) { works.mapNotNull { it.coverId }.distinct().take(2) }
     Row(
         Modifier.fillMaxWidth()
             .clip(shape)
@@ -442,42 +832,28 @@ private fun SeriesCard(name: String, works: List<WorkEntity>, onClick: () -> Uni
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(Modifier.size(width = 64.dp, height = 52.dp)) {
-            if (covers.size >= 2) {
-                Artwork(
-                    image = WhispImage.Asset(covers[1]),
-                    description = null,
-                    modifier =
-                        Modifier.align(Alignment.TopEnd)
-                            .size(width = 48.dp, height = 40.dp)
-                            .clip(RoundedCornerShape(9.dp))
-                            .border(
-                                0.5.dp,
-                                MaterialTheme.colorScheme.outlineVariant,
-                                RoundedCornerShape(9.dp),
-                            ),
-                )
-            }
-            Artwork(
-                image = covers.firstOrNull()?.let { WhispImage.Asset(it) },
-                description = null,
-                modifier =
-                    Modifier.align(Alignment.BottomStart)
-                        .size(width = 52.dp, height = 44.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .border(1.dp, MaterialTheme.colorScheme.surface, RoundedCornerShape(10.dp)),
-            )
-        }
+        Artwork(
+            image = summary.coverId?.let { WhispImage.Asset(it) },
+            description = null,
+            modifier =
+                Modifier.size(width = 56.dp, height = 46.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .border(
+                        0.5.dp,
+                        MaterialTheme.colorScheme.outlineVariant,
+                        RoundedCornerShape(10.dp),
+                    ),
+        )
         Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
             Text(
-                name,
+                summary.series,
                 style = MaterialTheme.typography.titleMedium,
                 color = Cream,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${works.size} 部作品",
+                "${summary.workCount} 部作品",
                 style = MaterialTheme.typography.bodySmall.merge(TabularNumeralStyle),
                 color = Muted,
                 fontSize = 13.sp,

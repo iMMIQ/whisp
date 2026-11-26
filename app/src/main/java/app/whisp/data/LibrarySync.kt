@@ -622,6 +622,8 @@ class LibrarySync(
                             supersededOfflineCover = latest.coverId
                         }
                     }
+                    val previous = decodeDlsiteDetails(library.dao.dlsiteMetadata(id)?.snapshot)
+                    val mergedDetails = metadata.details.preserving(previous)
                     library.dao.putWorks(
                         listOf(
                             latest.copy(
@@ -632,12 +634,12 @@ class LibrarySync(
                                 series = metadata.series,
                                 coverUrl = metadata.coverUrl,
                                 coverId = if (keepCustom) latest.coverId else coverId,
+                                searchMetadata = buildSearchMetadata(mergedDetails),
                             ),
                         ),
                     )
-                    val previous = decodeDlsiteDetails(library.dao.dlsiteMetadata(id)?.snapshot)
                     library.dao.putDlsiteMetadata(
-                        DlsiteMetadataEntity(id, metadata.details.preserving(previous).encode()),
+                        DlsiteMetadataEntity(id, mergedDetails.encode()),
                     )
                 }
                 supersededOfflineCover?.let { previousCover ->
@@ -818,6 +820,9 @@ class LibrarySync(
                         else freshWork.coverUrl,
                     addedAt = prev.addedAt,
                     offlineAttachments = prev.offlineAttachments,
+                    searchMetadata = prev.searchMetadata.ifBlank { freshWork.searchMetadata },
+                    userTags = prev.userTags,
+                    volumeOffsetDb = prev.volumeOffsetDb,
                 )
             } ?: freshWork
         val offlinePresent =
@@ -838,16 +843,25 @@ class LibrarySync(
             track.copy(
                 durationMs =
                     track.durationMs.takeIf { it > 0 } ?: oldTracks[track.id]?.durationMs ?: 0,
+                subtitleId = track.subtitleId ?: oldTracks[track.id]?.subtitleId,
             )
         }
         val oldAttachments = old?.attachments.orEmpty()
-        val pinnedAttachments = oldAttachments.filter { it.id in offlineFiles }.map { it.id }
+        val customAttachments = oldAttachments.filter {
+            it.relativePath.startsWith("_external/") || it.relativePath.startsWith("_linked/")
+        }
+        val pinnedAttachments =
+            (oldAttachments.filter { it.id in offlineFiles } + customAttachments).map { it.id }
         val keepAttachments = (attachments.map { it.id } + pinnedAttachments).toSet()
         val staleAttachments = oldAttachments.map { it.id }.filter { it !in keepAttachments }
+        val mergedAttachments =
+            (attachments + customAttachments.filter { it.id !in attachmentIds }).distinctBy {
+                it.id
+            }
         return WorkMergePlan(
             work = retainedWork,
             tracks = mergedTracks,
-            attachments = attachments,
+            attachments = mergedAttachments,
             obsoleteTracks = obsoleteTracks,
             staleAttachments = staleAttachments,
         )
@@ -885,9 +899,12 @@ class LibrarySync(
         library.dao.putAttachments(plan.attachments)
         metadata?.let { fresh ->
             val previous = decodeDlsiteDetails(library.dao.dlsiteMetadata(freshWork.id)?.snapshot)
-            library.dao.putDlsiteMetadata(
-                DlsiteMetadataEntity(freshWork.id, fresh.preserving(previous).encode()),
-            )
+            val merged = fresh.preserving(previous)
+            library.dao.putDlsiteMetadata(DlsiteMetadataEntity(freshWork.id, merged.encode()))
+            val searchMeta = buildSearchMetadata(merged)
+            if (searchMeta != plan.work.searchMetadata) {
+                library.dao.updateWorkSearchMetadata(freshWork.id, searchMeta)
+            }
         }
         return plan.obsoleteTracks
     }

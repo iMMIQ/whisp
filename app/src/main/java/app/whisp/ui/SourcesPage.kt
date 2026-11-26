@@ -34,6 +34,7 @@ import androidx.media3.exoplayer.offline.Download
 import app.whisp.AppGraph
 import app.whisp.DlsiteLoginActivity
 import app.whisp.R
+import app.whisp.data.AsmrOneClient
 import app.whisp.data.SourceEntity
 import app.whisp.data.SourceKind
 import app.whisp.data.WhispImage
@@ -86,6 +87,8 @@ internal fun SourcesPage(
 
     var adding by rememberSaveable { mutableStateOf(false) }
     var remoteKind by rememberSaveable { mutableStateOf<String?>(null) }
+    var editingAsmrSourceId by rememberSaveable { mutableStateOf<String?>(null) }
+    var addingCustomAsmr by rememberSaveable { mutableStateOf(false) }
     var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
     var confirmingRemoveSource by remember { mutableStateOf<SourceEntity?>(null) }
     var confirmingRemoveOffline by remember { mutableStateOf<WorkEntity?>(null) }
@@ -427,6 +430,15 @@ internal fun SourcesPage(
                     },
                 )
                 WhispSheetRow(
+                    icon = WhispIcons.Outlined.Explore,
+                    title = "自定义 Kikoeru / 镜像站",
+                    subtitle = "连接 ASMR.ONE 镜像或自建 Kikoeru 服务器",
+                    onClick = {
+                        dismiss()
+                        addingCustomAsmr = true
+                    },
+                )
+                WhispSheetRow(
                     icon = WhispIcons.Outlined.FolderOpen,
                     title = "本地目录",
                     subtitle = "授权扫描设备中的音频与视频文件夹",
@@ -476,7 +488,7 @@ internal fun SourcesPage(
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     Text(source.name, style = MaterialTheme.typography.headlineSmall, color = Cream)
-                    if (source.kindType !in setOf(SourceKind.ASMRONE, SourceKind.DLSITE)) {
+                    if (source.kindType != SourceKind.DLSITE) {
                         Text(source.root, color = Muted, fontSize = 13.sp)
                     }
                     source.error?.let {
@@ -518,6 +530,15 @@ internal fun SourcesPage(
                         onClick = {
                             graph.sync.scheduleScan(source.id)
                             dismiss()
+                        },
+                    )
+                    WhispSheetRow(
+                        icon = WhispIcons.Outlined.Tune,
+                        title = "切换镜像 / 编辑服务器",
+                        subtitle = source.root,
+                        onClick = {
+                            dismiss()
+                            editingAsmrSourceId = source.id
                         },
                     )
                 }
@@ -586,6 +607,159 @@ internal fun SourcesPage(
 
     remoteKind?.let { raw ->
         SourceKind.of(raw)?.let { kind -> RemoteDialog(graph, kind) { remoteKind = null } }
+    }
+
+    if (addingCustomAsmr) {
+        AsmrServerDialog(
+            graph = graph,
+            existing = null,
+            onSaved = { id ->
+                addingCustomAsmr = false
+                online(id)
+            },
+            onDismiss = { addingCustomAsmr = false },
+        )
+    }
+
+    sources
+        .firstOrNull { it.id == editingAsmrSourceId && it.kindType == SourceKind.ASMRONE }
+        ?.let { source ->
+            AsmrServerDialog(
+                graph = graph,
+                existing = source,
+                onSaved = { editingAsmrSourceId = null },
+                onDismiss = { editingAsmrSourceId = null },
+            )
+        }
+}
+
+@Composable
+private fun AsmrServerDialog(
+    graph: AppGraph,
+    existing: SourceEntity?,
+    onSaved: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by rememberSaveable(existing?.id) { mutableStateOf(existing?.name ?: "ASMR.ONE") }
+    var root by
+        rememberSaveable(existing?.id) {
+            mutableStateOf(existing?.root ?: AsmrOneClient.API_ROOT)
+        }
+    var token by remember(existing?.id) { mutableStateOf("") }
+    var saving by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    WhispSheet(onDismissRequest = { if (!saving) onDismiss() }, dismissible = !saving) { close ->
+        Column(
+            Modifier.fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp)
+                .navigationBarsPadding()
+                .imePadding(),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                if (existing != null) "编辑镜像 / Kikoeru 服务器" else "添加 Kikoeru / 镜像站",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+            )
+            Text("常用官方镜像", style = MaterialTheme.typography.labelLarge, color = Muted)
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(AsmrOneClient.MIRROR_PRESETS, key = { it }) { preset ->
+                    FilterChip(
+                        selected = root.trim().trimEnd('/') == preset.trimEnd('/'),
+                        onClick = { root = preset },
+                        label = { Text(preset.removePrefix("https://").trimEnd('/')) },
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text("名称") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+            )
+            OutlinedTextField(
+                value = root,
+                onValueChange = { root = it },
+                label = { Text("API 地址（HTTPS）") },
+                placeholder = { Text("https://api.asmr-200.com/") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+            )
+            OutlinedTextField(
+                value = token,
+                onValueChange = { token = it },
+                label = {
+                    Text(
+                        if (existing != null && existing.secret.isNotBlank()) "访问令牌（留空保持现有，输入空格清除）"
+                        else "Bearer Token（私有 Kikoeru 可选）",
+                    )
+                },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+            )
+            error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedButton(
+                    enabled = !saving,
+                    onClick = close,
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text("取消")
+                }
+                Button(
+                    enabled = !saving,
+                    onClick = {
+                        saving = true
+                        error = null
+                        scope.launch {
+                            try {
+                                val id =
+                                    if (existing != null) {
+                                        val nextToken =
+                                            when {
+                                                token.isEmpty() -> null
+                                                token.isBlank() -> ""
+                                                else -> token.trim()
+                                            }
+                                        graph.library.updateAsmrOneConfig(
+                                            existing.id,
+                                            name,
+                                            root,
+                                            nextToken,
+                                        )
+                                        existing.id
+                                    } else {
+                                        graph.library.addAsmrOne(name, root, token.trim())
+                                    }
+                                onSaved(id)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                error = e.message ?: "保存失败"
+                            } finally {
+                                saving = false
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text(if (saving) "保存中" else "保存", fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
     }
 }
 

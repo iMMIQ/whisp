@@ -12,6 +12,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -59,6 +60,7 @@ internal fun WorkDetailScreen(
     back: () -> Unit,
     player: () -> Unit,
     filter: ((AsmrFacet) -> Unit)? = null,
+    openWork: ((String) -> Unit)? = null,
 ) {
     val bg = MaterialTheme.colorScheme.background
     val reduced = LocalReducedMotion.current
@@ -200,8 +202,23 @@ internal fun WorkDetailScreen(
     var tab by rememberSaveable(detail.work.id) { mutableStateOf("曲目") }
     var information by rememberSaveable(detail.work.id) { mutableStateOf(false) }
     var downloadManage by rememberSaveable(detail.work.id) { mutableStateOf(false) }
+    var downloadSectionPicker by rememberSaveable(detail.work.id) { mutableStateOf(false) }
     var confirmRemoveOffline by rememberSaveable(detail.work.id) { mutableStateOf(false) }
     var attachment by remember { mutableStateOf<AttachmentEntity?>(null) }
+    var trackMenuTarget by remember { mutableStateOf<TrackEntity?>(null) }
+    var playlistAddTarget by remember { mutableStateOf<PlaylistAddRequest?>(null) }
+    val settings by graph.settings.settings.collectAsStateWithLifecycle()
+    val allDownloads by graph.media.downloads.collectAsStateWithLifecycle()
+    val sourceList by graph.library.sourceList.collectAsStateWithLifecycle()
+    val siblingWorks by
+        remember(detail.work.rj, detail.work.id) {
+                detail.work.rj?.let { rj ->
+                    graph.library.observeWorksByRj(rj).map { list ->
+                        list.filter { it.id != detail.work.id }
+                    }
+                } ?: flowOf(emptyList())
+            }
+            .collectAsStateWithLifecycle(initialValue = emptyList())
 
     val dlsiteStates by graph.dlsiteLoader.states.collectAsStateWithLifecycle()
     val storedDlsite by
@@ -266,7 +283,10 @@ internal fun WorkDetailScreen(
     val downloadPaused = downloadSnapshot[2] as Boolean
     val downloadProgress = downloadSnapshot[3] as Float
 
-    val sections = remember(detail.tracks) { TrackSections.groups(detail.tracks) }
+    val sections =
+        remember(detail.tracks, settings.editionPreference) {
+            TrackSections.groups(detail.tracks, settings.editionPreference)
+        }
     val totalDurationMs =
         remember(detail.tracks) { detail.tracks.sumOf { it.durationMs.coerceAtLeast(0L) } }
     val resume = inLibrary && remembered != null
@@ -274,7 +294,7 @@ internal fun WorkDetailScreen(
         if (detail.tracks.any { it.id == playback.trackId }) playback.ended
         else
             PlaybackQueue.finished(
-                TrackSections.queue(detail.tracks, remembered?.trackId),
+                TrackSections.queue(detail.tracks, remembered?.trackId, settings.editionPreference),
                 remembered,
             )
     val scripts =
@@ -417,6 +437,8 @@ internal fun WorkDetailScreen(
                                         ) {
                                             if (offline || downloading || downloadPaused) {
                                                 downloadManage = true
+                                            } else if (sections.size > 1) {
+                                                downloadSectionPicker = true
                                             } else {
                                                 scope.launch {
                                                     runCatching {
@@ -504,6 +526,88 @@ internal fun WorkDetailScreen(
                     )
                 }
                 OfficialCircle(official.details, filter)
+                val userTagList =
+                    remember(detail.work.userTags) { parseUserTags(detail.work.userTags) }
+                if (userTagList.isNotEmpty()) {
+                    LazyRow(
+                        Modifier.fillMaxWidth().padding(top = 4.dp),
+                        contentPadding = PaddingValues(horizontal = 20.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(userTagList, key = { it }) { tag ->
+                            SuggestionChip(
+                                onClick = { information = true },
+                                label = { Text("#$tag") },
+                            )
+                        }
+                    }
+                }
+                if (inLibrary && siblingWorks.isNotEmpty()) {
+                    LazyRow(
+                        Modifier.fillMaxWidth().padding(top = 6.dp),
+                        contentPadding = PaddingValues(horizontal = 20.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(siblingWorks, key = { it.id }) { sibling ->
+                            val srcName =
+                                sourceList.firstOrNull { it.id == sibling.sourceId }?.name
+                                    ?: sibling.origin.uppercase()
+                            AssistChip(
+                                onClick = {
+                                    if (openWork != null) openWork(sibling.id)
+                                    else {
+                                        scope.launch {
+                                            runCatching {
+                                                graph.offline.linkSiblingSubtitles(
+                                                    detail.work.id,
+                                                    sibling.id,
+                                                )
+                                            }
+                                                .onSuccess { count ->
+                                                    graph.messages.tryEmit(
+                                                        if (count > 0) "已从 $srcName 关联 $count 条字幕"
+                                                        else "$srcName 暂无可关联字幕",
+                                                    )
+                                                }
+                                                .onFailure {
+                                                    graph.messages.tryEmit(it.message ?: "关联字幕失败")
+                                                }
+                                        }
+                                    }
+                                },
+                                label = { Text("同号来源：$srcName") },
+                                leadingIcon = {
+                                    Icon(WhispIcons.Outlined.Lan, null, Modifier.size(16.dp))
+                                },
+                            )
+                            AssistChip(
+                                onClick = {
+                                    scope.launch {
+                                        runCatching {
+                                            graph.offline.linkSiblingSubtitles(
+                                                detail.work.id,
+                                                sibling.id,
+                                            )
+                                        }
+                                            .onSuccess { count ->
+                                                graph.messages.tryEmit(
+                                                    if (count > 0) "已从 $srcName 关联 $count 条字幕"
+                                                    else "$srcName 暂无可关联字幕",
+                                                )
+                                            }
+                                            .onFailure {
+                                                graph.messages.tryEmit(it.message ?: "关联字幕失败")
+                                            }
+                                    }
+                                },
+                                label = { Text("复用 $srcName 字幕") },
+                                leadingIcon = {
+                                    Icon(WhispIcons.Outlined.Subtitles, null, Modifier.size(16.dp))
+                                },
+                            )
+                        }
+                    }
+                }
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -669,6 +773,20 @@ internal fun WorkDetailScreen(
                                             color = Muted,
                                         )
                                     }
+                                    if (inLibrary) {
+                                        IconAction(
+                                            WhispIcons.AutoMirrored.Outlined.QueueMusic,
+                                            "将${section.title}加入歌单",
+                                            Muted,
+                                            haptic = HapticKind.Tick,
+                                        ) {
+                                            playlistAddTarget =
+                                                PlaylistAddRequest(
+                                                    workId = detail.work.id,
+                                                    trackIds = section.tracks.map { it.id },
+                                                )
+                                        }
+                                    }
                                     IconAction(
                                         WhispIcons.Outlined.PlayArrow,
                                         "播放${section.title}",
@@ -693,13 +811,30 @@ internal fun WorkDetailScreen(
                             }
                         }
                         items(section.tracks, key = { it.id }) { track ->
-                            TrackRow(track, playback.trackId == track.id) {
-                                haptics.tick()
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Box(Modifier.weight(1f)) {
+                                    TrackRow(track, playback.trackId == track.id) {
+                                        haptics.tick()
+                                        if (inLibrary) {
+                                            graph.playback.playWork(detail, track.id)
+                                            player()
+                                        } else {
+                                            commitPreview(playAfter = true, trackId = track.id)
+                                        }
+                                    }
+                                }
                                 if (inLibrary) {
-                                    graph.playback.playWork(detail, track.id)
-                                    player()
-                                } else {
-                                    commitPreview(playAfter = true, trackId = track.id)
+                                    IconAction(
+                                        WhispIcons.Outlined.MoreVert,
+                                        "曲目操作",
+                                        Muted,
+                                        haptic = HapticKind.Tick,
+                                    ) {
+                                        trackMenuTarget = track
+                                    }
                                 }
                             }
                         }
@@ -821,6 +956,150 @@ internal fun WorkDetailScreen(
         }
     }
 
+    if (downloadSectionPicker && inLibrary) {
+        WhispSheet(onDismissRequest = { downloadSectionPicker = false }) { dismiss ->
+            Text(
+                "选择离线下载版本",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cream,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp),
+            )
+            Text(
+                "多版本作品可只下载指定格式以节省存储空间",
+                style = MaterialTheme.typography.bodySmall,
+                color = Muted,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp),
+            )
+            sections.forEach { section ->
+                val sizeLabel = formatSectionBytes(section.totalBytes)
+                val sub =
+                    if (sizeLabel != null) "${section.tracks.size} 曲 · $sizeLabel"
+                    else "${section.tracks.size} 曲"
+                WhispSheetRow(
+                    icon = WhispIcons.Outlined.Download,
+                    title = section.title,
+                    subtitle = sub,
+                    onClick = {
+                        dismiss()
+                        scope.launch {
+                            runCatching {
+                                graph.offline.downloadTracks(
+                                    detail.work.id,
+                                    section.tracks.map { it.id },
+                                )
+                            }
+                                .onSuccess {
+                                    graph.messages.tryEmit("已开始下载「${section.title}」")
+                                }
+                                .onFailure {
+                                    graph.messages.tryEmit(it.message ?: "下载失败")
+                                }
+                        }
+                    },
+                )
+            }
+            val allSize = formatSectionBytes(detail.tracks.sumOf { it.size.coerceAtLeast(0L) })
+            WhispSheetRow(
+                icon = WhispIcons.Outlined.FileDownload,
+                title = "下载全部版本",
+                subtitle =
+                    if (allSize != null) "${detail.tracks.size} 曲 · $allSize"
+                    else "${detail.tracks.size} 曲",
+                onClick = {
+                    dismiss()
+                    scope.launch {
+                        runCatching { graph.offline.downloadWork(detail.work.id) }
+                            .onSuccess { graph.messages.tryEmit("已开始离线下载") }
+                            .onFailure { graph.messages.tryEmit(it.message ?: "下载失败") }
+                    }
+                },
+            )
+            Spacer(Modifier.navigationBarsPadding().height(8.dp))
+        }
+    }
+    trackMenuTarget?.let { targetTrack ->
+        val isTrackOffline = allDownloads[targetTrack.id]?.state == Download.STATE_COMPLETED
+        WhispSheet(onDismissRequest = { trackMenuTarget = null }) { dismiss ->
+            Text(
+                targetTrack.title,
+                style = MaterialTheme.typography.titleMedium,
+                color = Cream,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp),
+            )
+            WhispSheetRow(
+                icon = WhispIcons.Outlined.PlayArrow,
+                title = "下一首播放",
+                subtitle = "插入到当前播放曲目之后",
+                onClick = {
+                    dismiss()
+                    graph.playback.appendToQueue(detail.work, listOf(targetTrack), playNext = true)
+                },
+            )
+            WhispSheetRow(
+                icon = WhispIcons.AutoMirrored.Outlined.QueueMusic,
+                title = "加入播放队列末尾",
+                onClick = {
+                    dismiss()
+                    graph.playback.appendToQueue(detail.work, listOf(targetTrack), playNext = false)
+                },
+            )
+            WhispSheetRow(
+                icon = WhispIcons.Outlined.BookmarkAdd,
+                title = "加入自定义歌单",
+                onClick = {
+                    dismiss()
+                    playlistAddTarget =
+                        PlaylistAddRequest(
+                            workId = detail.work.id,
+                            trackIds = listOf(targetTrack.id),
+                        )
+                },
+            )
+            if (isTrackOffline) {
+                WhispSheetRow(
+                    icon = WhispIcons.Outlined.DeleteOutline,
+                    title = "移除此曲离线副本",
+                    tint = MaterialTheme.colorScheme.error,
+                    onClick = {
+                        dismiss()
+                        scope.launch {
+                            runCatching {
+                                graph.offline.removeTrackOffline(detail.work.id, targetTrack.id)
+                            }
+                                .onSuccess { graph.messages.tryEmit("已移除此曲离线副本") }
+                                .onFailure { graph.messages.tryEmit(it.message ?: "移除失败") }
+                        }
+                    },
+                )
+            } else {
+                WhispSheetRow(
+                    icon = WhispIcons.Outlined.Download,
+                    title = "仅离线下载此曲",
+                    subtitle = formatSectionBytes(targetTrack.size),
+                    onClick = {
+                        dismiss()
+                        scope.launch {
+                            runCatching {
+                                graph.offline.downloadTracks(detail.work.id, listOf(targetTrack.id))
+                            }
+                                .onSuccess { graph.messages.tryEmit("已开始离线下载此曲") }
+                                .onFailure { graph.messages.tryEmit(it.message ?: "下载失败") }
+                        }
+                    },
+                )
+            }
+            Spacer(Modifier.navigationBarsPadding().height(8.dp))
+        }
+    }
+    playlistAddTarget?.let { req ->
+        AddToPlaylistSheet(
+            graph = graph,
+            request = req,
+            onDismiss = { playlistAddTarget = null },
+        )
+    }
     if (downloadManage && inLibrary) {
         WhispSheet(onDismissRequest = { downloadManage = false }) { dismiss ->
             Text(
@@ -909,3 +1188,12 @@ internal fun WorkDetailScreen(
         }
     }
 }
+
+private fun formatSectionBytes(bytes: Long): String? =
+    when {
+        bytes >= 1024L * 1024 * 1024 ->
+            String.format(Locale.ROOT, "%.2f GiB", bytes / (1024.0 * 1024 * 1024))
+        bytes >= 1024L * 1024 -> String.format(Locale.ROOT, "%.1f MiB", bytes / (1024.0 * 1024))
+        bytes > 0L -> "${(bytes + 1023) / 1024} KiB"
+        else -> null
+    }

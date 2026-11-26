@@ -21,6 +21,8 @@ data class DisplayCue(
 object SubtitleTimeline {
     private val enhancedLrcTag = Regex("<\\d+:\\d+(?:[.,]\\d+)?>")
     private val assOverrideTag = Regex("\\{\\\\[^}]*\\}")
+    private val assDrawingTag = Regex("\\{[^}]*\\\\p[1-9][^}]*\\}")
+    private val assLineBreak = Regex("\\\\[Nn]")
 
     private fun cleanTimedText(raw: String): String =
         if ('{' in raw) raw.replace(assOverrideTag, "") else raw
@@ -38,11 +40,64 @@ object SubtitleTimeline {
         when (extension.lowercase()) {
             "lrc" -> lrc(content)
             "srt" -> timed(content, SubripParser())
+            "ass",
+            "ssa" -> ass(content)
             else -> vtt(content)
         }
 
     fun vtt(content: String): List<Cue> {
         return timed(content, WebvttParser())
+    }
+
+    fun ass(content: String): List<Cue> {
+        if (content.isBlank()) return emptyList()
+        val clean = content.removePrefix("\uFEFF")
+        var inEvents = false
+        var startIdx = 1
+        var endIdx = 2
+        var textIdx = 9
+        var fieldCount = 10
+        val result = mutableListOf<Cue>()
+
+        for (rawLine in clean.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith(';')) continue
+            if (line.startsWith('[') && line.endsWith(']')) {
+                inEvents = line.equals("[Events]", ignoreCase = true)
+                continue
+            }
+            if (!inEvents) continue
+            if (line.startsWith("Format:", ignoreCase = true)) {
+                val fields = line.substringAfter(':').split(',').map { it.trim().lowercase() }
+                val s = fields.indexOf("start")
+                val e = fields.indexOf("end")
+                val t = fields.indexOf("text")
+                if (s >= 0 && e >= 0 && t >= 0) {
+                    startIdx = s
+                    endIdx = e
+                    textIdx = t
+                    fieldCount = fields.size
+                }
+                continue
+            }
+            if (!line.startsWith("Dialogue:", ignoreCase = true)) continue
+            val payload = line.substringAfter(':').trimStart()
+            val parts = payload.split(',', limit = fieldCount)
+            if (parts.size <= maxOf(startIdx, endIdx, textIdx)) continue
+            val start = runCatching { time(parts[startIdx]) }.getOrNull() ?: continue
+            val end = runCatching { time(parts[endIdx]) }.getOrNull() ?: continue
+            if (start < 0L || end <= start) continue
+            val rawText = parts[textIdx]
+            if (assDrawingTag.containsMatchIn(rawText)) continue
+            val text =
+                rawText
+                    .replace(assOverrideTag, "")
+                    .replace(assLineBreak, "\n")
+                    .replace("\\h", " ")
+                    .trim()
+            if (text.isNotBlank()) result += Cue(start, end, text)
+        }
+        return result.sortedWith(compareBy<Cue> { it.startMs }.thenBy { it.endMs })
     }
 
     private fun timed(content: String, parser: SubtitleParser): List<Cue> {

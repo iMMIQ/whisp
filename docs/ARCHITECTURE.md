@@ -20,7 +20,7 @@ flowchart TD
     SRC["SourceRegistry"]
     DB["Room LibraryDatabase (v1 + FTS4)"]
     SET["SettingsStore (Typed DataStore) & SecretStore (Keystore)"]
-    PROTO["Local SAF / SMBJ / libnfs JNI / WebDAV / ASMR.ONE / DLsite"]
+    PROTO["Local SAF / libsmb2 JNI / libnfs JNI / WebDAV / ASMR.ONE / DLsite"]
 
     UI --> PB
     UI --> LIB
@@ -80,6 +80,7 @@ flowchart TD
 | `bookmarks` | 作品片段书签，支持时间点书签与带 `endMs` 的区间书签（外键级联删除） |
 | `dlsite_metadata` | 按作品缓存的 DLsite 结构化介绍、创作者分工、标签与评分快照（外键级联删除） |
 | `dlsite_purchases` | 按 DLsite 账号 `sourceId` 隔离缓存的已购音声目录（外键级联删除） |
+| `playlists` / `playlist_items` | 跨作品自定义歌单及曲目/区间片段编排条目（外键级联删除） |
 
 ### 稳定身份与状态持久化
 
@@ -125,7 +126,7 @@ flowchart TD
 | 来源 | 核心实现 | 关键设计约束 |
 | --- | --- | --- |
 | **本地目录** | `LocalDirectory` | 基于 SAF `DocumentsContract`，持久化树 URI 授权，单来源索引上限 100,000 条目 |
-| **SMB 2/3** | `SmbClient`（SMBJ） | 只读访问，默认强制 SMB 加密，可选局域网兼容开关；与 NFS 共用 `RemoteFileDataSource` 实现 64 位偏移随机读与 EOF 处理；播放空闲 30 秒后自动关闭空闲连接池 |
+| **SMB 2/3** | `SmbClient` + `libwhisp_smb.so`（`libsmb2 7.0.0`） | 只读访问，默认强制 SMB3 加密，可选局域网兼容开关；与 NFS 共用 `RemoteFileDataSource` 实现 64 位偏移随机读与 EOF 处理；播放空闲 30 秒后自动关闭空闲连接池 |
 | **NFS** | `NfsClient` + `libwhisp_nfs.so` | 支持 NFS 3 / 4.0 / 4.2（TCP + `AUTH_SYS`），扫描最多 4 并发连接，读取采用 256 KiB 缓冲；详见 [原生依赖](NATIVE.md) |
 | **WebDAV** | `WebDavClient`（OkHttp + SAX） | 远程强制 HTTPS；SAX 解析禁止 DTD/外部实体防止 XXE；限制最多 6 次同来源根目录内重定向 |
 | **ASMR.ONE** | `AsmrOneClient` + `AsmrCatalogController` | 独立网络配置与站点 Referer；按作用域缓存分页状态（最多 6 个 LRU 作用域）；媒体使用 `whisp-asmr` 内部 URI，按需入库，不污染未打开作品的本地数据库 |

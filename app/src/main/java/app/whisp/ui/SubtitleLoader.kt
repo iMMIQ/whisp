@@ -6,20 +6,28 @@ import android.os.PowerManager
 import android.util.LruCache
 import app.whisp.data.Cue
 import app.whisp.data.DisplayCue
+import app.whisp.data.LibraryIndexer
 import app.whisp.data.LibraryStore
 import app.whisp.data.SettingsStore
+import app.whisp.data.SubtitleLang
 import app.whisp.data.SubtitleTimeline
 import app.whisp.data.TextEncoding
+import app.whisp.data.TrackEntity
 import app.whisp.data.TrackSubtitleSelection
+import app.whisp.data.WorkDetails
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
+data class WorkSubtitleMatch(
+    val track: TrackEntity,
+    val cue: Cue,
+)
+
 /**
- * Subtitle loading, encoding-aware decoding, bilingual merging, next-track prefetching, and bounded
- * LRU caching owned by PlaybackCoordinator. Defers remote fetches while screen-off with no active
- * subtitle UI observers.
+ * Subtitle loading, encoding-aware decoding, language-priority auto-bilingual pairing, next-track
+ * prefetching, whole-work subtitle search, and bounded LRU caching owned by PlaybackCoordinator.
  */
 class SubtitleLoader(
     private val context: Context,
@@ -43,6 +51,9 @@ class SubtitleLoader(
     private var prefetchJob: Job? = null
     private var deferredTrackId: String? = null
     private var encoding: String = settings.settings.value.textEncoding
+    private var preferredPrimaryLang: String = settings.settings.value.preferredPrimarySubtitleLang
+    private var preferredSecondaryLang: String =
+        settings.settings.value.preferredSecondarySubtitleLang
     private var lastSelection: TrackSubtitleSelection? = null
 
     init {
@@ -51,6 +62,21 @@ class SubtitleLoader(
                 .map { it.textEncoding }
                 .distinctUntilChanged()
                 .collect(::onEncodingChanged)
+        }
+        scope.launch {
+            settings.settingsUpdates
+                .map { it.preferredPrimarySubtitleLang to it.preferredSecondarySubtitleLang }
+                .distinctUntilChanged()
+                .collect { (primary, secondary) ->
+                    if (primary != preferredPrimaryLang || secondary != preferredSecondaryLang) {
+                        preferredPrimaryLang = primary
+                        preferredSecondaryLang = secondary
+                        val active = currentTrackId
+                        if (active != null && lastSelection == null) {
+                            load(active, force = true, allowDeferred = false)
+                        }
+                    }
+                }
         }
         scope.launch {
             library.trackStates.collect { states ->
@@ -90,6 +116,30 @@ class SubtitleLoader(
         }
     }
 
+    private suspend fun resolveSubtitleIds(
+        track: TrackEntity,
+        selection: TrackSubtitleSelection?,
+    ): Pair<String?, String?> {
+        if (selection != null) {
+            val primary = selection.primaryId ?: track.subtitleId
+            val secondary = selection.secondaryId?.takeIf { it != primary }
+            return primary to secondary
+        }
+        if (
+            preferredPrimaryLang == SubtitleLang.AUTO && preferredSecondaryLang == SubtitleLang.NONE
+        ) {
+            return track.subtitleId to null
+        }
+        val attachments =
+            withContext(Dispatchers.IO) { library.dao.attachmentsForWorks(listOf(track.workId)) }
+        return LibraryIndexer.pickAutoSubtitles(
+            track = track,
+            attachments = attachments,
+            primaryLang = preferredPrimaryLang,
+            secondaryLang = preferredSecondaryLang,
+        )
+    }
+
     /**
      * Silently prefetches the next queued track's primary subtitle so track transitions are
      * instant.
@@ -103,9 +153,9 @@ class SubtitleLoader(
         prefetchJob = scope.launch {
             runCatching {
                 val track = library.track(trackId) ?: return@launch
-                val selection = library.subtitleSelectionFor(trackId)
-                val primaryId = selection?.primaryId ?: track.subtitleId ?: return@launch
-                if (attachmentCache[primaryId] != null) return@launch
+                val selection = library.loadSubtitleSelection(trackId)
+                val (primaryId, _) = resolveSubtitleIds(track, selection)
+                if (primaryId == null || attachmentCache[primaryId] != null) return@launch
                 val parsed = fetchAndParseAttachment(primaryId, requestedEncoding) ?: return@launch
                 if (requestedEncoding == encoding) {
                     attachmentCache.put(primaryId, parsed)
@@ -146,8 +196,9 @@ class SubtitleLoader(
             scope.launch(start = CoroutineStart.LAZY) {
                 try {
                     val track = library.track(id) ?: return@launch
-                    val primaryId = selection?.primaryId ?: track.subtitleId
-                    val secondaryId = selection?.secondaryId?.takeIf { it != primaryId }
+                    val effectiveSelection = selection ?: library.loadSubtitleSelection(id)
+                    lastSelection = effectiveSelection
+                    val (primaryId, secondaryId) = resolveSubtitleIds(track, effectiveSelection)
                     if (currentTrackId == id) {
                         activePrimaryId.value = primaryId
                         activeSecondaryId.value = secondaryId
@@ -217,6 +268,45 @@ class SubtitleLoader(
         job = nextJob
         nextJob.start()
     }
+
+    /** Searches across all subtitled tracks of [detail] for cues matching [query]. */
+    suspend fun searchWorkSubtitles(
+        detail: WorkDetails,
+        query: String,
+        maxResults: Int = 120,
+    ): List<WorkSubtitleMatch> =
+        withContext(Dispatchers.IO) {
+            val q = query.trim()
+            if (q.isEmpty()) return@withContext emptyList()
+            val requestedEncoding = encoding
+            val results = mutableListOf<WorkSubtitleMatch>()
+            for (track in detail.tracks) {
+                currentCoroutineContext().ensureActive()
+                val selection = library.loadSubtitleSelection(track.id)
+                val (primaryId, secondaryId) = resolveSubtitleIds(track, selection)
+                val ids = listOfNotNull(primaryId, secondaryId).distinct()
+                if (ids.isEmpty()) continue
+                val seenStart = HashSet<Long>()
+                for (subId in ids) {
+                    val parsed =
+                        attachmentCache[subId]
+                            ?: runCatching { fetchAndParseAttachment(subId, requestedEncoding) }
+                                .getOrNull()
+                                ?.also {
+                                    if (requestedEncoding == encoding)
+                                        attachmentCache.put(subId, it)
+                                }
+                            ?: continue
+                    for (cue in parsed) {
+                        if (cue.text.contains(q, ignoreCase = true) && seenStart.add(cue.startMs)) {
+                            results += WorkSubtitleMatch(track, cue)
+                            if (results.size >= maxResults) return@withContext results
+                        }
+                    }
+                }
+            }
+            results
+        }
 
     private suspend fun fetchAndParseAttachment(
         attachmentId: String,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import android.content.Intent
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -30,8 +31,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import app.whisp.AppGraph
 import app.whisp.R
+import app.whisp.data.EditionPreference
 import app.whisp.data.LibraryBackup
 import app.whisp.data.StorageUsage
+import app.whisp.data.SubtitleLang
 import app.whisp.data.SupportedSkipSeconds
 import app.whisp.system.AppLockAuthenticator
 import java.text.SimpleDateFormat
@@ -98,6 +101,37 @@ internal fun SettingsPage(
                     throw e
                 } catch (e: Exception) {
                     graph.messages.tryEmit(e.message ?: "导出备份失败")
+                } finally {
+                    backupBusy = false
+                }
+            }
+        }
+
+    val pickAutoBackupTarget =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/json"),
+        ) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            backupBusy = true
+            scope.launch {
+                try {
+                    runCatching {
+                        context.contentResolver.takePersistableUriPermission(
+                            uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                        )
+                    }
+                    val targetStr = uri.toString()
+                    graph.settings.update { it.copy(autoBackupUri = targetStr) }
+                    LibraryBackup.writeToUri(context, targetStr, graph.library, graph.settings)
+                    LibraryBackup.scheduleAutoBackup(context, enabled = true)
+                    haptics.confirm()
+                    graph.messages.tryEmit("已开启每日自动备份并完成首次同步")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    graph.messages.tryEmit(e.message ?: "配置自动备份失败")
                 } finally {
                     backupBusy = false
                 }
@@ -233,6 +267,42 @@ internal fun SettingsPage(
                             }
                         },
                     )
+                    if (settings.nightDynamics) {
+                        val strengthOptions = listOf(1 to "轻柔", 2 to "标准", 3 to "强力")
+                        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                            strengthOptions.forEachIndexed { index, (level, label) ->
+                                SegmentedButton(
+                                    selected = settings.nightDynamicsStrength == level,
+                                    onClick = {
+                                        haptics.tick()
+                                        scope.launch {
+                                            graph.settings.update {
+                                                it.copy(nightDynamicsStrength = level)
+                                            }
+                                        }
+                                    },
+                                    shape =
+                                        SegmentedButtonDefaults.itemShape(
+                                            index,
+                                            strengthOptions.size,
+                                        ),
+                                ) {
+                                    Text(label, style = MaterialTheme.typography.labelMedium)
+                                }
+                            }
+                        }
+                    }
+                    WhispToggleRow(
+                        label = "低切降噪（80 Hz）",
+                        subtitle = "削减麦克风喷麦与低频环境底噪",
+                        checked = settings.highPassFilter,
+                        tag = "settings-high-pass",
+                        onCheckedChange = { checked ->
+                            scope.launch {
+                                graph.settings.update { it.copy(highPassFilter = checked) }
+                            }
+                        },
+                    )
                     WhispToggleRow(
                         label = "单声道合并",
                         subtitle = "侧睡单耳佩戴时听全双耳内容",
@@ -240,6 +310,47 @@ internal fun SettingsPage(
                         tag = "settings-mono-audio",
                         onCheckedChange = { checked ->
                             scope.launch { graph.settings.update { it.copy(monoAudio = checked) } }
+                        },
+                    )
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "左右声道平衡",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = Muted,
+                            modifier = Modifier.weight(1f),
+                        )
+                        val balPct = (settings.stereoBalance * 100f).roundToInt()
+                        Text(
+                            when {
+                                balPct < -1 -> "左 +${-balPct}%"
+                                balPct > 1 -> "右 +${balPct}%"
+                                else -> "居中"
+                            },
+                            style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                            color = if (abs(balPct) > 1) Rose else Muted,
+                        )
+                        if (abs(settings.stereoBalance) > 0.02f) {
+                            TextButton(
+                                onClick = {
+                                    haptics.tick()
+                                    scope.launch {
+                                        graph.settings.update { it.copy(stereoBalance = 0f) }
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            ) {
+                                Text("居中")
+                            }
+                        }
+                    }
+                    SyncedSlider(
+                        settings.stereoBalance,
+                        -1f..1f,
+                        onValueChange = { value ->
+                            val snapped = if (abs(value) < 0.04f) 0f else value
+                            scope.launch {
+                                graph.settings.update { it.copy(stereoBalance = snapped) }
+                            }
                         },
                     )
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -460,6 +571,76 @@ internal fun SettingsPage(
                             }
                         },
                     )
+                    Text(
+                        "多版本默认优先",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Muted,
+                    )
+                    val editionOptions =
+                        listOf(
+                            EditionPreference.COMPACT_MP3 to "MP3 轻享",
+                            EditionPreference.LOSSLESS_FIRST to "无损优先",
+                            EditionPreference.DEFAULT to "目录顺序",
+                        )
+                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                        editionOptions.forEachIndexed { index, (pref, label) ->
+                            SegmentedButton(
+                                selected = settings.editionPreference == pref,
+                                onClick = {
+                                    haptics.tick()
+                                    scope.launch {
+                                        graph.settings.update { it.copy(editionPreference = pref) }
+                                    }
+                                },
+                                shape =
+                                    SegmentedButtonDefaults.itemShape(index, editionOptions.size),
+                            ) {
+                                Text(label, style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                    }
+                    Text(
+                        "主字幕语言偏好",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Muted,
+                    )
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(SubtitleLang.primaryOptions, key = { it }) { code ->
+                            FilterChip(
+                                selected = settings.preferredPrimarySubtitleLang == code,
+                                onClick = {
+                                    haptics.tick()
+                                    scope.launch {
+                                        graph.settings.update {
+                                            it.copy(preferredPrimarySubtitleLang = code)
+                                        }
+                                    }
+                                },
+                                label = { Text(SubtitleLang.label(code)) },
+                            )
+                        }
+                    }
+                    Text(
+                        "自动双语副字幕语言",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Muted,
+                    )
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(SubtitleLang.secondaryOptions, key = { it }) { code ->
+                            FilterChip(
+                                selected = settings.preferredSecondarySubtitleLang == code,
+                                onClick = {
+                                    haptics.tick()
+                                    scope.launch {
+                                        graph.settings.update {
+                                            it.copy(preferredSecondarySubtitleLang = code)
+                                        }
+                                    }
+                                },
+                                label = { Text(SubtitleLang.label(code)) },
+                            )
+                        }
+                    }
                 }
             }
             item(key = "section-privacy") {
@@ -548,10 +729,88 @@ internal fun SettingsPage(
                         }
                     }
                     Text(
-                        "备份包含设置、书签、播放进度与单曲字幕偏移，不含任何 NAS 密码或账号 Cookie",
+                        "备份包含设置、歌单、个人标签、书签、播放进度与单曲字幕偏移，不含任何 NAS 密码或账号 Cookie",
                         style = MaterialTheme.typography.bodySmall,
                         color = Muted,
                     )
+                    HorizontalDivider(
+                        thickness = 0.5.dp,
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                    )
+                    val autoEnabled = settings.autoBackupUri.isNotBlank()
+                    val lastSyncLabel =
+                        remember(settings.lastAutoBackupAt) {
+                            if (settings.lastAutoBackupAt > 0L)
+                                SimpleDateFormat("MM-dd HH:mm", Locale.US)
+                                    .format(Date(settings.lastAutoBackupAt))
+                            else null
+                        }
+                    Text(
+                        if (autoEnabled) {
+                            "定时自动备份：已开启" + (lastSyncLabel?.let { " · 上次 $it" } ?: "")
+                        } else "定时自动备份：未开启",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (autoEnabled) Rose else Muted,
+                    )
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            enabled = !backupBusy,
+                            onClick = {
+                                pickAutoBackupTarget.launch("whisp-auto-backup.json")
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Text(if (autoEnabled) "更换备份文件" else "选择自动备份文件")
+                        }
+                        if (autoEnabled) {
+                            FilledTonalButton(
+                                enabled = !backupBusy,
+                                onClick = {
+                                    backupBusy = true
+                                    scope.launch {
+                                        try {
+                                            LibraryBackup.writeToUri(
+                                                context,
+                                                settings.autoBackupUri,
+                                                graph.library,
+                                                graph.settings,
+                                            )
+                                            haptics.confirm()
+                                            graph.messages.tryEmit("自动备份已同步")
+                                        } catch (e: CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            graph.messages.tryEmit(e.message ?: "同步失败")
+                                        } finally {
+                                            backupBusy = false
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                            ) {
+                                Text("立即同步")
+                            }
+                        }
+                    }
+                    if (autoEnabled) {
+                        TextButton(
+                            enabled = !backupBusy,
+                            onClick = {
+                                scope.launch {
+                                    graph.settings.update { it.copy(autoBackupUri = "") }
+                                    LibraryBackup.scheduleAutoBackup(context, enabled = false)
+                                    graph.messages.tryEmit("已关闭定时自动备份")
+                                }
+                            },
+                            contentPadding = PaddingValues(0.dp),
+                        ) {
+                            Text("关闭自动备份", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
                 }
             }
             item(key = "section-storage") {

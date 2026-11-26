@@ -168,6 +168,7 @@ private data class AsmrTreeNodeDto(
 class AsmrOneClient(
     baseHttp: OkHttpClient,
     private val root: HttpUrl = API_ROOT.toHttpUrl(),
+    private val bearerToken: String = "",
 ) {
     private val http: OkHttpClient =
         baseHttp
@@ -181,6 +182,13 @@ class AsmrOneClient(
 
     companion object {
         const val API_ROOT = "https://api.asmr.one/"
+        val MIRROR_PRESETS =
+            listOf(
+                "https://api.asmr.one/",
+                "https://api.asmr-100.com/",
+                "https://api.asmr-200.com/",
+                "https://api.asmr-300.com/",
+            )
         val MEDIA_HEADERS = mapOf("Origin" to "https://asmr.one", "Referer" to "https://asmr.one/")
         private val illegalPathChars = Regex("[\\\\/\\u0000]")
     }
@@ -327,7 +335,12 @@ class AsmrOneClient(
                         url.host == it || url.host.endsWith(".$it")
                     }
                 if (dlsite) header("Referer", "https://www.dlsite.com/")
-                else MEDIA_HEADERS.forEach { (k, v) -> header(k, v) }
+                else {
+                    MEDIA_HEADERS.forEach { (k, v) -> header(k, v) }
+                    if (bearerToken.isNotBlank() && url.host == root.host) {
+                        header("Authorization", "Bearer $bearerToken")
+                    }
+                }
             }
             .build()
 

@@ -205,6 +205,7 @@ internal fun ActiveModifiersRow(
     settings: Settings,
     trackOffsetMs: Long,
     markA: Long,
+    workVolumeDb: Float = 0f,
     onOpenPreferences: () -> Unit,
     onOpenSubtitleTune: () -> Unit,
     onOpenTimer: () -> Unit,
@@ -234,7 +235,8 @@ internal fun ActiveModifiersRow(
     val showLoop = state.loopStart >= 0L || markA >= 0L
     val showOffset = trackOffsetMs != 0L
     val showShuffle = state.shuffleEnabled
-    val showAudioMod = settings.hasDspEffects || settings.volumeGain < 0.99f
+    val showAudioMod =
+        settings.hasDspEffects || settings.volumeGain < 0.99f || abs(workVolumeDb) > 0.25f
     if (
         !showSpeed &&
             !showTimer &&
@@ -268,7 +270,13 @@ internal fun ActiveModifiersRow(
                 val label = buildList {
                     if (settings.swapChannels) add("声道反转")
                     if (settings.nightDynamics) add("夜间柔化")
+                    if (settings.highPassFilter) add("低切")
                     if (settings.monoAudio) add("单声道")
+                    if (abs(settings.stereoBalance) > 0.02f) add("声道平衡")
+                    if (abs(workVolumeDb) > 0.25f) {
+                        val db = workVolumeDb.roundToInt()
+                        add(if (db > 0) "+${db}dB" else "${db}dB")
+                    }
                     if (settings.volumeGain < 0.99f) {
                         add("音量${(settings.volumeGain * 100f).roundToInt()}%")
                     }
@@ -711,6 +719,7 @@ internal fun PlayerControls(
                 settings = settings,
                 trackOffsetMs = trackOffsetMs,
                 markA = markA,
+                workVolumeDb = detail.work.volumeOffsetDb,
                 onOpenPreferences = onOpenPreferences,
                 onOpenSubtitleTune = onOpenSubtitleTune,
                 onOpenTimer = onOpenTimer,

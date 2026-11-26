@@ -24,11 +24,14 @@ object DspNative {
         frames: Int,
         swap: Boolean,
         mono: Boolean,
-        night: Boolean,
+        nightStrength: Int,
+        balance: Float,
+        gainLinear: Float,
+        highPassCoeff: Float,
         attackCoeff: Float,
         releaseCoeff: Float,
-        initialEnvelope: Float,
-    ): Float
+        state: FloatArray,
+    )
 
     external fun processPcmFloatStereo(
         input: ByteBuffer,
@@ -38,9 +41,12 @@ object DspNative {
         frames: Int,
         swap: Boolean,
         mono: Boolean,
-        night: Boolean,
+        nightStrength: Int,
+        balance: Float,
+        gainLinear: Float,
+        highPassCoeff: Float,
         attackCoeff: Float,
         releaseCoeff: Float,
-        initialEnvelope: Float,
-    ): Float
+        state: FloatArray,
+    )
 }

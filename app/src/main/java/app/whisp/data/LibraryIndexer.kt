@@ -19,8 +19,31 @@ data class IndexedLibrary(
 
 fun stableId(value: String): String = value.encodeUtf8().sha256().substring(0, 16).hex()
 
+object SubtitleLang {
+    const val AUTO = "auto"
+    const val NONE = "none"
+    const val ZH = "zh"
+    const val JA = "ja"
+    const val EN = "en"
+    const val KO = "ko"
+
+    val primaryOptions = listOf(AUTO, ZH, JA, EN, KO)
+    val secondaryOptions = listOf(NONE, ZH, JA, EN, KO)
+
+    fun label(code: String): String =
+        when (code) {
+            AUTO -> "自动"
+            NONE -> "关闭"
+            ZH -> "中文"
+            JA -> "日语"
+            EN -> "英语"
+            KO -> "韩语"
+            else -> code
+        }
+}
+
 object LibraryIndexer {
-    private val rjPattern = Regex("RJ\\d{6,}", RegexOption.IGNORE_CASE)
+    private val workCodePattern = Regex("(?:RJ|VJ|BJ)\\d{6,8}", RegexOption.IGNORE_CASE)
     private val images = setOf("jpg", "jpeg", "png", "webp")
     private val codePrefix = Regex("^[A-Za-z]\\d+[_-]")
     private val leadingNumber = Regex("^(\\d+)")
@@ -46,6 +69,27 @@ object LibraryIndexer {
             RegexOption.IGNORE_CASE,
         )
 
+    private val zhToken =
+        Regex(
+            "(?:[._\\-\\[【(]|^)(?:zh(?:[-_](?:cn|tw|hk|hans|hant))?|chs|cht|cn|sc|tc)(?:[._\\-\\]】)]|$)|中文|简中|繁中|简体|繁体|汉化|機翻|机翻",
+            RegexOption.IGNORE_CASE,
+        )
+    private val jaToken =
+        Regex(
+            "(?:[._\\-\\[【(]|^)(?:ja|jp|jpn)(?:[._\\-\\]】)]|$)|日语|日文|日本語|原文",
+            RegexOption.IGNORE_CASE,
+        )
+    private val enToken =
+        Regex(
+            "(?:[._\\-\\[【(]|^)(?:en|eng)(?:[._\\-\\]】)]|$)|英文|英语|english",
+            RegexOption.IGNORE_CASE,
+        )
+    private val koToken =
+        Regex(
+            "(?:[._\\-\\[【(]|^)(?:ko|kr|kor)(?:[._\\-\\]】)]|$)|韩语|韩文|한국어",
+            RegexOption.IGNORE_CASE,
+        )
+
     private fun stem(name: String) = name.replace(subtitleSuffix, "").replace(resourceSuffix, "")
 
     internal fun subtitleBaseStem(name: String): String {
@@ -56,6 +100,18 @@ object LibraryIndexer {
             current = stripped
         }
         return current
+    }
+
+    /** Detects a coarse subtitle language code (`zh`, `ja`, `en`, `ko`) from file/path hints. */
+    fun subtitleLanguage(fileName: String, relativePath: String = fileName): String? {
+        val target = "$relativePath/$fileName"
+        return when {
+            zhToken.containsMatchIn(target) -> SubtitleLang.ZH
+            jaToken.containsMatchIn(target) -> SubtitleLang.JA
+            enToken.containsMatchIn(target) -> SubtitleLang.EN
+            koToken.containsMatchIn(target) -> SubtitleLang.KO
+            else -> null
+        }
     }
 
     /**
@@ -89,6 +145,50 @@ object LibraryIndexer {
         )
     }
 
+    /**
+     * Automatically selects primary and optional secondary subtitles for [track] based on preferred
+     * language settings, restricted to subtitles that genuinely match [track].
+     */
+    fun pickAutoSubtitles(
+        track: TrackEntity,
+        attachments: List<AttachmentEntity>,
+        primaryLang: String = SubtitleLang.AUTO,
+        secondaryLang: String = SubtitleLang.NONE,
+    ): Pair<String?, String?> {
+        if (primaryLang == SubtitleLang.AUTO && secondaryLang == SubtitleLang.NONE) {
+            return track.subtitleId to null
+        }
+        val exactStem = stem(track.fileName).lowercase()
+        val baseStem = subtitleBaseStem(track.fileName).lowercase()
+        val matching =
+            subtitleCandidates(track, attachments).filter { candidate ->
+                candidate.id == track.subtitleId ||
+                    stem(candidate.fileName).lowercase() == exactStem ||
+                    subtitleBaseStem(candidate.fileName).lowercase() == baseStem ||
+                    (track.order < 9999 && number(candidate.fileName) == track.order)
+            }
+        if (matching.isEmpty()) return track.subtitleId to null
+        val primary =
+            if (primaryLang == SubtitleLang.AUTO) {
+                matching.firstOrNull { it.id == track.subtitleId } ?: matching.first()
+            } else {
+                matching.firstOrNull {
+                    subtitleLanguage(it.fileName, it.relativePath) == primaryLang
+                } ?: matching.firstOrNull { it.id == track.subtitleId } ?: matching.first()
+            }
+        val secondary =
+            if (secondaryLang == SubtitleLang.NONE || secondaryLang == primaryLang) {
+                null
+            } else {
+                matching.firstOrNull { candidate ->
+                    candidate.id != primary.id &&
+                        subtitleLanguage(candidate.fileName, candidate.relativePath) ==
+                            secondaryLang
+                }
+            }
+        return primary.id to secondary?.id
+    }
+
     fun number(name: String): Int =
         leadingNumber.find(name.replace(codePrefix, ""))?.groupValues?.get(1)?.toIntOrNull() ?: 9999
 
@@ -100,7 +200,7 @@ object LibraryIndexer {
     private fun rootOf(path: String): String {
         val dirs = path.split('/').dropLast(1)
         val matches = dirs.mapIndexedNotNull { index, name ->
-            rjPattern.find(name)?.value?.uppercase()?.let { index to it }
+            workCodePattern.find(name)?.value?.uppercase()?.let { index to it }
         }
         if (matches.isEmpty()) return dirs.joinToString("/")
         val lastId = matches.last().second
@@ -132,7 +232,7 @@ object LibraryIndexer {
         val attachments = mutableListOf<AttachmentEntity>()
         groups.toSortedMap().forEach { (root, group) ->
             val name = root.basename().ifBlank { "未命名作品" }
-            val rj = rjPattern.find(name)?.value?.uppercase()
+            val rj = workCodePattern.find(name)?.value?.uppercase()
             // Per-source directory identity stays stable automatically when tracks are
             // added/removed.
             val workId = workOverride?.id ?: stableId("$sourceId|$root")
@@ -183,13 +283,15 @@ object LibraryIndexer {
                     ?.value
                     ?.id
             val title =
-                name.replace(rjPattern, "").replace(bracketPattern, "").trim().ifBlank { name }
+                name.replace(workCodePattern, "").replace(bracketPattern, "").trim().ifBlank {
+                    name
+                }
             val series =
                 root
                     .split('/')
                     .dropLast(1)
                     .lastOrNull()
-                    ?.takeUnless { rjPattern.containsMatchIn(it) }
+                    ?.takeUnless { workCodePattern.containsMatchIn(it) }
                     ?.replace(seriesFrame, "")
             works +=
                 workOverride?.copy(

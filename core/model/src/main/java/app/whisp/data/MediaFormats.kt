@@ -5,7 +5,7 @@ object MediaFormats {
     val audio = setOf("mp3", "m4a", "flac", "wav", "ogg", "opus", "aac")
     val video = setOf("mp4", "m4v", "mkv", "webm", "mov", "3gp", "ts", "m2ts", "mpg", "mpeg")
     val playable = audio + video
-    val subtitles = setOf("vtt", "lrc", "srt")
+    val subtitles = setOf("vtt", "lrc", "srt", "ass", "ssa")
 
     fun extension(name: String) = name.substringAfterLast('.', "").lowercase()
 

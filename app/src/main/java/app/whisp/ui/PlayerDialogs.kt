@@ -224,10 +224,11 @@ internal fun PlayerFragmentsSheet(
     markA: Long,
     shownTrack: TrackEntity?,
     cues: List<Cue>,
-    settings: Settings,
+    trackOffsetMs: Long = 0L,
     bookmarks: List<BookmarkEntity>,
     playback: PlaybackCoordinator,
     onDeleteBookmark: (BookmarkEntity) -> Unit,
+    onAddBookmarkToPlaylist: ((BookmarkEntity) -> Unit)? = null,
     haptics: WhispHaptics,
     onCreateBookmark: (BookmarkDraft) -> Unit,
     onOpenInlineAb: () -> Unit,
@@ -314,7 +315,7 @@ internal fun PlayerFragmentsSheet(
                                 val cueIndex =
                                     SubtitleTimeline.anchor(
                                         cues,
-                                        (state.loopStart - settings.subtitleOffsetMs).coerceAtLeast(
+                                        (state.loopStart - trackOffsetMs).coerceAtLeast(
                                             0,
                                         ),
                                     )
@@ -345,7 +346,7 @@ internal fun PlayerFragmentsSheet(
                             val cueIndex =
                                 SubtitleTimeline.anchor(
                                     cues,
-                                    (position - settings.subtitleOffsetMs).coerceAtLeast(0),
+                                    (position - trackOffsetMs).coerceAtLeast(0),
                                 )
                             onCreateBookmark(
                                 BookmarkDraft.atPosition(
@@ -420,6 +421,17 @@ internal fun PlayerFragmentsSheet(
                         ) {
                             playback.playBookmark(detail, item, repeat = true)
                             dismiss()
+                        }
+                    }
+                    if (onAddBookmarkToPlaylist != null) {
+                        IconAction(
+                            WhispIcons.AutoMirrored.Outlined.QueueMusic,
+                            "加入歌单",
+                            Muted,
+                            haptic = HapticKind.Tick,
+                        ) {
+                            dismiss()
+                            onAddBookmarkToPlaylist(item)
                         }
                     }
                     IconAction(

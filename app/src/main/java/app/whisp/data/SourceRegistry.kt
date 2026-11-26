@@ -85,7 +85,8 @@ class SourceRegistry(
 
     fun asmrClient(source: SourceEntity): AsmrOneClient {
         require(source.kindType == SourceKind.ASMRONE) { "来源类型不匹配" }
-        return AsmrOneClient(onlineHttp, source.root.toHttpUrlOrNull() ?: error("来源地址无效"))
+        val token = if (source.secret.isNotBlank()) secrets.decryptCached(source) else ""
+        return AsmrOneClient(onlineHttp, source.root.toHttpUrlOrNull() ?: error("来源地址无效"), token)
     }
 
     suspend fun dlsiteAccount(sourceId: String): DlsiteAccountClient = dlsiteCookieWrites.withLock {
@@ -339,7 +340,7 @@ class SourceRegistry(
                     ) { spec ->
                         val asset = spec.uri.lastPathSegment ?: throw IOException("文件标识无效")
                         val sourceId = spec.uri.authority ?: throw IOException("来源未关联")
-                        val targetUri =
+                        val (targetUri, bearer) =
                             runBlocking(Dispatchers.IO) {
                                 val source = dao.source(sourceId) ?: throw IOException("来源已移除")
                                 require(source.kindType == SourceKind.ASMRONE) { "来源类型不匹配" }
@@ -360,9 +361,19 @@ class SourceRegistry(
                                 ) {
                                     throw IOException("文件地址须使用 HTTPS")
                                 }
-                                raw
+                                val token =
+                                    if (source.secret.isNotBlank() && parsed.host == root.host) {
+                                        secrets.decryptCached(source)
+                                    } else ""
+                                raw to token
                             }
-                        spec.withUri(targetUri.toUri())
+                        val nextSpec = spec.withUri(targetUri.toUri())
+                        if (bearer.isNotBlank()) {
+                            nextSpec.withRequestHeaders(
+                                spec.httpRequestHeaders +
+                                    mapOf("Authorization" to "Bearer $bearer"),
+                            )
+                        } else nextSpec
                     }
                     .createDataSource()
             "whisp-webdav" ->

@@ -562,6 +562,7 @@ fun WhispRoot(
                                                 }
                                             },
                                             sources = { activeTabIndex = 1 },
+                                            openPlayer = { push(WhispRoute.Player, destination) },
                                         )
                                     }
                                 }
@@ -573,6 +574,7 @@ fun WhispRoot(
                                             back = { pop(destination) },
                                             player = { push(WhispRoute.Player, destination) },
                                             filter = openFacetFilter,
+                                            openWork = { push(WhispRoute.Detail(it), destination) },
                                         )
                                     }
                                 }

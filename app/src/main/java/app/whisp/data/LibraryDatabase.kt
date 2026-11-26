@@ -54,7 +54,7 @@ data class SourceEntity(
                 onDelete = ForeignKey.SET_NULL,
             ),
         ],
-    indices = [Index("sourceId"), Index("coverId"), Index("addedAt")],
+    indices = [Index("sourceId"), Index("coverId"), Index("addedAt"), Index("rj")],
 )
 data class WorkEntity(
     @PrimaryKey val id: String,
@@ -71,12 +71,15 @@ data class WorkEntity(
     val coverUrl: String? = null,
     val origin: String = SourceKind.LOCAL.raw,
     val sourceId: String? = null,
+    val searchMetadata: String = "",
+    val userTags: String = "",
+    val volumeOffsetDb: Float = 0f,
 )
 
 @Fts4(
     contentEntity = WorkEntity::class,
     tokenizer = FtsOptions.TOKENIZER_UNICODE61,
-    tokenizerArgs = ["separators=_-./()[]【】「」『』"],
+    tokenizerArgs = ["separators=_-./()[]【】「」『』,，、"],
 )
 @Entity(tableName = "works_fts")
 data class WorkFtsEntity(
@@ -84,6 +87,8 @@ data class WorkFtsEntity(
     val rj: String?,
     val artist: String,
     val originalTitle: String,
+    val searchMetadata: String,
+    val userTags: String,
 )
 
 @Entity(
@@ -257,6 +262,65 @@ data class BookmarkEntity(
     val endMs: Long? = null,
 )
 
+@Entity(tableName = "playlists")
+data class PlaylistEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis(),
+)
+
+@Entity(
+    tableName = "playlist_items",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = PlaylistEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["playlistId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+            ForeignKey(
+                entity = WorkEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["workId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+            ForeignKey(
+                entity = TrackEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["trackId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+        ],
+    indices = [Index(value = ["playlistId", "position"]), Index("workId"), Index("trackId")],
+)
+data class PlaylistItemEntity(
+    @PrimaryKey val id: String,
+    val playlistId: String,
+    val workId: String,
+    val trackId: String,
+    val position: Int,
+    val startMs: Long? = null,
+    val endMs: Long? = null,
+    val label: String? = null,
+    val addedAt: Long = System.currentTimeMillis(),
+)
+
+data class PlaylistSummary(
+    val id: String,
+    val name: String,
+    val updatedAt: Long,
+    val itemCount: Int,
+    val coverId: String?,
+)
+
+data class SeriesSummary(
+    val series: String,
+    val workCount: Int,
+    val coverId: String?,
+)
+
 data class WorkDetails(
     @Embedded val work: WorkEntity,
     @Relation(parentColumn = "id", entityColumn = "workId") val tracks: List<TrackEntity>,
@@ -347,13 +411,113 @@ interface LibraryDao {
 
     @Query(
         """
+        SELECT COUNT(*) FROM works w
+        WHERE w.sourceId IS NOT NULL
+           OR w.offlineAttachments = 1
+           OR (:hasOrphanOffline = 1 AND w.id IN (:orphanOfflineIds))
+        """,
+    )
+    fun observeVisibleWorkCount(
+        hasOrphanOffline: Boolean,
+        orphanOfflineIds: List<String>,
+    ): Flow<Int>
+
+    @Query(
+        """
+        SELECT w.series AS series, COUNT(*) AS workCount, MIN(w.coverId) AS coverId
+        FROM works w
+        WHERE w.series IS NOT NULL AND w.series != ''
+          AND (w.sourceId IS NOT NULL OR w.offlineAttachments = 1 OR (:hasOrphanOffline = 1 AND w.id IN (:orphanOfflineIds)))
+        GROUP BY w.series
+        ORDER BY w.series ASC
+        """,
+    )
+    fun observeSeriesSummaries(
+        hasOrphanOffline: Boolean,
+        orphanOfflineIds: List<String>,
+    ): Flow<List<SeriesSummary>>
+
+    @Query(
+        """
+        SELECT w.* FROM works w
+        WHERE w.rj IS NOT NULL AND UPPER(w.rj) = UPPER(:rj)
+          AND (w.sourceId IS NOT NULL OR w.offlineAttachments = 1)
+        ORDER BY w.addedAt DESC
+        """,
+    )
+    fun observeWorksByRj(rj: String): Flow<List<WorkEntity>>
+
+    @Query(
+        """
         SELECT w.* FROM works w
         LEFT JOIN progress p ON p.workId = w.id
         WHERE (w.sourceId IS NOT NULL OR w.offlineAttachments = 1 OR (:hasOrphanOffline = 1 AND w.id IN (:orphanOfflineIds)))
           AND (:favoriteOnly = 0 OR w.favorite = 1)
           AND (:offlineOnly = 0 OR w.offlineAttachments = 1)
           AND (:series IS NULL OR w.series = :series)
-          AND (:filterByIds = 0 OR w.id IN (:matchedIds))
+          AND (:sourceId IS NULL OR w.sourceId = :sourceId)
+          AND (:artistFilter IS NULL OR w.artist LIKE :artistFilter OR w.searchMetadata LIKE :artistFilter)
+          AND (:tagFilter IS NULL OR w.userTags LIKE :tagFilter OR w.searchMetadata LIKE :tagFilter)
+          AND (:hasSubtitlesOnly = 0 OR EXISTS (SELECT 1 FROM attachments a WHERE a.workId = w.id AND a.kind = 'subtitle'))
+          AND (
+              :listenFilter = 'all'
+              OR (:listenFilter = 'unplayed' AND p.workId IS NULL)
+              OR (:listenFilter = 'in_progress' AND p.workId IS NOT NULL AND NOT EXISTS (
+                  SELECT 1 FROM tracks lt
+                  WHERE lt.workId = w.id
+                    AND lt.id = p.trackId
+                    AND lt.durationMs > 0
+                    AND p.positionMs >= lt.durationMs - 500
+                    AND NOT EXISTS (
+                        SELECT 1 FROM tracks nt
+                        WHERE nt.workId = w.id
+                          AND (nt.`order` > lt.`order` OR (nt.`order` = lt.`order` AND nt.id > lt.id))
+                    )
+              ))
+              OR (:listenFilter = 'finished' AND p.workId IS NOT NULL AND EXISTS (
+                  SELECT 1 FROM tracks lt
+                  WHERE lt.workId = w.id
+                    AND lt.id = p.trackId
+                    AND lt.durationMs > 0
+                    AND p.positionMs >= lt.durationMs - 500
+                    AND NOT EXISTS (
+                        SELECT 1 FROM tracks nt
+                        WHERE nt.workId = w.id
+                          AND (nt.`order` > lt.`order` OR (nt.`order` = lt.`order` AND nt.id > lt.id))
+                    )
+              ))
+          )
+          AND (
+              :ftsQuery IS NULL
+              OR w.rowid IN (SELECT docid FROM works_fts WHERE works_fts MATCH :ftsQuery)
+              OR EXISTS (
+                  SELECT 1 FROM tracks t
+                  JOIN tracks_fts ON t.rowid = tracks_fts.docid
+                  WHERE t.workId = w.id AND tracks_fts MATCH :ftsQuery
+              )
+              OR EXISTS (
+                  SELECT 1 FROM attachments a
+                  JOIN attachments_fts ON a.rowid = attachments_fts.docid
+                  WHERE a.workId = w.id AND attachments_fts MATCH :ftsQuery
+              )
+          )
+          AND (
+              :likePattern IS NULL
+              OR w.title LIKE :likePattern
+              OR w.rj LIKE :likePattern
+              OR w.artist LIKE :likePattern
+              OR w.originalTitle LIKE :likePattern
+              OR w.searchMetadata LIKE :likePattern
+              OR w.userTags LIKE :likePattern
+              OR EXISTS (
+                  SELECT 1 FROM tracks t
+                  WHERE t.workId = w.id AND (t.title LIKE :likePattern OR t.fileName LIKE :likePattern)
+              )
+              OR EXISTS (
+                  SELECT 1 FROM attachments a
+                  WHERE a.workId = w.id AND a.fileName LIKE :likePattern
+              )
+          )
         ORDER BY
           CASE WHEN :sort = 'added_asc' THEN w.addedAt END ASC,
           CASE WHEN :sort = 'recent' THEN COALESCE(p.updatedAt, 0) END DESC,
@@ -369,8 +533,13 @@ interface LibraryDao {
         favoriteOnly: Boolean,
         offlineOnly: Boolean,
         series: String?,
-        filterByIds: Boolean,
-        matchedIds: List<String>,
+        sourceId: String? = null,
+        artistFilter: String? = null,
+        tagFilter: String? = null,
+        hasSubtitlesOnly: Boolean = false,
+        listenFilter: String = ListenFilter.ALL,
+        ftsQuery: String? = null,
+        likePattern: String? = null,
         sort: String,
     ): PagingSource<Int, WorkEntity>
 
@@ -439,6 +608,8 @@ interface LibraryDao {
            OR rj LIKE :pattern
            OR artist LIKE :pattern
            OR originalTitle LIKE :pattern
+           OR searchMetadata LIKE :pattern
+           OR userTags LIKE :pattern
         UNION
         SELECT workId FROM tracks
         WHERE title LIKE :pattern
@@ -465,6 +636,9 @@ interface LibraryDao {
 
     @Query("SELECT * FROM works WHERE UPPER(rj) = UPPER(:rj) LIMIT 1")
     suspend fun workByRj(rj: String): WorkEntity?
+
+    @Query("SELECT * FROM works WHERE UPPER(rj) = UPPER(:rj)")
+    suspend fun worksByRj(rj: String): List<WorkEntity>
 
     @Query("SELECT * FROM works WHERE favorite = 1 ORDER BY addedAt DESC LIMIT :limit")
     suspend fun favoriteWorks(limit: Int): List<WorkEntity>
@@ -526,6 +700,15 @@ interface LibraryDao {
 
     @Query("UPDATE works SET title = :title, artist = :artist WHERE id = :id")
     suspend fun updateWorkIdentity(id: String, title: String, artist: String)
+
+    @Query("UPDATE works SET userTags = :userTags WHERE id = :id")
+    suspend fun updateWorkTags(id: String, userTags: String)
+
+    @Query("UPDATE works SET volumeOffsetDb = :volumeOffsetDb WHERE id = :id")
+    suspend fun updateWorkVolumeOffset(id: String, volumeOffsetDb: Float)
+
+    @Query("UPDATE works SET searchMetadata = :searchMetadata WHERE id = :id")
+    suspend fun updateWorkSearchMetadata(id: String, searchMetadata: String)
 
     @Query("UPDATE works SET coverId = :coverId WHERE id = :id")
     suspend fun updateWorkCover(id: String, coverId: String)
@@ -674,6 +857,58 @@ interface LibraryDao {
     @Upsert suspend fun saveBookmark(bookmark: BookmarkEntity)
 
     @Query("DELETE FROM bookmarks WHERE id = :id") suspend fun deleteBookmark(id: String)
+
+    // Playlists
+    @Query(
+        """
+        SELECT
+            pl.id AS id,
+            pl.name AS name,
+            pl.updatedAt AS updatedAt,
+            COUNT(pi.id) AS itemCount,
+            (SELECT w.coverId FROM playlist_items pi2
+             INNER JOIN works w ON w.id = pi2.workId
+             WHERE pi2.playlistId = pl.id AND w.coverId IS NOT NULL
+             ORDER BY pi2.position ASC LIMIT 1) AS coverId
+        FROM playlists pl
+        LEFT JOIN playlist_items pi ON pi.playlistId = pl.id
+        GROUP BY pl.id
+        ORDER BY pl.updatedAt DESC
+        """,
+    )
+    fun observePlaylistSummaries(): Flow<List<PlaylistSummary>>
+
+    @Query("SELECT * FROM playlists ORDER BY updatedAt DESC")
+    suspend fun allPlaylists(): List<PlaylistEntity>
+
+    @Query("SELECT * FROM playlists WHERE id = :id")
+    suspend fun playlist(id: String): PlaylistEntity?
+
+    @Upsert suspend fun putPlaylist(playlist: PlaylistEntity)
+
+    @Query("UPDATE playlists SET name = :name, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun renamePlaylist(id: String, name: String, updatedAt: Long)
+
+    @Query("UPDATE playlists SET updatedAt = :updatedAt WHERE id = :id")
+    suspend fun touchPlaylist(id: String, updatedAt: Long)
+
+    @Query("DELETE FROM playlists WHERE id = :id") suspend fun deletePlaylist(id: String)
+
+    @Query("SELECT * FROM playlist_items WHERE playlistId = :playlistId ORDER BY position ASC")
+    fun observePlaylistItems(playlistId: String): Flow<List<PlaylistItemEntity>>
+
+    @Query("SELECT * FROM playlist_items WHERE playlistId = :playlistId ORDER BY position ASC")
+    suspend fun playlistItems(playlistId: String): List<PlaylistItemEntity>
+
+    @Query("SELECT * FROM playlist_items ORDER BY playlistId, position ASC")
+    suspend fun allPlaylistItems(): List<PlaylistItemEntity>
+
+    @Query("SELECT COALESCE(MAX(position), -1) FROM playlist_items WHERE playlistId = :playlistId")
+    suspend fun maxPlaylistPosition(playlistId: String): Int
+
+    @Upsert suspend fun putPlaylistItems(items: List<PlaylistItemEntity>)
+
+    @Query("DELETE FROM playlist_items WHERE id = :id") suspend fun deletePlaylistItem(id: String)
 }
 
 @Database(
@@ -691,6 +926,8 @@ interface LibraryDao {
             BookmarkEntity::class,
             DlsiteMetadataEntity::class,
             DlsitePurchaseEntity::class,
+            PlaylistEntity::class,
+            PlaylistItemEntity::class,
         ],
     version = 1,
     exportSchema = true,

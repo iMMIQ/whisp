@@ -312,7 +312,12 @@ class PlaybackCoordinator(
                     if (!restart && !shuffle && trackId == null && startPosition == null)
                         library.progress(detail.work.id)
                     else null
-                val rawQueue = TrackSections.queue(detail.tracks, trackId ?: savedProgress?.trackId)
+                val rawQueue =
+                    TrackSections.queue(
+                        detail.tracks,
+                        trackId ?: savedProgress?.trackId,
+                        settings.settings.value.editionPreference,
+                    )
                 val available = library.availableTracks(detail.work, rawQueue)
                 if (trackId != null && available.none { it.id == trackId }) {
                     reportError("音轨文件不可用，请检查来源或重新下载")
@@ -426,6 +431,135 @@ class PlaybackCoordinator(
                 if (state.value.trackId == bookmark.trackId) {
                     setLoop(bookmark.positionMs, bookmark.endMs)
                 }
+            }
+        }
+    }
+
+    /** Plays a cross-work custom playlist, preserving per-work covers and optional A-B ranges. */
+    fun playPlaylist(
+        playlistId: String,
+        startItemId: String? = null,
+        shuffle: Boolean = false,
+    ) {
+        if (guardSpeakerPlayback { playPlaylist(playlistId, startItemId, shuffle) }) return
+        error.value = null
+        bookmarkLoopJob?.cancel()
+        bookmarkLoopJob = null
+        openJob?.cancel()
+        pendingStartPlaying = true
+        openJob = scope.launch {
+            try {
+                val resolved =
+                    withContext(Dispatchers.IO) {
+                        val rawItems = library.dao.playlistItems(playlistId)
+                        if (rawItems.isEmpty()) return@withContext emptyList()
+                        val trackIds = rawItems.map { it.trackId }.distinct()
+                        val workIds = rawItems.map { it.workId }.distinct()
+                        val tracksById =
+                            trackIds
+                                .chunked(500)
+                                .flatMap { library.dao.tracksByIds(it) }
+                                .associateBy { it.id }
+                        val worksById =
+                            workIds
+                                .chunked(500)
+                                .flatMap { library.dao.worksByIds(it) }
+                                .associateBy { it.id }
+                        rawItems.mapNotNull { item ->
+                            val track = tracksById[item.trackId] ?: return@mapNotNull null
+                            val work = worksById[item.workId] ?: return@mapNotNull null
+                            Triple(item, track, work)
+                        }
+                    }
+                if (resolved.isEmpty()) {
+                    reportError("歌单中暂无可播放曲目")
+                    return@launch
+                }
+                val startIndex =
+                    if (shuffle) 0
+                    else resolved.indexOfFirst { it.first.id == startItemId }.coerceAtLeast(0)
+                val firstEntry = resolved[startIndex]
+                openingTrackId.value = firstEntry.second.id
+                val (player, items) =
+                    coroutineScope {
+                        val playerDeferred = async { ensurePlayer() }
+                        val itemsDeferred =
+                            async(Dispatchers.IO) {
+                                mediaItemsForEntries(resolved.map { it.second to it.third })
+                            }
+                        playerDeferred.await() to itemsDeferred.await()
+                    }
+                queueSnapshot.clear()
+                resolved.forEach { queueSnapshot[it.second.id] = it.second }
+                activeErrorInfo = null
+                if (shuffle && items.size > 1) {
+                    val indices = items.indices.shuffled().toIntArray()
+                    player.setMediaItems(items, indices[0], 0L)
+                    player.setShuffleOrder(
+                        ShuffleOrder.DefaultShuffleOrder(indices, Random.nextLong()),
+                    )
+                    player.shuffleModeEnabled = true
+                } else {
+                    val startPos = firstEntry.first.startMs?.coerceAtLeast(0L) ?: 0L
+                    player.shuffleModeEnabled = false
+                    player.setMediaItems(items, startIndex, startPos)
+                }
+                player.prepare()
+                if (pendingStartPlaying) player.play() else player.pause()
+                refreshFromPlayer(player, queueDirty = true)
+                val endMs = firstEntry.first.endMs
+                val startMs = firstEntry.first.startMs ?: 0L
+                if (!shuffle && endMs != null && endMs > startMs) {
+                    setLoop(startMs, endMs)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                reportError(e.message ?: "无法播放歌单")
+            } finally {
+                if (openJob === currentCoroutineContext()[Job]) {
+                    openingTrackId.value = null
+                }
+            }
+        }
+    }
+
+    /** Inserts tracks right after the active item ([playNext] = true) or appends to queue end. */
+    fun appendToQueue(work: WorkEntity, tracks: List<TrackEntity>, playNext: Boolean = false) {
+        if (tracks.isEmpty()) return
+        val player = activePlayer
+        if (player == null || player.mediaItemCount == 0) {
+            scope.launch {
+                val detail = withContext(Dispatchers.IO) { library.workDetails(work.id) }
+                if (detail != null) {
+                    playWork(detail, tracks.first().id)
+                }
+            }
+            return
+        }
+        scope.launch {
+            try {
+                val available = library.availableTracks(work, tracks)
+                if (available.isEmpty()) {
+                    reportError("音轨文件不可用，请检查来源或重新下载")
+                    return@launch
+                }
+                val items = withContext(Dispatchers.IO) { mediaItems(available, work) }
+                available.forEach { queueSnapshot[it.id] = it }
+                val insertAt =
+                    if (playNext)
+                        (player.currentMediaItemIndex + 1).coerceIn(0, player.mediaItemCount)
+                    else player.mediaItemCount
+                player.addMediaItems(insertAt, items)
+                refreshFromPlayer(player, queueDirty = true)
+                messages.tryEmit(
+                    if (playNext) "已设为下一首播放（${available.size} 曲）"
+                    else "已加入播放队列（${available.size} 曲）",
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                reportError(e.message ?: "加入队列失败")
             }
         }
     }
@@ -654,15 +788,33 @@ class PlaybackCoordinator(
     }
 
     fun jumpToTimerStartAnchor() {
-        val anchor = activeTimer?.lastStartAnchor ?: return
-        val player = activePlayer ?: return
-        val index =
-            (0 until player.mediaItemCount).firstOrNull {
-                player.getMediaItemAt(it).mediaId == anchor.trackId
+        val anchor =
+            activeTimer?.lastStartAnchor
+                ?: settings.sleepStartAnchor.value?.let {
+                    TimerStartAnchor(it.trackId, it.positionMs, it.workId)
+                }
+                ?: return
+        val player = activePlayer
+        val index = player?.let { p ->
+            (0 until p.mediaItemCount).firstOrNull {
+                p.getMediaItemAt(it).mediaId == anchor.trackId
             }
-        if (index != null) {
+        }
+        if (player != null && index != null) {
             player.seekTo(index, anchor.positionMs)
             activeTimer?.clearStartAnchor()
+            scope.launch { settings.saveSleepStartAnchor(null) }
+        } else if (anchor.workId.isNotBlank()) {
+            scope.launch {
+                val detail = withContext(Dispatchers.IO) { library.workDetails(anchor.workId) }
+                if (detail != null) {
+                    activeTimer?.clearStartAnchor()
+                    settings.saveSleepStartAnchor(null)
+                    playWork(detail, anchor.trackId, startPosition = anchor.positionMs)
+                } else {
+                    messages.tryEmit("原作品已移除，无法回到定时起点")
+                }
+            }
         }
     }
 
@@ -872,6 +1024,43 @@ class PlaybackCoordinator(
         }
     }
 
+    suspend fun mediaItemsForEntries(
+        entries: List<Pair<TrackEntity, WorkEntity>>,
+    ): List<MediaItem> {
+        if (entries.isEmpty()) return emptyList()
+        val hide = settings.settingsUpdates.first().hideArtwork
+        val artworkByCover =
+            if (hide) emptyMap()
+            else
+                entries
+                    .mapNotNull { it.second.coverId }
+                    .distinct()
+                    .mapNotNull { coverId ->
+                        images.thumbnailBytes(coverId)?.let { coverId to it }
+                    }
+                    .toMap()
+        val urisByTrackId = HashMap<String, String>(entries.size)
+        entries
+            .groupBy { it.second.id }
+            .values
+            .forEach { group ->
+                val work = group.first().second
+                urisByTrackId.putAll(library.resolveTrackUris(group.map { it.first }, work))
+            }
+        return entries.map { (track, work) ->
+            val uri = urisByTrackId[track.id] ?: library.resolveTrackUri(track, work)
+            MediaItem.Builder()
+                .setMediaId(track.id)
+                .setUri(uri.toUri())
+                .setMimeType(MediaFormats.videoMimeType(track.fileName))
+                .setCustomCacheKey(track.id)
+                .setMediaMetadata(
+                    mediaMetadata(track, work, hide, work.coverId?.let(artworkByCover::get)),
+                )
+                .build()
+        }
+    }
+
     private suspend fun buildMediaItem(
         track: TrackEntity,
         work: WorkEntity,
@@ -952,7 +1141,11 @@ class PlaybackCoordinator(
                 buffering = player.playbackState == Player.STATE_BUFFERING,
                 timerEnd = activeTimer?.deadlineMs ?: 0L,
                 timerStopAfterTrack = activeTimer?.stopAfterTrack == true,
-                timerStartAnchor = activeTimer?.lastStartAnchor,
+                timerStartAnchor =
+                    activeTimer?.lastStartAnchor
+                        ?: settings.sleepStartAnchor.value?.let {
+                            TimerStartAnchor(it.trackId, it.positionMs, it.workId)
+                        },
                 loopStart = activeLoop?.startMs ?: -1L,
                 loopEnd = activeLoop?.endMs ?: -1L,
                 playWhenReady = player.playWhenReady,

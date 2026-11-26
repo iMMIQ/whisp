@@ -236,8 +236,6 @@ class PerformanceOptimizationTest {
                     favoriteOnly = false,
                     offlineOnly = false,
                     series = null,
-                    filterByIds = false,
-                    matchedIds = listOf(""),
                     sort = app.whisp.data.LibrarySort.TITLE_DESC,
                 )
             val loaded =

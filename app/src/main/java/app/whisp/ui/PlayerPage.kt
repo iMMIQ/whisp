@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import android.provider.OpenableColumns
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
@@ -104,6 +107,7 @@ internal fun PlayerPage(
     var inlineAbBar by rememberSaveable { mutableStateOf(false) }
     var showScript by rememberSaveable(detail?.work?.id) { mutableStateOf(false) }
     var bookmark by remember { mutableStateOf<BookmarkDraft?>(null) }
+    var playlistRequest by remember { mutableStateOf<PlaylistAddRequest?>(null) }
     var subtitleAction by remember(track?.id) { mutableStateOf<Cue?>(null) }
     var more by rememberSaveable { mutableStateOf(false) }
     var precise by rememberSaveable { mutableStateOf(false) }
@@ -649,6 +653,33 @@ internal fun PlayerPage(
             },
         )
     }
+    val importSubtitleLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                try {
+                    val fileName =
+                        withContext(Dispatchers.IO) {
+                            context.contentResolver
+                                .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                        } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "external.vtt"
+                    val added =
+                        graph.offline.importExternalSubtitle(
+                            workId = detail.work.id,
+                            trackId = track.id,
+                            uri = uri,
+                            displayName = fileName,
+                        )
+                    graph.messages.tryEmit("已导入外挂字幕：${added.fileName}")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    graph.messages.tryEmit(e.message ?: "导入字幕失败")
+                }
+            }
+        }
+
     if (fragments) {
         PlayerFragmentsSheet(
             detail = detail,
@@ -657,7 +688,7 @@ internal fun PlayerPage(
             markA = markA,
             shownTrack = shownTrack,
             cues = cues,
-            settings = settings.copy(subtitleOffsetMs = trackOffsetMs),
+            trackOffsetMs = trackOffsetMs,
             bookmarks = workBookmarks,
             playback = playback,
             onDeleteBookmark = { item ->
@@ -674,10 +705,27 @@ internal fun PlayerPage(
                     }
                 }
             },
+            onAddBookmarkToPlaylist = { item ->
+                playlistRequest =
+                    PlaylistAddRequest(
+                        workId = detail.work.id,
+                        trackIds = listOf(item.trackId),
+                        startMs = item.positionMs,
+                        endMs = item.endMs,
+                        label = item.title,
+                    )
+            },
             haptics = haptics,
             onCreateBookmark = { bookmark = it },
             onOpenInlineAb = { inlineAbBar = true },
             onDismiss = { fragments = false },
+        )
+    }
+    playlistRequest?.let { req ->
+        AddToPlaylistSheet(
+            graph = graph,
+            request = req,
+            onDismiss = { playlistRequest = null },
         )
     }
     if (timer) {
@@ -768,7 +816,7 @@ internal fun PlayerPage(
             onDismiss = { subtitleAction = null },
         )
     }
-    if (subtitlePicker && subtitleCandidates.isNotEmpty()) {
+    if (subtitlePicker) {
         SubtitlePickerSheet(
             candidates = subtitleCandidates,
             activePrimaryId = activePrimarySubId ?: track.subtitleId,
@@ -785,10 +833,11 @@ internal fun PlayerPage(
             onResetAuto = {
                 scope.launch { graph.library.setTrackSubtitleSelection(track.id, null) }
             },
+            onImportExternal = { importSubtitleLauncher.launch(arrayOf("*/*")) },
             onDismiss = { subtitlePicker = false },
         )
     }
-    if (subtitleSearch && displayCues.isNotEmpty()) {
+    if (subtitleSearch && (displayCues.isNotEmpty() || subtitleCandidates.isNotEmpty())) {
         SubtitleSearchSheet(
             cues = displayCues,
             offsetMs = trackOffsetMs,
@@ -797,6 +846,13 @@ internal fun PlayerPage(
                 followSignal++
                 if (shownTrack != null) playback.seek(targetPos)
                 else playback.playWork(detail, track.id, startPosition = targetPos)
+            },
+            onSearchWork = { q -> playback.subtitles.searchWorkSubtitles(detail, q) },
+            onJumpTrack = { targetTrack, cue ->
+                val offset = graph.library.subtitleOffsetFor(targetTrack.id)
+                val targetPos = (cue.startMs + offset).coerceAtLeast(0L)
+                followSignal++
+                playback.playWork(detail, targetTrack.id, startPosition = targetPos)
             },
             onDismiss = { subtitleSearch = false },
         )
@@ -808,7 +864,7 @@ internal fun PlayerPage(
             audioOutputLabel = audioOutput.label,
             bedsideDimMode = settings.bedsideDimMode,
             hasSubtitles = hasAnySubtitles,
-            hasSubtitleCandidates = subtitleCandidates.isNotEmpty(),
+            hasSubtitleCandidates = true,
             onSpeedChange = playback::setPlaybackSpeed,
             onToggleBedsideDim = {
                 scope.launch {
@@ -841,6 +897,10 @@ internal fun PlayerPage(
             settings = settings,
             currentSpeed = state.speed,
             trackOffsetMs = trackOffsetMs,
+            workVolumeDb = detail.work.volumeOffsetDb,
+            onWorkVolumeDbChange = { nextDb ->
+                scope.launch { graph.library.updateWorkVolumeOffset(detail.work.id, nextDb) }
+            },
             onTrackOffsetChange = { nextOffset ->
                 scope.launch { graph.library.setTrackSubtitleOffset(track.id, nextOffset) }
             },

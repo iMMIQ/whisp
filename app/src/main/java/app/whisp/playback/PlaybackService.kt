@@ -61,6 +61,8 @@ class PlaybackService : MediaLibraryService() {
     private var checkpointJob: Job? = null
     private var idleCloseJob: Job? = null
     private var softFadeJob: Job? = null
+    private var workVolumeJob: Job? = null
+    private var activeWorkId: String? = null
     private var currentWakeMode: Int = C.WAKE_MODE_LOCAL
     private var sleepingForOffload: Boolean = false
     private var videoTrackEnabled: Boolean = false
@@ -93,6 +95,10 @@ class PlaybackService : MediaLibraryService() {
         audioProcessor.swapChannels = initialSettings.swapChannels
         audioProcessor.monoAudio = initialSettings.monoAudio
         audioProcessor.nightDynamics = initialSettings.nightDynamics
+        audioProcessor.nightDynamicsStrength = initialSettings.nightDynamicsStrength
+        audioProcessor.stereoBalance = initialSettings.stereoBalance
+        audioProcessor.highPassFilter = initialSettings.highPassFilter
+        dspEffectsActive = audioProcessor.hasActiveEffects
 
         val renderersFactory =
             object : DefaultRenderersFactory(this) {
@@ -133,6 +139,10 @@ class PlaybackService : MediaLibraryService() {
         }
         applyTrackDisables(videoEnabled = false, textEnabled = false, force = true)
         loop = AbLoopController(player, ::publishSessionState)
+        val persistedAnchor =
+            graph.settings.sleepStartAnchor.value?.let {
+                TimerStartAnchor(it.trackId, it.positionMs, it.workId)
+            }
         timer =
             SleepTimerController(
                     context = this,
@@ -145,8 +155,26 @@ class PlaybackService : MediaLibraryService() {
                     getVolume = { player.volume },
                     setVolume = { player.volume = it },
                     captureStartAnchor = {
-                        player.currentMediaItem?.mediaId?.let { id ->
-                            TimerStartAnchor(id, player.currentPosition.coerceAtLeast(0L))
+                        player.currentMediaItem?.let { item ->
+                            TimerStartAnchor(
+                                trackId = item.mediaId,
+                                positionMs = player.currentPosition.coerceAtLeast(0L),
+                                workId = item.mediaMetadata.extras?.getString("workId").orEmpty(),
+                            )
+                        }
+                    },
+                    initialStartAnchor = persistedAnchor,
+                    onStartAnchorChanged = { anchor ->
+                        graph.scope.launch {
+                            graph.settings.saveSleepStartAnchor(
+                                anchor?.let {
+                                    app.whisp.data.PersistedSleepAnchor(
+                                        workId = it.workId,
+                                        trackId = it.trackId,
+                                        positionMs = it.positionMs,
+                                    )
+                                },
+                            )
                         }
                     },
                 )
@@ -350,6 +378,9 @@ class PlaybackService : MediaLibraryService() {
                         currentTrackId = mediaItem?.mediaId
                         pausedAtElapsedMs = 0L
                         loop.onTrackTransition()
+                        observeActiveWorkVolume(
+                            mediaItem?.mediaMetadata?.extras?.getString("workId"),
+                        )
                         reconcileWakeMode()
                         saveProgress()
                         refreshSystemSurfaces()
@@ -647,6 +678,9 @@ class PlaybackService : MediaLibraryService() {
                         it.swapChannels,
                         it.monoAudio,
                         it.nightDynamics,
+                        it.nightDynamicsStrength,
+                        it.stereoBalance,
+                        it.highPassFilter,
                         it.gaplessPriority,
                         it.softFadePause,
                         it.smartResumeRewind,
@@ -661,7 +695,10 @@ class PlaybackService : MediaLibraryService() {
                     audioProcessor.swapChannels = s.swapChannels
                     audioProcessor.monoAudio = s.monoAudio
                     audioProcessor.nightDynamics = s.nightDynamics
-                    dspEffectsActive = s.hasDspEffects
+                    audioProcessor.nightDynamicsStrength = s.nightDynamicsStrength
+                    audioProcessor.stereoBalance = s.stereoBalance
+                    audioProcessor.highPassFilter = s.highPassFilter
+                    dspEffectsActive = audioProcessor.hasActiveEffects
                     gaplessPriority = s.gaplessPriority
                     softFadePauseEnabled = s.softFadePause
                     smartResumeRewindEnabled = s.smartResumeRewind
@@ -801,6 +838,30 @@ class PlaybackService : MediaLibraryService() {
         lastAppliedDeviceKey = output.deviceKey
         val profile = settings.toDeviceAudioProfile()
         graph.scope.launch { graph.settings.saveDeviceAudioProfile(output.deviceKey, profile) }
+    }
+
+    private fun observeActiveWorkVolume(workId: String?) {
+        if (workId == activeWorkId && workVolumeJob?.isActive == true) return
+        activeWorkId = workId
+        workVolumeJob?.cancel()
+        workVolumeJob = null
+        if (workId.isNullOrBlank()) {
+            audioProcessor.workGainLinear = 1f
+            dspEffectsActive = audioProcessor.hasActiveEffects
+            applyAudioOffload()
+            return
+        }
+        workVolumeJob = scope.launch {
+            graph.library
+                .observeDetails(workId)
+                .map { it?.work?.volumeOffsetDb ?: 0f }
+                .distinctUntilChanged()
+                .collect { db ->
+                    audioProcessor.workGainLinear = WhispAudioProcessor.dbToLinear(db)
+                    dspEffectsActive = audioProcessor.hasActiveEffects
+                    applyAudioOffload()
+                }
+        }
     }
 
     private fun reconcileShakeDetector() {
@@ -960,6 +1021,7 @@ class PlaybackService : MediaLibraryService() {
         saveProgress(immediate = true)
         softFadeJob?.cancel()
         idleCloseJob?.cancel()
+        workVolumeJob?.cancel()
         if (::shakeDetector.isInitialized) shakeDetector.release()
         graph.playback.detach(player)
         loop.release()

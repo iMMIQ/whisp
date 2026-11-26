@@ -10,6 +10,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadRequest
 import androidx.media3.exoplayer.offline.DownloadService
+import androidx.room.withTransaction
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
@@ -27,7 +28,10 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okio.ByteString.Companion.toByteString
 
-/** Offline downloads, attachment persistence, and custom cover assignment. */
+/**
+ * Offline downloads (whole work, edition/section, or single track), attachment persistence,
+ * external/cross-source subtitle import, and custom cover assignment.
+ */
 @androidx.annotation.OptIn(UnstableApi::class)
 class OfflineStore(
     private val context: Context,
@@ -68,17 +72,28 @@ class OfflineStore(
         onMain { media.downloadManager.pauseDownloads() }
     }
 
-    suspend fun downloadWork(id: String) =
+    suspend fun downloadWork(id: String) = downloadTracks(id, null)
+
+    /**
+     * Downloads either all tracks ([trackIds] == null) or a chosen subset (e.g. MP3 edition only or
+     * a single track) along with the work's cover and subtitle/script attachments.
+     */
+    suspend fun downloadTracks(id: String, trackIds: Collection<String>?) =
         withWork(id) { detail ->
-            require(detail.tracks.isNotEmpty()) { "作品没有音轨" }
-            val requests =
-                detail.tracks.map { track ->
-                    val uri = library.resolveTrackUri(track, detail.work)
-                    DownloadRequest.Builder(track.id, uri.toUri())
-                        .setMimeType(MediaFormats.videoMimeType(track.fileName))
-                        .setCustomCacheKey(track.id)
-                        .build()
+            val targets =
+                if (trackIds == null) detail.tracks
+                else {
+                    val wanted = trackIds.toSet()
+                    detail.tracks.filter { it.id in wanted }
                 }
+            require(targets.isNotEmpty()) { "作品没有可下载音轨" }
+            val requests = targets.map { track ->
+                val uri = library.resolveTrackUri(track, detail.work)
+                DownloadRequest.Builder(track.id, uri.toUri())
+                    .setMimeType(MediaFormats.videoMimeType(track.fileName))
+                    .setCustomCacheKey(track.id)
+                    .build()
+            }
             for (request in requests) {
                 runCatching {
                     DownloadService.sendAddDownload(
@@ -99,6 +114,20 @@ class OfflineStore(
                         .setInputData(workDataOf("workId" to id))
                         .build(),
                 )
+        }
+
+    suspend fun removeTrackOffline(workId: String, trackId: String) =
+        withWork(workId) { detail ->
+            removeTrackDownload(trackId)
+            val remainingOffline =
+                detail.tracks.any {
+                    it.id != trackId &&
+                        (media.isCompleted(it.id) || library.offlineFile(it.id) != null)
+                }
+            if (!remainingOffline) {
+                library.dao.attachmentsReady(workId, false)
+            }
+            library.storageChanged()
         }
 
     suspend fun downloadAttachments(id: String) =
@@ -124,6 +153,131 @@ class OfflineStore(
             }
             library.dao.attachmentsReady(id, true)
             library.storageChanged()
+        }
+
+    /**
+     * Imports a user-selected external subtitle file (`.vtt`, `.srt`, `.lrc`, `.ass`, `.ssa`) via
+     * SAF into durable app storage, registers it on [workId], and optionally selects it for
+     * [trackId].
+     */
+    suspend fun importExternalSubtitle(
+        workId: String,
+        trackId: String?,
+        uri: Uri,
+        displayName: String,
+    ): AttachmentEntity =
+        withContext(Dispatchers.IO) {
+            val cleanName =
+                displayName.replace(Regex("[\\\\/\\u0000]"), "_").trim().ifBlank { "external.vtt" }
+            val ext = MediaFormats.extension(cleanName)
+            require(ext in MediaFormats.subtitles) {
+                "仅支持 ${MediaFormats.subtitles.joinToString("/")} 字幕格式"
+            }
+            val bytes =
+                context.contentResolver.openInputStream(uri)?.use {
+                    boundedRead(it, 16 * 1024 * 1024)
+                } ?: error("无法读取字幕文件")
+            require(bytes.isNotEmpty()) { "字幕文件为空" }
+            library.withWorkLock(workId) {
+                library.dao.work(workId) ?: throw IOException("作品已删除")
+                val digest = bytes.toByteString().sha256().substring(0, 6).hex()
+                val relative = "_external/${digest}_$cleanName"
+                val attachmentId = stableId("$workId|$relative")
+                val targetFile = File(library.offlineDir, attachmentId)
+                atomicFile(targetFile, bytes)
+                val entity =
+                    AttachmentEntity(
+                        id = attachmentId,
+                        workId = workId,
+                        title = LibraryIndexer.trackTitle(cleanName),
+                        fileName = cleanName,
+                        relativePath = relative,
+                        kind = "subtitle",
+                        uri = Uri.fromFile(targetFile).toString(),
+                        size = bytes.size.toLong(),
+                    )
+                library.database.withTransaction {
+                    library.dao.putAttachments(listOf(entity))
+                    if (trackId != null) {
+                        val prev = library.dao.trackState(trackId)?.subtitleSelectionOrNull()
+                        val nextSecondary = prev?.secondaryId?.takeIf { it != attachmentId }
+                        library.dao.upsertTrackSubtitleSelection(
+                            trackId = trackId,
+                            primaryId = attachmentId,
+                            secondaryId = nextSecondary,
+                            updatedAt = System.currentTimeMillis(),
+                        )
+                    }
+                }
+                library.storageChanged()
+                entity
+            }
+        }
+
+    /**
+     * Copies all subtitle attachments from [sourceWorkId] (e.g. an ASMR.ONE or local sibling with
+     * the same RJ/VJ code) onto [targetWorkId] into local offline storage so high-res NAS/DLsite
+     * tracks can reuse community subtitles seamlessly.
+     */
+    suspend fun linkSiblingSubtitles(targetWorkId: String, sourceWorkId: String): Int =
+        withContext(Dispatchers.IO) {
+            require(targetWorkId != sourceWorkId) { "不能关联同一作品" }
+            val sourceDetail = library.dao.details(sourceWorkId) ?: throw IOException("来源作品不存在")
+            val subtitles = sourceDetail.attachments.filter { it.kind == "subtitle" }
+            if (subtitles.isEmpty()) return@withContext 0
+            val downloaded = subtitles.mapNotNull { sub ->
+                currentCoroutineContext().ensureActive()
+                runCatching { sub to library.readAsset(sub.id, 16 * 1024 * 1024) }.getOrNull()
+            }
+            if (downloaded.isEmpty()) return@withContext 0
+            library.withWorkLock(targetWorkId) {
+                val targetDetail = library.dao.details(targetWorkId) ?: throw IOException("目标作品已删除")
+                val newAttachments = mutableListOf<AttachmentEntity>()
+                for ((sub, bytes) in downloaded) {
+                    val relative = "_linked/${sub.relativePath}"
+                    val newId = stableId("$targetWorkId|$relative")
+                    val file = File(library.offlineDir, newId)
+                    atomicFile(file, bytes)
+                    newAttachments +=
+                        AttachmentEntity(
+                            id = newId,
+                            workId = targetWorkId,
+                            title = sub.title,
+                            fileName = sub.fileName,
+                            relativePath = relative,
+                            kind = "subtitle",
+                            uri = Uri.fromFile(file).toString(),
+                            size = bytes.size.toLong(),
+                        )
+                }
+                val mergedAttachments = targetDetail.attachments + newAttachments
+                val updatedTracks =
+                    targetDetail.tracks.map { track ->
+                        if (track.subtitleId != null) track
+                        else {
+                            val best =
+                                LibraryIndexer.subtitleCandidates(track, mergedAttachments)
+                                    .firstOrNull { candidate ->
+                                        candidate.id in newAttachments.mapTo(HashSet()) { it.id } &&
+                                            (LibraryIndexer.subtitleBaseStem(candidate.fileName)
+                                                .equals(
+                                                    LibraryIndexer.subtitleBaseStem(track.fileName),
+                                                    ignoreCase = true,
+                                                ) ||
+                                                (track.order < 9999 &&
+                                                    LibraryIndexer.number(candidate.fileName) ==
+                                                        track.order))
+                                    }
+                            if (best != null) track.copy(subtitleId = best.id) else track
+                        }
+                    }
+                library.database.withTransaction {
+                    library.dao.putAttachments(newAttachments)
+                    library.dao.putTracks(updatedTracks)
+                }
+                library.storageChanged()
+                newAttachments.size
+            }
         }
 
     suspend fun setCover(work: WorkEntity, uri: Uri) =
@@ -160,12 +314,18 @@ class OfflineStore(
         WorkManager.getInstance(context).cancelUniqueWork("attachments-$id")
         withWork(id) { detail ->
             detail.tracks.forEach { removeTrackDownload(it.id) }
-            detail.attachments.forEach { File(library.offlineDir, it.id).delete() }
+            detail.attachments
+                .filterNot {
+                    it.relativePath.startsWith("_external/") ||
+                        it.relativePath.startsWith("_linked/")
+                }
+                .forEach { File(library.offlineDir, it.id).delete() }
             detail.work.coverId?.let {
                 if (!library.dao.otherOfflineCover(it, id)) File(library.offlineDir, it).delete()
             }
             library.dao.attachmentsReady(id, false)
             if (detail.work.sourceId == null) {
+                detail.attachments.forEach { File(library.offlineDir, it.id).delete() }
                 val trackIds = detail.tracks.map { it.id }.toSet()
                 if (trackIds.isNotEmpty()) {
                     withContext(Dispatchers.Main.immediate) { detachTracks(trackIds) }
@@ -185,7 +345,11 @@ class OfflineStore(
 
     fun isOffline(detail: WorkDetails): Boolean =
         detail.work.offlineAttachments &&
+            detail.tracks.isNotEmpty() &&
             detail.tracks.all { media.downloads.value[it.id]?.state == Download.STATE_COMPLETED }
+
+    fun downloadedTrackCount(detail: WorkDetails): Int =
+        detail.tracks.count { media.downloads.value[it.id]?.state == Download.STATE_COMPLETED }
 }
 
 class AttachmentsWorker(context: Context, params: WorkerParameters) :

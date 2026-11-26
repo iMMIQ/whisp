@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 package app.whisp.ui
 
+import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -19,6 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -28,6 +30,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.whisp.AppGraph
 import app.whisp.R
 import app.whisp.data.*
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
@@ -135,8 +139,12 @@ internal fun InfoDialog(
 ) {
     var title by rememberSaveable(detail.work.id) { mutableStateOf(detail.work.title) }
     var artist by rememberSaveable(detail.work.id) { mutableStateOf(detail.work.artist) }
+    var userTags by rememberSaveable(detail.work.id) { mutableStateOf(detail.work.userTags) }
+    var volumeDb by
+        rememberSaveable(detail.work.id) { mutableFloatStateOf(detail.work.volumeOffsetDb) }
     var confirmingRemoval by rememberSaveable(detail.work.id) { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val cover =
         rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -144,6 +152,32 @@ internal fun InfoDialog(
                 scope.launch {
                     runCatching { graph.offline.setCover(detail.work, it) }
                         .onFailure { err -> graph.messages.tryEmit(err.message ?: "更换封面失败") }
+                }
+            }
+        }
+    val importSub =
+        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                try {
+                    val fileName =
+                        withContext(Dispatchers.IO) {
+                            context.contentResolver
+                                .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                        } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "external.vtt"
+                    val added =
+                        graph.offline.importExternalSubtitle(
+                            workId = detail.work.id,
+                            trackId = detail.tracks.firstOrNull()?.id,
+                            uri = uri,
+                            displayName = fileName,
+                        )
+                    graph.messages.tryEmit("已导入外挂字幕：${added.fileName}")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    graph.messages.tryEmit(e.message ?: "导入字幕失败")
                 }
             }
         }
@@ -211,6 +245,41 @@ internal fun InfoDialog(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(14.dp),
             )
+            OutlinedTextField(
+                value = userTags,
+                onValueChange = { userTags = it },
+                label = { Text("个人标签（逗号分隔，如：助眠, 掏耳）") },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+            )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "本作品音量补偿",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Muted,
+                    modifier = Modifier.weight(1f),
+                )
+                val rounded = volumeDb.roundToInt()
+                Text(
+                    if (rounded > 0) "+${rounded} dB" else "${rounded} dB",
+                    style = MaterialTheme.typography.labelMedium.merge(TabularNumeralStyle),
+                    color = if (rounded != 0) Rose else Muted,
+                )
+                if (abs(volumeDb) > 0.25f) {
+                    TextButton(
+                        onClick = { volumeDb = 0f },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) {
+                        Text("归零")
+                    }
+                }
+            }
+            SyncedSlider(
+                value = volumeDb,
+                range = -12f..12f,
+                steps = 23,
+                onValueChange = { volumeDb = it.roundToInt().toFloat() },
+            )
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -228,28 +297,35 @@ internal fun InfoDialog(
                 ) {
                     Text("更换封面")
                 }
-                if (detail.work.rj != null) {
-                    OutlinedButton(
-                        enabled = !loading,
-                        onClick = {
-                            loading = true
-                            scope.launch {
-                                try {
-                                    graph.sync.updateDlsiteMetadata(detail.work.id)
-                                } catch (e: CancellationException) {
-                                    throw e
-                                } catch (e: Exception) {
-                                    graph.messages.tryEmit(e.message ?: "元数据更新失败")
-                                } finally {
-                                    loading = false
-                                }
+                OutlinedButton(
+                    onClick = { importSub.launch(arrayOf("*/*")) },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("导入字幕")
+                }
+            }
+            if (detail.work.rj != null) {
+                OutlinedButton(
+                    enabled = !loading,
+                    onClick = {
+                        loading = true
+                        scope.launch {
+                            try {
+                                graph.sync.updateDlsiteMetadata(detail.work.id)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                graph.messages.tryEmit(e.message ?: "元数据更新失败")
+                            } finally {
+                                loading = false
                             }
-                        },
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(12.dp),
-                    ) {
-                        Text(if (loading) "读取中" else "更新 DLsite 元数据", maxLines = 1)
-                    }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text(if (loading) "读取中" else "更新 DLsite 元数据", maxLines = 1)
                 }
             }
             if (detail.work.isRemovableOnline) {
@@ -277,6 +353,8 @@ internal fun InfoDialog(
                     onClick = {
                         val nextTitle = title.ifBlank { detail.work.title }
                         val nextArtist = artist
+                        val nextTags = userTags
+                        val nextDb = volumeDb
                         graph.scope.launch {
                             runCatching {
                                 graph.library.editWorkIdentity(
@@ -284,6 +362,8 @@ internal fun InfoDialog(
                                     nextTitle,
                                     nextArtist,
                                 )
+                                graph.library.updateWorkTags(detail.work.id, nextTags)
+                                graph.library.updateWorkVolumeOffset(detail.work.id, nextDb)
                             }
                         }
                         close()

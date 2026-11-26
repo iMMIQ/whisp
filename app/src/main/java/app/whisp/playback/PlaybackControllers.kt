@@ -263,11 +263,15 @@ data class LoopState(val startMs: Long, val endMs: Long) {
     }
 }
 
-data class TimerStartAnchor(val trackId: String, val positionMs: Long)
+data class TimerStartAnchor(
+    val trackId: String,
+    val positionMs: Long,
+    val workId: String = "",
+)
 
 /**
  * AlarmManager-backed sleep timer with coroutine fallback, perceptual quadratic fade-out curve,
- * deferred volume restoration (preventing post-pause burst), and sleep-start position anchor.
+ * deferred volume restoration (preventing post-pause burst), and persisted sleep-start anchor.
  */
 internal class SleepTimerController(
     private val context: Context,
@@ -277,6 +281,8 @@ internal class SleepTimerController(
     private val getVolume: () -> Float = { 1f },
     private val setVolume: (Float) -> Unit = {},
     private val captureStartAnchor: () -> TimerStartAnchor? = { null },
+    initialStartAnchor: TimerStartAnchor? = null,
+    private val onStartAnchorChanged: (TimerStartAnchor?) -> Unit = {},
 ) {
     companion object {
         private const val SLEEP_ALARM_REQUEST_CODE = 1702
@@ -302,8 +308,15 @@ internal class SleepTimerController(
     var fading: Boolean = false
         private set
 
-    var lastStartAnchor: TimerStartAnchor? = null
+    var lastStartAnchor: TimerStartAnchor? = initialStartAnchor
         private set
+
+    private fun updateStartAnchor(next: TimerStartAnchor?) {
+        if (lastStartAnchor != next) {
+            lastStartAnchor = next
+            onStartAnchorChanged(next)
+        }
+    }
 
     val handlerDeadlineMs: Long
         get() = if (handledByAlarm && !fading) 0L else deadlineMs
@@ -342,7 +355,7 @@ internal class SleepTimerController(
 
     fun clearStartAnchor() {
         if (lastStartAnchor != null) {
-            lastStartAnchor = null
+            updateStartAnchor(null)
             onChanged()
         }
     }
@@ -356,7 +369,7 @@ internal class SleepTimerController(
         stopAfterTrack = false
         deadlineMs = SleepTimer.deadlineMs(SystemClock.elapsedRealtime(), minutes)
         if (deadlineMs > 0L) {
-            lastStartAnchor = captureStartAnchor() ?: lastStartAnchor
+            updateStartAnchor(captureStartAnchor() ?: lastStartAnchor)
             scheduleCurrentDeadline()
         }
         onChanged()
@@ -372,7 +385,7 @@ internal class SleepTimerController(
         timerJob = null
         cancelAlarm()
         stopAfterTrack = false
-        if (lastStartAnchor == null) lastStartAnchor = captureStartAnchor()
+        if (lastStartAnchor == null) updateStartAnchor(captureStartAnchor())
         deadlineMs = (base + deltaMinutes * 60_000L).coerceAtMost(now + 180 * 60_000L)
         scheduleCurrentDeadline()
         onChanged()
@@ -386,7 +399,7 @@ internal class SleepTimerController(
         cancelAlarm()
         deadlineMs = 0L
         stopAfterTrack = enabled
-        if (enabled) lastStartAnchor = captureStartAnchor() ?: lastStartAnchor
+        if (enabled) updateStartAnchor(captureStartAnchor() ?: lastStartAnchor)
         onChanged()
     }
 

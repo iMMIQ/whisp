@@ -11,6 +11,7 @@ import androidx.paging.PagingData
 import androidx.room.withTransaction
 import java.io.File
 import java.io.IOException
+import java.util.UUID
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
@@ -42,9 +43,21 @@ internal class WorkLocks {
     }
 }
 
+data class LibraryQueryFilter(
+    val favoriteOnly: Boolean = false,
+    val offlineOnly: Boolean = false,
+    val series: String? = null,
+    val sourceId: String? = null,
+    val artist: String? = null,
+    val tag: String? = null,
+    val hasSubtitlesOnly: Boolean = false,
+    val listenFilter: String = ListenFilter.ALL,
+    val query: String = "",
+)
+
 /**
- * Owns Room queries/mutations, per-work locking, progress persistence, source registration, and
- * asset resolution/reading.
+ * Owns Room queries/mutations, per-work locking, progress persistence, source registration,
+ * playlists, and asset resolution/reading.
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 class LibraryStore(
@@ -89,38 +102,70 @@ class LibraryStore(
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    fun pagedWorks(
-        favoriteOnly: Boolean,
-        offlineOnly: Boolean,
-        series: String?,
-        matchedIds: Set<String>?,
-        sort: String,
-    ): Flow<PagingData<WorkEntity>> = orphanOfflineWorkIds.flatMapLatest { orphanIds ->
-        val orphanList = orphanIds.toList()
-        val idList = matchedIds?.toList().orEmpty()
-        Pager(
-                config =
-                    PagingConfig(
-                        pageSize = 40,
-                        initialLoadSize = 60,
-                        prefetchDistance = 20,
-                        enablePlaceholders = false,
-                    ),
-                pagingSourceFactory = {
-                    dao.pagingWorks(
-                        hasOrphanOffline = orphanList.isNotEmpty(),
-                        orphanOfflineIds = orphanList.ifEmpty { listOf("") },
-                        favoriteOnly = favoriteOnly,
-                        offlineOnly = offlineOnly,
-                        series = series,
-                        filterByIds = matchedIds != null,
-                        matchedIds = idList.ifEmpty { listOf("") },
-                        sort = sort,
-                    )
-                },
-            )
-            .flow
+    val visibleWorkCount: StateFlow<Int> by lazy {
+        orphanOfflineWorkIds
+            .flatMapLatest { orphanIds ->
+                val list = orphanIds.take(400)
+                dao.observeVisibleWorkCount(list.isNotEmpty(), list.ifEmpty { listOf("") })
+            }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), 0)
     }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val seriesSummaries: StateFlow<List<SeriesSummary>> by lazy {
+        orphanOfflineWorkIds
+            .flatMapLatest { orphanIds ->
+                val list = orphanIds.take(400)
+                dao.observeSeriesSummaries(list.isNotEmpty(), list.ifEmpty { listOf("") })
+            }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+    }
+
+    val playlists: StateFlow<List<PlaylistSummary>> by lazy {
+        dao.observePlaylistSummaries()
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun pagedWorks(filter: LibraryQueryFilter, sort: String): Flow<PagingData<WorkEntity>> =
+        orphanOfflineWorkIds.flatMapLatest { orphanIds ->
+            val orphanList = orphanIds.take(400)
+            val trimmed = filter.query.trim()
+            val fts = if (trimmed.isNotEmpty()) buildFtsQueryOrNull(trimmed) else null
+            val like = if (trimmed.isNotEmpty() && fts == null) "%$trimmed%" else null
+            val artistLike = filter.artist?.trim()?.takeIf(String::isNotEmpty)?.let { "%$it%" }
+            val tagLike = filter.tag?.trim()?.takeIf(String::isNotEmpty)?.let { "%$it%" }
+            Pager(
+                    config =
+                        PagingConfig(
+                            pageSize = 40,
+                            initialLoadSize = 60,
+                            prefetchDistance = 20,
+                            enablePlaceholders = false,
+                        ),
+                    pagingSourceFactory = {
+                        dao.pagingWorks(
+                            hasOrphanOffline = orphanList.isNotEmpty(),
+                            orphanOfflineIds = orphanList.ifEmpty { listOf("") },
+                            favoriteOnly = filter.favoriteOnly,
+                            offlineOnly = filter.offlineOnly,
+                            series = filter.series,
+                            sourceId = filter.sourceId,
+                            artistFilter = artistLike,
+                            tagFilter = tagLike,
+                            hasSubtitlesOnly = filter.hasSubtitlesOnly,
+                            listenFilter = filter.listenFilter,
+                            ftsQuery = fts,
+                            likePattern = like,
+                            sort = sort,
+                        )
+                    },
+                )
+                .flow
+        }
 
     val progress: StateFlow<List<ProgressEntity>> by lazy {
         dao.observeProgress().stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyList())
@@ -133,11 +178,13 @@ class LibraryStore(
             .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyMap())
     }
 
+    // Subscribed only while UI/subtitles actively observe track state rather than eagerly at cold
+    // start.
     val trackStates: StateFlow<Map<String, TrackStateEntity>> by lazy {
         dao.observeTrackStates()
             .map { list -> list.associateBy { it.trackId } }
             .distinctUntilChanged()
-            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
+            .stateIn(scope, SharingStarted.WhileSubscribed(5_000L), emptyMap())
     }
 
     val bookmarks: StateFlow<List<BookmarkEntity>> by lazy {
@@ -170,12 +217,17 @@ class LibraryStore(
 
     fun observeDetails(workId: String): Flow<WorkDetails?> = dao.observeDetails(workId)
 
+    fun observeWorksByRj(rj: String): Flow<List<WorkEntity>> = dao.observeWorksByRj(rj)
+
     fun observeLatestProgress(): Flow<ProgressEntity?> = dao.observeLatestProgress()
 
     fun observeProgress(workId: String): Flow<ProgressEntity?> = dao.observeProgressForWork(workId)
 
     fun observeBookmarks(workId: String): Flow<List<BookmarkEntity>> =
         dao.observeBookmarksForWork(workId)
+
+    fun observePlaylistItems(playlistId: String): Flow<List<PlaylistItemEntity>> =
+        dao.observePlaylistItems(playlistId)
 
     suspend fun workDetails(id: String): WorkDetails? = dao.details(id)
 
@@ -208,6 +260,12 @@ class LibraryStore(
         trackStates.value[it]?.subtitleSelectionOrNull()
     }
 
+    suspend fun loadSubtitleSelection(trackId: String): TrackSubtitleSelection? =
+        withContext(Dispatchers.IO) { dao.trackState(trackId)?.subtitleSelectionOrNull() }
+
+    suspend fun loadSavedTrackPosition(trackId: String): Long =
+        withContext(Dispatchers.IO) { dao.trackState(trackId)?.positionMs ?: 0L }
+
     fun savedTrackPosition(trackId: String?): Long =
         trackId?.let { trackStates.value[it]?.positionMs } ?: 0L
 
@@ -234,9 +292,114 @@ class LibraryStore(
     suspend fun editWorkIdentity(id: String, title: String, artist: String) =
         dao.updateWorkIdentity(id, title, artist)
 
+    suspend fun updateWorkTags(id: String, rawTags: String) {
+        val normalized = normalizeUserTags(rawTags)
+        dao.updateWorkTags(id, normalized)
+    }
+
+    suspend fun updateWorkVolumeOffset(id: String, db: Float) {
+        dao.updateWorkVolumeOffset(id, db.coerceIn(-12f, 12f))
+    }
+
     suspend fun saveBookmark(bookmark: BookmarkEntity) = dao.saveBookmark(bookmark)
 
     suspend fun deleteBookmark(id: String) = dao.deleteBookmark(id)
+
+    // Playlists CRUD
+    suspend fun createPlaylist(name: String): String =
+        withContext(Dispatchers.IO) {
+            val clean = name.trim().take(80)
+            require(clean.isNotBlank()) { "请输入歌单名称" }
+            val now = System.currentTimeMillis()
+            val id = UUID.randomUUID().toString()
+            dao.putPlaylist(PlaylistEntity(id = id, name = clean, createdAt = now, updatedAt = now))
+            id
+        }
+
+    suspend fun renamePlaylist(id: String, name: String) =
+        withContext(Dispatchers.IO) {
+            val clean = name.trim().take(80)
+            require(clean.isNotBlank()) { "请输入歌单名称" }
+            dao.renamePlaylist(id, clean, System.currentTimeMillis())
+        }
+
+    suspend fun deletePlaylist(id: String) = withContext(Dispatchers.IO) { dao.deletePlaylist(id) }
+
+    suspend fun addToPlaylist(
+        playlistId: String,
+        workId: String,
+        trackId: String,
+        startMs: Long? = null,
+        endMs: Long? = null,
+        label: String? = null,
+    ) =
+        withContext(Dispatchers.IO) {
+            database.withTransaction {
+                val now = System.currentTimeMillis()
+                val nextPos = dao.maxPlaylistPosition(playlistId) + 1
+                dao.putPlaylistItems(
+                    listOf(
+                        PlaylistItemEntity(
+                            id = UUID.randomUUID().toString(),
+                            playlistId = playlistId,
+                            workId = workId,
+                            trackId = trackId,
+                            position = nextPos,
+                            startMs = startMs,
+                            endMs = endMs,
+                            label = label,
+                            addedAt = now,
+                        ),
+                    ),
+                )
+                dao.touchPlaylist(playlistId, now)
+            }
+        }
+
+    suspend fun addTracksToPlaylist(playlistId: String, workId: String, trackIds: List<String>) =
+        withContext(Dispatchers.IO) {
+            if (trackIds.isEmpty()) return@withContext
+            database.withTransaction {
+                val now = System.currentTimeMillis()
+                var pos = dao.maxPlaylistPosition(playlistId) + 1
+                val entities = trackIds.map { trackId ->
+                    PlaylistItemEntity(
+                        id = UUID.randomUUID().toString(),
+                        playlistId = playlistId,
+                        workId = workId,
+                        trackId = trackId,
+                        position = pos++,
+                        addedAt = now,
+                    )
+                }
+                dao.putPlaylistItems(entities)
+                dao.touchPlaylist(playlistId, now)
+            }
+        }
+
+    suspend fun removePlaylistItem(playlistId: String, itemId: String) =
+        withContext(Dispatchers.IO) {
+            database.withTransaction {
+                dao.deletePlaylistItem(itemId)
+                dao.touchPlaylist(playlistId, System.currentTimeMillis())
+            }
+        }
+
+    suspend fun movePlaylistItem(playlistId: String, itemId: String, delta: Int) =
+        withContext(Dispatchers.IO) {
+            database.withTransaction {
+                val items = dao.playlistItems(playlistId).toMutableList()
+                val from = items.indexOfFirst { it.id == itemId }
+                if (from < 0) return@withTransaction
+                val to = (from + delta).coerceIn(0, items.lastIndex)
+                if (from == to) return@withTransaction
+                val moved = items.removeAt(from)
+                items.add(to, moved)
+                val now = System.currentTimeMillis()
+                dao.putPlaylistItems(items.mapIndexed { idx, item -> item.copy(position = idx) })
+                dao.touchPlaylist(playlistId, now)
+            }
+        }
 
     fun dlsiteDetails(id: String): Flow<DlsiteDetails?> =
         dao.observeDlsiteMetadata(id)
@@ -250,11 +413,14 @@ class LibraryStore(
         withContext(Dispatchers.IO) {
             database.withTransaction {
                 val work = dao.work(id)
-                if (work != null && work.rj == details.rj) {
+                if (work != null && work.rj.equals(details.rj, ignoreCase = true)) {
                     val previous = decodeDlsiteDetails(dao.dlsiteMetadata(id)?.snapshot)
-                    dao.putDlsiteMetadata(
-                        DlsiteMetadataEntity(id, details.preserving(previous).encode()),
-                    )
+                    val merged = details.preserving(previous)
+                    dao.putDlsiteMetadata(DlsiteMetadataEntity(id, merged.encode()))
+                    val meta = buildSearchMetadata(merged)
+                    if (meta != work.searchMetadata) {
+                        dao.updateWorkSearchMetadata(id, meta)
+                    }
                 }
             }
         }
@@ -477,15 +643,101 @@ class LibraryStore(
         return id
     }
 
-    suspend fun addAsmrOne(): String {
-        val id = stableId("asmr.one")
-        if (dao.source(id) == null)
+    suspend fun addAsmrOne(
+        name: String = "ASMR.ONE",
+        root: String = AsmrOneClient.API_ROOT,
+        token: String = "",
+    ): String {
+        val url = root.trim().toHttpUrlOrNull() ?: error("请输入有效的 Kikoeru / ASMR.ONE 地址")
+        val isLocal = url.host in setOf("localhost", "127.0.0.1", "10.0.2.2")
+        require(url.scheme == "https" || isLocal) { "在线目录地址须使用 HTTPS" }
+        require(
+            url.username.isEmpty() &&
+                url.password.isEmpty() &&
+                url.query == null &&
+                url.fragment == null,
+        ) {
+            "地址不能包含凭据或查询参数"
+        }
+        val normalized =
+            url.newBuilder()
+                .apply { if (!url.encodedPath.endsWith('/')) addPathSegment("") }
+                .build()
+                .toString()
+        val isDefault = normalized == AsmrOneClient.API_ROOT && token.isBlank()
+        val id = if (isDefault) stableId("asmr.one") else stableId("asmr.one|$normalized")
+        val encrypted = if (token.isNotBlank()) sources.secrets.encrypt(token.trim()) else ""
+        val existing = dao.source(id)
+        if (existing == null || existing.root != normalized || existing.secret != encrypted) {
             dao.putSource(
-                SourceEntity(id, "ASMR.ONE", SourceKind.ASMRONE.raw, AsmrOneClient.API_ROOT),
+                SourceEntity(
+                    id = id,
+                    name = name.trim().ifBlank { url.host },
+                    kind = SourceKind.ASMRONE.raw,
+                    root = normalized,
+                    secret = encrypted,
+                ),
             )
+        }
         return id
     }
+
+    suspend fun updateAsmrOneConfig(
+        sourceId: String,
+        name: String,
+        root: String,
+        token: String? = null,
+    ) {
+        val existing = dao.source(sourceId) ?: error("来源已移除")
+        require(existing.kindType == SourceKind.ASMRONE) { "来源类型不匹配" }
+        val url = root.trim().toHttpUrlOrNull() ?: error("请输入有效的 HTTPS 地址")
+        val isLocal = url.host in setOf("localhost", "127.0.0.1", "10.0.2.2")
+        require(url.scheme == "https" || isLocal) { "在线目录地址须使用 HTTPS" }
+        val normalized =
+            url.newBuilder()
+                .apply { if (!url.encodedPath.endsWith('/')) addPathSegment("") }
+                .build()
+                .toString()
+        val nextSecret =
+            when {
+                token == null -> existing.secret
+                token.isBlank() -> ""
+                else -> sources.secrets.encrypt(token.trim())
+            }
+        dao.putSource(
+            existing.copy(
+                name = name.trim().ifBlank { url.host },
+                root = normalized,
+                secret = nextSecret,
+                error = null,
+            ),
+        )
+        sources.secrets.evict(sourceId)
+    }
 }
+
+internal fun buildSearchMetadata(details: DlsiteDetails?): String {
+    if (details == null) return ""
+    val parts = buildList {
+        details.circle?.takeIf(String::isNotBlank)?.let(::add)
+        details.series?.takeIf(String::isNotBlank)?.let(::add)
+        details.credits.forEach { if (it.name.isNotBlank()) add(it.name) }
+        details.genres.forEach { if (it.name.isNotBlank()) add(it.name) }
+    }
+    return parts.distinct().joinToString(" ")
+}
+
+internal fun normalizeUserTags(raw: String): String =
+    raw.split(',', '，', '、', '\n', '#')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .take(24)
+        .joinToString(", ")
+
+internal fun parseUserTags(raw: String): List<String> =
+    if (raw.isBlank()) emptyList()
+    else raw.split(',', '，', '、').map { it.trim() }.filter { it.isNotEmpty() }.distinct()
 
 private val ftsAsciiWordQuery = Regex("^[A-Za-z0-9\\s_-]+$")
 private val ftsTokenSplit = Regex("[\\s_-]+")
